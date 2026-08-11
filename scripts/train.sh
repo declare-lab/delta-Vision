@@ -23,6 +23,11 @@ export NCCL_NET=Socket
 unset NCCL_NET_PLUGIN 2>/dev/null || true
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
+WANDB_ARGS=""
+if [[ "${WANDB:-0}" == "1" ]]; then
+  WANDB_ARGS="--wandb --wandb-project ${WANDB_PROJECT:-vision-kv-inject} --wandb-run-name ${RUN_NAME} --wandb-mode ${WANDB_MODE:-online}"
+fi
+
 echo "=== Vision KV Inject Training ==="
 echo "run=$RUN_NAME"
 echo "output=$OUT_DIR"
@@ -43,4 +48,5 @@ $PY -m torch.distributed.run \
   --log-every "${LOG_EVERY:-10}" \
   --save-every "${SAVE_EVERY:-500}" \
   --deepspeed-config configs/ds_zero2.json \
-  --seed 42
+  --seed 42 \
+  $WANDB_ARGS

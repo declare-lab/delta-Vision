@@ -19,13 +19,31 @@ def load_adapter_from_ckpt(checkpoint_path: str, device: torch.device):
     source_layers = [int(x) for x in source_layers_str.split(",")]
     bottleneck_dim = int(ckpt_args.get("bottleneck_dim", 0))
     from src.model import PerLayerKVAdapter
+    concat_source = bool(ckpt_args.get("concat_source", False))
+    # Infer adapter dims from checkpoint weights
+    state_dict = ckpt["state_dict"]
+    # Find num_llm_layers from source_mix shape or k_projs count
+    if "source_mix" in state_dict:
+        num_llm_layers = state_dict["source_mix"].shape[0]
+    else:
+        num_llm_layers = sum(1 for k in state_dict if k.startswith("k_projs.") and k.endswith(".weight"))
+    # Find target_dim from k_projs.0.weight or k_up.0.weight
+    if "k_projs.0.weight" in state_dict:
+        target_dim = state_dict["k_projs.0.weight"].shape[0]
+    elif "k_up.0.weight" in state_dict:
+        target_dim = state_dict["k_up.0.weight"].shape[0]
+    else:
+        target_dim = 4096
+    head_dim = 128
+    num_heads = target_dim // head_dim
     adapter = PerLayerKVAdapter(
-        num_llm_layers=32,
+        num_llm_layers=num_llm_layers,
         num_source_layers=len(source_layers),
         source_dim=1024,
-        num_heads=32,
-        head_dim=128,
+        num_heads=num_heads,
+        head_dim=head_dim,
         bottleneck_dim=bottleneck_dim,
+        concat_source=concat_source,
     )
     adapter.load_state_dict(ckpt["state_dict"])
     adapter.to(device=device, dtype=torch.bfloat16)

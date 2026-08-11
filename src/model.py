@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoProcessor, LlavaForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForImageTextToText, LlavaForConditionalGeneration
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
 
 
@@ -25,6 +25,7 @@ class PerLayerKVAdapter(nn.Module):
         num_heads: int = 32,
         head_dim: int = 128,
         bottleneck_dim: int = 0,
+        concat_source: bool = False,
     ):
         super().__init__()
         self.num_llm_layers = num_llm_layers
@@ -32,20 +33,24 @@ class PerLayerKVAdapter(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.bottleneck_dim = bottleneck_dim
+        self.concat_source = concat_source
         target_dim = num_heads * head_dim
+
+        # Input dim depends on concat vs mix mode
+        input_dim = source_dim * num_source_layers if concat_source else source_dim
 
         self.source_mix = nn.Parameter(torch.zeros(num_llm_layers, num_source_layers))
 
         if bottleneck_dim > 0:
-            self.k_down = nn.ModuleList([nn.Linear(source_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
+            self.k_down = nn.ModuleList([nn.Linear(input_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
             self.k_up = nn.ModuleList([nn.Linear(bottleneck_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
-            self.v_down = nn.ModuleList([nn.Linear(source_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
+            self.v_down = nn.ModuleList([nn.Linear(input_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
             self.v_up = nn.ModuleList([nn.Linear(bottleneck_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
             self.k_projs = None
             self.v_projs = None
         else:
-            self.k_projs = nn.ModuleList([nn.Linear(source_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
-            self.v_projs = nn.ModuleList([nn.Linear(source_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
+            self.k_projs = nn.ModuleList([nn.Linear(input_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
+            self.v_projs = nn.ModuleList([nn.Linear(input_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
             self.k_down = None
             self.k_up = None
             self.v_down = None
@@ -84,11 +89,17 @@ class PerLayerKVAdapter(nn.Module):
             key: [B, N_vis, num_heads, head_dim]
             value: [B, N_vis, num_heads, head_dim]
         """
-        weights = F.softmax(self.source_mix[layer_idx].float(), dim=-1)
-        weights = weights.to(source_k.dtype)
-
-        mixed_k = torch.einsum("s,bsnd->bnd", weights, source_k)
-        mixed_v = torch.einsum("s,bsnd->bnd", weights, source_v)
+        if self.concat_source:
+            # Concat mode: [B, num_source, N_vis, D] -> [B, N_vis, num_source*D]
+            B, S, N, D = source_k.shape
+            mixed_k = source_k.permute(0, 2, 1, 3).reshape(B, N, S * D)
+            mixed_v = source_v.permute(0, 2, 1, 3).reshape(B, N, S * D)
+        else:
+            # Weighted sum mode
+            weights = F.softmax(self.source_mix[layer_idx].float(), dim=-1)
+            weights = weights.to(source_k.dtype)
+            mixed_k = torch.einsum("s,bsnd->bnd", weights, source_k)
+            mixed_v = torch.einsum("s,bsnd->bnd", weights, source_v)
 
         B, N, _ = mixed_k.shape
         gate = torch.sigmoid(self.gates[layer_idx])
@@ -129,6 +140,13 @@ def extract_vision_kv(
     vision_tower = _get_vision_tower(model)
     vision_model = vision_tower.vision_model if hasattr(vision_tower, "vision_model") else vision_tower
 
+    # Handle multi-crop (LLaVA-1.6): [B, num_crops, C, H, W] -> [B*num_crops, C, H, W]
+    if pixel_values.ndim == 5:
+        B_orig, num_crops = pixel_values.shape[:2]
+        pixel_values = pixel_values.view(-1, *pixel_values.shape[2:])
+    else:
+        B_orig, num_crops = pixel_values.shape[0], 1
+
     hidden = vision_model.embeddings(pixel_values)
     hidden = vision_model.pre_layrnorm(hidden)
 
@@ -144,12 +162,19 @@ def extract_vision_kv(
         if idx in wanted:
             collected_k[idx] = layer.self_attn.k_proj(normed)[:, 1:].float()
             collected_v[idx] = layer.self_attn.v_proj(normed)[:, 1:].float()
-        layer_out = layer(hidden, attention_mask=None, causal_attention_mask=None)
+        layer_out = layer(hidden, attention_mask=None)
         hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
     ordered_indices = sorted(wanted)
     source_k = torch.stack([collected_k[i] for i in ordered_indices], dim=1)
     source_v = torch.stack([collected_v[i] for i in ordered_indices], dim=1)
+
+    # For multi-crop: merge crops into token dimension [B, S, num_crops*N_vis, D]
+    if num_crops > 1:
+        B_total, S, N_vis, D = source_k.shape
+        source_k = source_k.view(B_orig, num_crops, S, N_vis, D).permute(0, 2, 1, 3, 4).reshape(B_orig, S, num_crops * N_vis, D)
+        source_v = source_v.view(B_orig, num_crops, S, N_vis, D).permute(0, 2, 1, 3, 4).reshape(B_orig, S, num_crops * N_vis, D)
+
     return source_k, source_v
 
 
@@ -254,17 +279,17 @@ def student_forward_with_visual_kv(
 
 @torch.no_grad()
 def teacher_forward(
-    model: LlavaForConditionalGeneration,
+    model,
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
+    image_sizes: list | None = None,
 ) -> torch.Tensor:
-    """Standard LLaVA forward to get teacher logits."""
-    outputs = model(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        attention_mask=attention_mask,
-    )
+    """Standard LLaVA/LlavaNext forward to get teacher logits."""
+    kwargs = dict(input_ids=input_ids, pixel_values=pixel_values, attention_mask=attention_mask)
+    if image_sizes is not None:
+        kwargs["image_sizes"] = image_sizes
+    outputs = model(**kwargs)
     return outputs.logits
 
 
@@ -275,7 +300,7 @@ def load_frozen_llava(
 ) -> tuple:
     """Load LLaVA model with all parameters frozen."""
     processor = AutoProcessor.from_pretrained(model_path)
-    model = LlavaForConditionalGeneration.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_path,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,

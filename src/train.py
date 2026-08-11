@@ -20,7 +20,7 @@ from src.model import (
     student_forward_with_visual_kv,
     teacher_forward,
 )
-from src.data import VQADataset, collate_fn
+from src.data import VQADataset, OPDDataset, collate_fn
 
 
 def topk_kl_loss(
@@ -45,12 +45,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="../delta-vision", help="Root for resolving image paths in JSONL")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--init-checkpoint", default=None, help="Load adapter weights from this checkpoint before training")
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--max-answer-tokens", type=int, default=9999)
     parser.add_argument("--kl-topk", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--source-layers", default="22,23", help="Comma-separated ViT layer indices")
     parser.add_argument("--bottleneck-dim", type=int, default=0, help="If >0, use bottleneck: source_dim -> bottleneck -> target_dim")
+    parser.add_argument("--concat-source", action="store_true", help="Concat source layers instead of weighted sum")
+    parser.add_argument("--dataset-type", default="vqa", choices=["vqa", "opd"], help="Dataset format")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="vision-kv-inject")
+    parser.add_argument("--wandb-run-name", default="")
+    parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
@@ -79,18 +87,46 @@ def main():
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
 
     source_layers = [int(x) for x in args.source_layers.split(",")]
+    language_model = model.model.language_model
+    num_llm_layers = len(language_model.layers)
+    num_heads = language_model.config.num_attention_heads
+    head_dim = language_model.config.hidden_size // num_heads
+    if is_main:
+        print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
     adapter = PerLayerKVAdapter(
-        num_llm_layers=32,
+        num_llm_layers=num_llm_layers,
         num_source_layers=len(source_layers),
         source_dim=1024,
-        num_heads=32,
-        head_dim=128,
+        num_heads=num_heads,
+        head_dim=head_dim,
         bottleneck_dim=args.bottleneck_dim,
+        concat_source=args.concat_source,
     )
 
     trainable_params = sum(p.numel() for p in adapter.parameters())
     if is_main:
         print(f"Adapter trainable params: {trainable_params / 1e6:.2f}M")
+
+    wandb_run = None
+    if is_main and args.wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or Path(args.output_dir).name,
+            mode=args.wandb_mode,
+            config={
+                **vars(args),
+                "adapter_trainable_params": trainable_params,
+                "adapter_trainable_millions": trainable_params / 1e6,
+                "world_size": world_size,
+            },
+        )
+
+    if args.init_checkpoint:
+        ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        adapter.load_state_dict(ckpt["state_dict"])
+        if is_main:
+            print(f"Loaded init checkpoint: {args.init_checkpoint}")
 
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     engine, optimizer, _, _ = deepspeed.initialize(
@@ -99,7 +135,8 @@ def main():
         config=args.deepspeed_config,
     )
 
-    dataset = VQADataset(
+    DatasetCls = OPDDataset if args.dataset_type == "opd" else VQADataset
+    dataset = DatasetCls(
         args.data,
         processor,
         data_root=args.data_root,
@@ -110,7 +147,7 @@ def main():
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
     dataloader = DataLoader(
         dataset,
-        batch_size=4,
+        batch_size=args.batch_size,
         sampler=sampler,
         collate_fn=collate_fn,
         num_workers=4,
@@ -134,7 +171,8 @@ def main():
 
             with torch.no_grad():
                 source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
-                teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask)
+                image_sizes = batch.get("image_sizes")
+                teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
 
             B = input_ids.shape[0]
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -182,6 +220,8 @@ def main():
                 print(json.dumps(item), flush=True)
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(item) + "\n")
+                if wandb_run is not None:
+                    wandb_run.log({"train/loss": item["loss"], "train/step": step}, step=step)
 
             if is_main and step > 0 and step % args.save_every == 0:
                 ckpt_path = Path(args.output_dir) / f"step_{step}.pt"
@@ -206,6 +246,8 @@ def main():
         }, final_path)
         print(f"Training complete. Final checkpoint: {final_path}", flush=True)
 
+    if wandb_run is not None:
+        wandb_run.finish()
     dist.destroy_process_group()
 
 

@@ -62,12 +62,15 @@ class VQADataset(Dataset):
         num_image_in_prompt = (prompt_inputs["input_ids"] == image_token_id).sum().item()
         prompt_len = prompt_inputs["input_ids"].shape[1] - num_image_in_prompt
 
-        return {
+        result = {
             "input_ids": inputs["input_ids"].squeeze(0),
             "pixel_values": inputs["pixel_values"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
             "prompt_len": prompt_len,
         }
+        if "image_sizes" in inputs:
+            result["image_sizes"] = inputs["image_sizes"]
+        return result
 
 
 def collate_fn(batch: list[dict]) -> dict:
@@ -92,12 +95,15 @@ def collate_fn(batch: list[dict]) -> dict:
         attention_masks.append(mask)
         prompt_lens.append(item["prompt_len"])
 
-    return {
+    result = {
         "input_ids": torch.stack(input_ids),
         "pixel_values": torch.stack(pixel_values),
         "attention_mask": torch.stack(attention_masks),
         "prompt_lens": torch.tensor(prompt_lens, dtype=torch.long),
     }
+    if "image_sizes" in batch[0]:
+        result["image_sizes"] = [item["image_sizes"] for item in batch]
+    return result
 
 
 class MMStarDataset(Dataset):
@@ -141,4 +147,56 @@ class MMStarDataset(Dataset):
             "attention_mask": inputs["attention_mask"].squeeze(0),
             "gold": gold,
             "index": row.get("index", idx),
+        }
+
+
+class OPDDataset(Dataset):
+    """Vision-OPD-6K dataset."""
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        processor,
+        data_root: str | None = None,
+        max_samples: int | None = None,
+        shuffle: bool = False,
+        seed: int = 42,
+    ):
+        self.processor = processor
+        self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
+
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            self.rows = [json.loads(line) for line in f if line.strip()]
+
+        if shuffle:
+            rng = random.Random(seed)
+            rng.shuffle(self.rows)
+        if max_samples is not None:
+            self.rows = self.rows[:max_samples]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.rows[idx]
+        image_path = self.data_root / row["images"][0]
+        problem = row["problem"]
+        answer = str(row["answer"]).strip()
+
+        prompt = f"USER: {problem}\nASSISTANT:"
+        full_text = f"{prompt} {answer}"
+
+        image = Image.open(image_path).convert("RGB")
+        inputs = self.processor(text=full_text, images=image, return_tensors="pt")
+        prompt_inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+
+        image_token_id = 32000
+        num_image_in_prompt = (prompt_inputs["input_ids"] == image_token_id).sum().item()
+        prompt_len = prompt_inputs["input_ids"].shape[1] - num_image_in_prompt
+
+        return {
+            "input_ids": inputs["input_ids"].squeeze(0),
+            "pixel_values": inputs["pixel_values"].squeeze(0),
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+            "prompt_len": prompt_len,
         }
