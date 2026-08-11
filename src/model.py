@@ -477,3 +477,92 @@ def student_forward_optimized(
     hidden = norm(hidden)
     logits = model.lm_head(hidden)
     return logits
+
+
+def student_forward_flex(
+    model: LlavaForConditionalGeneration,
+    input_ids: torch.Tensor,
+    adapter: PerLayerKVAdapter,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    image_token_id: int,
+) -> torch.Tensor:
+    """Optimized forward using flex_attention (no Q-padding waste).
+
+    flex_attention compiles a custom prefix-causal mask into an efficient kernel,
+    computing attention only for the 67 actual Q rows instead of padding to 643.
+    """
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+    text_mask = input_ids[0] != image_token_id
+    text_ids = input_ids[:, text_mask]
+
+    language_model = _get_language_model(model)
+    text_embeds = language_model.embed_tokens(text_ids)
+
+    layers = language_model.layers
+    norm = language_model.norm
+    rotary_emb = language_model.rotary_emb
+
+    B, T, _ = text_embeds.shape
+    N_vis = source_k.shape[2]
+    device = text_embeds.device
+    dtype = text_embeds.dtype
+
+    text_position_ids = torch.arange(N_vis, N_vis + T, device=device).unsqueeze(0)
+    image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0)
+
+    # Create prefix-causal block mask once
+    def prefix_causal(b, h, q_idx, kv_idx):
+        return kv_idx <= q_idx + N_vis
+
+    block_mask = create_block_mask(prefix_causal, B=1, H=1, Q_LEN=T, KV_LEN=N_vis + T, device=device)
+
+    # Pre-compute adapter KV
+    src_k_cast = source_k.to(dtype=dtype)
+    src_v_cast = source_v.to(dtype=dtype)
+
+    all_vis_k = []
+    all_vis_v = []
+    dummy_ref = text_embeds[:, :1, :]
+    cos_img, sin_img = rotary_emb(dummy_ref, image_position_ids)
+    for layer_idx in range(len(layers)):
+        vis_k, vis_v = adapter.forward_layer(src_k_cast, src_v_cast, layer_idx)
+        vis_k = vis_k.transpose(1, 2)
+        vis_v = vis_v.transpose(1, 2)
+        vis_k, _ = apply_rotary_pos_emb(vis_k, vis_k, cos_img, sin_img)
+        all_vis_k.append(vis_k)
+        all_vis_v.append(vis_v)
+
+    hidden = text_embeds
+
+    for layer_idx, layer in enumerate(layers):
+        residual = hidden
+        normed = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+
+        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+
+        cos_txt, sin_txt = rotary_emb(normed, text_position_ids)
+        q, text_k = apply_rotary_pos_emb(q, text_k, cos_txt, sin_txt)
+
+        k = torch.cat([all_vis_k[layer_idx], text_k], dim=2)
+        v = torch.cat([all_vis_v[layer_idx], text_v], dim=2)
+
+        attn_out = flex_attention(q, k, v, block_mask=block_mask)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+        attn_out = attn.o_proj(attn_out)
+
+        hidden = residual + attn_out
+        residual = hidden
+        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+
+    hidden = norm(hidden)
+    logits = model.lm_head(hidden)
+    return logits
