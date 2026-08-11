@@ -1,0 +1,34 @@
+[project]
+name = "vision-kv-inject"
+version = "0.1.0"
+description = "Inject vision encoder KV cache into LLM via per-layer adapters"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "transformers>=4.46",
+    "accelerate>=1.0",
+    "deepspeed>=0.15",
+    "pillow>=10.0",
+    "safetensors>=0.4",
+    "sentencepiece>=0.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
