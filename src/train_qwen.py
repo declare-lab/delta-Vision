@@ -12,7 +12,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import sys
 sys.path.insert(0, ".")
 from src.model import (
-    QWEN_SOURCE_MERGER,
+    QWEN_SOURCE_RAW_SPATIAL_CONCAT,
     PerLayerKVAdapter,
     extract_vision_kv_qwen,
     infer_adapter_config_from_checkpoint,
@@ -176,7 +176,8 @@ def main():
     num_kv_heads = lm.config.num_key_value_heads
     head_dim = lm.layers[0].self_attn.head_dim
     spatial_merge_size = int(getattr(model.model.visual, "spatial_merge_size", 2))
-    merger_dim = qwen_source_dim(model, QWEN_SOURCE_MERGER)
+    source_mode = QWEN_SOURCE_RAW_SPATIAL_CONCAT
+    source_dim = qwen_source_dim(model, source_mode)
 
     init_ckpt = None
     init_config = None
@@ -184,11 +185,11 @@ def main():
         init_ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
         init_config, init_source_layers = infer_adapter_config_from_checkpoint(init_ckpt, language_model=lm)
         saved_config = init_ckpt.get("adapter_config", {})
-        checkpoint_source_mode = saved_config.get("qwen_source_mode", saved_config.get("source_mode", QWEN_SOURCE_MERGER))
-        if checkpoint_source_mode != QWEN_SOURCE_MERGER:
+        checkpoint_source_mode = saved_config.get("qwen_source_mode", saved_config.get("source_mode", source_mode))
+        if checkpoint_source_mode != source_mode:
             raise ValueError(
                 f"Init checkpoint uses unsupported Qwen source_mode={checkpoint_source_mode!r}; "
-                "raw spatial concat checkpoints are not compatible with the merger-source adapter."
+                f"expected {source_mode!r}."
             )
         if init_source_layers != source_layers:
             raise ValueError(
@@ -196,12 +197,10 @@ def main():
                 "pass matching --source-layers or use a compatible checkpoint."
             )
 
-    source_mode = QWEN_SOURCE_MERGER
-    source_dim = merger_dim
     if init_config is not None and init_config["source_dim"] != source_dim:
         raise ValueError(
             f"Init checkpoint source_dim={init_config['source_dim']} is incompatible with "
-            f"source_mode={source_mode} source_dim={source_dim}. Retrain from a merger-source checkpoint."
+            f"source_mode={source_mode} source_dim={source_dim}."
         )
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_kv_heads} kv_heads, head_dim={head_dim}")

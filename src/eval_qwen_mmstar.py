@@ -11,7 +11,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from src.data import QwenMMStarDataset
 from src.eval_mmstar import _eos_token_ids, extract_option_from_text
 from src.model import (
-    QWEN_SOURCE_MERGER,
+    QWEN_SOURCE_RAW_SPATIAL_CONCAT,
     PerLayerKVAdapter,
     extract_vision_kv_qwen,
     load_adapter_checkpoint,
@@ -28,18 +28,19 @@ def dtype_from_name(name: str) -> torch.dtype:
     }[name]
 
 
-def validate_merger_source_checkpoint(model, adapter_config: dict) -> None:
+def validate_qwen_source_checkpoint(model, adapter_config: dict) -> None:
+    source_mode = QWEN_SOURCE_RAW_SPATIAL_CONCAT
     saved_mode = adapter_config.get("qwen_source_mode", adapter_config.get("source_mode"))
-    if saved_mode is not None and saved_mode != QWEN_SOURCE_MERGER:
+    if saved_mode is not None and saved_mode != source_mode:
         raise ValueError(
             f"Checkpoint uses unsupported Qwen source_mode={saved_mode!r}; "
-            "raw spatial concat checkpoints are not compatible with the merger-source adapter."
+            f"expected {source_mode!r}."
         )
-    expected_source_dim = qwen_source_dim(model, QWEN_SOURCE_MERGER)
+    expected_source_dim = qwen_source_dim(model, source_mode)
     if int(adapter_config["source_dim"]) != expected_source_dim:
         raise ValueError(
             f"Checkpoint source_dim={adapter_config['source_dim']} does not match "
-            f"merger source_dim={expected_source_dim}. Retrain from a merger-source checkpoint."
+            f"{source_mode} source_dim={expected_source_dim}."
         )
 
 
@@ -278,8 +279,8 @@ def run_single_shard(args, shard_id: int, num_shards: int) -> dict:
         language_model=model.model.language_model,
         dtype=dtype,
     )
-    validate_merger_source_checkpoint(model, adapter_config)
-    source_mode = QWEN_SOURCE_MERGER
+    validate_qwen_source_checkpoint(model, adapter_config)
+    source_mode = QWEN_SOURCE_RAW_SPATIAL_CONCAT
 
     dataset = QwenMMStarDataset(
         args.data,

@@ -62,12 +62,29 @@ No MLP computation on visual tokens at any layer -- the main source of speedup.
 - LLaVA-1.6 Mistral (CLIP ViT + Mistral, multi-crop)
 - Qwen3-VL-4B (Qwen3 ViT + M-RoPE)
 
+## Data Preparation
+
+Mix Pixmo-clean with FineVision LLaVA-Instruct-150K:
+
+```bash
+.venv/bin/python scripts/prepare_mixed_data_v2.py
+```
+
+Default output:
+
+```text
+/lustre-data/leijingdi/code/delta-vision/data/pixmo_clean_finevision_llava150k/train.jsonl
+```
+
+Use that file with `--data-root /lustre-data/leijingdi/code/delta-vision/data/pixmo_clean_finevision_llava150k`.
+
 ## Project Structure
 
 
 ## TODO
-- [x] Replace default Qwen raw 2x2 KV concat with official PatchMerger source features
+- [x] Replace hardcoded Qwen 2x2 concat with spatial_merge_size-aware raw ViT QKV concat
 - [x] Add Qwen3-VL MMStar generation eval for this adapter
+- [x] Add Pixmo-clean + FineVision LLaVA-150K mixed data preparation
 - [ ] Add DeepStack-aware Qwen source features
 - [x] Add optional KV MSE loss for per-layer Qwen supervision
 - [x] Cosine LR schedule with warmup for training

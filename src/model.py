@@ -675,6 +675,9 @@ def extract_vision_kv_qwen(
         raise ValueError(f"Cannot spatial-merge {N} Qwen tokens by merge_unit={merge_unit}")
     source_k = source_k.view(1, S, N // merge_unit, merge_unit * D)
     source_v = source_v.view(1, S, N // merge_unit, merge_unit * D)
+    expected_tokens = int((grid_thw.prod(dim=-1) // merge_unit).sum().item())
+    if source_k.shape[2] != expected_tokens:
+        raise ValueError(f"Qwen source tokens {source_k.shape[2]} != grid-derived image tokens {expected_tokens}")
 
     return source_k, source_v
 
@@ -690,7 +693,7 @@ def student_forward_qwen(
     full_input_ids=None,
     mm_token_type_ids=None,
     attention_mask=None,
-    use_lower_right_causal=True,
+    use_lower_right_causal=False,
 ):
     language_model = model.model.language_model
     layers = language_model.layers
@@ -730,7 +733,7 @@ def student_forward_qwen(
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
         )
-        img_token_id = 151655
+        img_token_id = int(getattr(model.config, "image_token_id", getattr(model.config, "image_token_index", 151655)))
         valid_full = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(full_input_ids[0], dtype=torch.bool)
         img_mask_full = (full_input_ids[0] == img_token_id) & valid_full
         txt_mask_full = (~img_mask_full) & valid_full
