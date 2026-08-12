@@ -58,7 +58,7 @@ class PerLayerKVAdapter(nn.Module):
             self.v_down = None
             self.v_up = None
 
-        self.gates = nn.Parameter(torch.zeros(num_llm_layers))
+        self.gates = nn.Parameter(torch.full((num_llm_layers,), -5.0))
         self._init_weights()
 
     def _init_weights(self):
@@ -644,21 +644,11 @@ def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[
     source_v = torch.stack([qkv_outputs[i][1] for i in ordered], dim=0).unsqueeze(0)
 
     if spatial_merge:
-        t = int(grid_thw[0][0])
-        h = int(grid_thw[0][1])
-        w = int(grid_thw[0][2])
-        merge_size = 2
         S = source_k.shape[1]
+        N = source_k.shape[2]
         D = source_k.shape[3]
-        # [1, S, t*h*w, D] -> [1, S, t*(h//2)*(w//2), 4*D]
-        def do_merge(x):
-            x = x.view(1, S, t, h, w, D)
-            x = x.view(1, S, t, h // merge_size, merge_size, w // merge_size, merge_size, D)
-            x = x.permute(0, 1, 2, 3, 5, 4, 6, 7).contiguous()
-            x = x.view(1, S, t * (h // merge_size) * (w // merge_size), merge_size * merge_size * D)
-            return x
-        source_k = do_merge(source_k)
-        source_v = do_merge(source_v)
+        source_k = source_k.view(1, S, N // 4, 4 * D)
+        source_v = source_v.view(1, S, N // 4, 4 * D)
 
     return source_k, source_v
 
@@ -677,13 +667,19 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
         t_dim = int(image_grid_thw[0][0])
         h_dim = int(image_grid_thw[0][1]) // spatial_merge_size
         w_dim = int(image_grid_thw[0][2]) // spatial_merge_size
-        temporal_ids = torch.zeros(N_vis, dtype=torch.long, device=device)
-        height_ids = torch.arange(h_dim, device=device).repeat_interleave(w_dim).repeat(t_dim)[:N_vis]
-        width_ids = torch.arange(w_dim, device=device).repeat(h_dim * t_dim)[:N_vis]
+        # Image positions: temporal=0+start, height=start..start+h-1, width=start..start+w-1
+        # start_position = 0 (image comes first, no text before it)
+        start_pos = 0
+        temporal_ids = torch.zeros(N_vis, dtype=torch.long, device=device) + start_pos
+        height_ids = (torch.arange(h_dim, device=device) + start_pos).repeat_interleave(w_dim).repeat(t_dim)[:N_vis]
+        width_ids = (torch.arange(w_dim, device=device) + start_pos).repeat(h_dim * t_dim)[:N_vis]
         img_pos_3d = torch.stack([temporal_ids, height_ids, width_ids], dim=0).unsqueeze(1)
+        # Text positions: start at max(h_dim, w_dim) after image, all 3 dims same
+        text_start = start_pos + max(h_dim, w_dim)
     else:
         img_pos_3d = torch.zeros(3, 1, N_vis, dtype=torch.long, device=device)
-    text_pos_1d = torch.arange(N_vis, N_vis + T, device=device)
+        text_start = N_vis
+    text_pos_1d = torch.arange(text_start, text_start + T, device=device)
     text_pos_3d = text_pos_1d.unsqueeze(0).expand(3, -1).unsqueeze(1)
     rope_dim = rotary_emb.inv_freq.shape[0] * 2
     dummy_img = torch.zeros(1, N_vis, rope_dim, device=device)

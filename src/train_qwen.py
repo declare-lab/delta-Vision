@@ -83,7 +83,9 @@ def parse_args():
     parser.add_argument("--lambda-kv-mse", type=float, default=0.5)
     parser.add_argument("--use-activation", action="store_true")
     parser.add_argument("--bottleneck-dim", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--warmup-ratio", type=float, default=0.2)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=500)
@@ -140,6 +142,17 @@ def main():
             print(f"Loaded init checkpoint: {args.init_checkpoint}")
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     engine, optimizer, _, _ = deepspeed.initialize(model=adapter, optimizer=optimizer, config=args.deepspeed_config)
+
+    # Cosine LR scheduler with warmup
+    warmup_steps = int(args.max_steps * args.warmup_ratio)
+    min_lr = args.lr * args.min_lr_ratio
+    import math
+    def get_lr(step):
+        if step < warmup_steps:
+            return args.lr * step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(args.max_steps - warmup_steps, 1)
+        return min_lr + (args.lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
 
     wandb_run = None
     if is_main and args.wandb:
@@ -215,6 +228,10 @@ def main():
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             engine.backward(loss)
+            # Update LR before step
+            current_lr = get_lr(step)
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
             engine.step()
 
             if is_main and step % args.log_every == 0:
@@ -223,7 +240,7 @@ def main():
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(item) + "\n")
                 if wandb_run:
-                    wandb_run.log({"train/loss": item["loss"]}, step=step)
+                    wandb_run.log({"train/loss": item["loss"], "train/lr": current_lr}, step=step)
 
             if is_main and step > 0 and step % args.save_every == 0:
                 torch.save({"state_dict": engine.module.state_dict(), "step": step, "args": vars(args)},
