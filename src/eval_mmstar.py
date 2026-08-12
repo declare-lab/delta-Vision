@@ -27,8 +27,8 @@ def get_option_token_ids(tokenizer) -> dict[str, list[int]]:
     result = {}
     for letter in OPTION_LETTERS:
         ids = tokenizer.encode(letter, add_special_tokens=False)
-        ids_space = tokenizer.encode(" " + letter, add_special_tokens=False)
-        result[letter] = list(set(ids + ids_space))
+        # Only use bare letter token (single token)
+        result[letter] = ids
     return result
 
 

@@ -212,7 +212,9 @@ def main():
 
                 # Student: text-only, answer starts at text_prompt_len-1 (causal: predict next)
                 s_start = max(0, text_prompt_len - 1)
-                s_end = min(s_start + args.max_answer_tokens, num_text)
+                # Exclude pad tokens from answer range
+                actual_len = int(attention_mask[i].sum().item()) - n_image_tokens
+                s_end = min(s_start + args.max_answer_tokens, actual_len)
                 s_answer = student_logits[0, s_start:s_end]
 
                 # Teacher: full sequence with image tokens expanded
