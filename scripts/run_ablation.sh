@@ -57,7 +57,7 @@ run_experiment() {
           --model-path "$MODEL_PATH" \
           --data ../delta-vision/data/mmstar/mmstar_val.jsonl \
           --data-root ../delta-vision \
-          --checkpoint "${out_dir}/step_${MAX_STEPS}.pt" \
+          --checkpoint "${out_dir}/final.pt" \
           --output-dir "${out_dir}/eval" \
           --num-shards 8 \
           --max-samples 1000 \
@@ -69,7 +69,7 @@ run_experiment() {
       --model-path "$MODEL_PATH" \
       --data ../delta-vision/data/mmstar/mmstar_val.jsonl \
       --data-root ../delta-vision \
-      --checkpoint "${out_dir}/step_${MAX_STEPS}.pt" \
+      --checkpoint "${out_dir}/final.pt" \
       --output-dir "${out_dir}/eval" \
       --num-shards 8
     echo ""

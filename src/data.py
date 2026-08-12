@@ -190,7 +190,7 @@ class OPDDataset(Dataset):
         problem = row["problem"]
         answer = str(row["answer"]).strip()
 
-        prompt = f"USER: {problem}\nASSISTANT:"
+        prompt = f"USER: <image>\n{problem}\nASSISTANT:"
         full_text = f"{prompt} {answer}"
 
         image = Image.open(image_path).convert("RGB")

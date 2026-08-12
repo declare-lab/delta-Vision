@@ -165,6 +165,7 @@ def main():
                 break
 
             input_ids = batch["input_ids"].to(device)
+            B = input_ids.shape[0]
             pixel_values = batch["pixel_values"].to(device) if torch.is_tensor(batch["pixel_values"]) else batch["pixel_values"]
             attention_mask = batch["attention_mask"].to(device)
             prompt_lens = batch["prompt_lens"].to(device)
@@ -190,7 +191,6 @@ def main():
                     teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
                     source_k_list = source_v_list = teacher_logits_list = None
 
-            B = input_ids.shape[0]
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             for i in range(B):
