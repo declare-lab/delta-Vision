@@ -1,20 +1,18 @@
 # Vision KV Inject
 
-Inject vision encoder KV cache into LLM attention layers via lightweight adapters, replacing visual token embeddings for faster prefill.
+Inject vision encoder KV cache into LLM attention layers via per-layer adapters, replacing visual token embeddings for faster prefill.
 
-## Two Methods
+## Method
 
-### Method 1: Direct KV Prediction
 
-- Adapter directly predicts each layer's visual K,V
-- Simple architecture, fast training
-- Best for speed (no dependency on frozen LLM weights)
 
-### Method 2: Hidden State Adapter (experimental)
+Each LLM layer has an independent adapter that maps ViT KV to LLM KV space:
+- source_mix: learnable softmax weights over source ViT layers
+- k_proj / v_proj: Linear(source_dim -> num_kv_heads * head_dim, bias=True)
+- gate: sigmoid scalar (init=0)
 
-- Adapter maps to LLM hidden space, LLM's own k_proj/v_proj create KV
-- Leverages LLM's native projection weights (already trained for visual tokens)
-- Shows phase-transition learning (sudden loss drop after ~400 steps)
+Text tokens go through the LLM normally. Visual info enters only via KV injection in attention.
+No MLP computation on visual tokens at any layer -- the main source of speedup.
 
 ## Results
 
@@ -30,13 +28,10 @@ Inject vision encoder KV cache into LLM attention layers via lightweight adapter
 
 | Config | Teacher | Adapter-only (best) | Params |
 |--------|---------|--------------------|----|
-| Method 1 (4000 steps) | 57.8% | 44.7% (77%) | 75.6M |
-| Method 1 (8000 steps) | 57.8% | 44.7% (77%) | 75.6M |
-| Method 2 (500 steps, phase transition) | 69.5%* | 25.0%* | 94.6M |
+| ViT KV source, 4000 steps | 57.8% | 44.7% (77%) | 75.6M |
+| ViT KV source, 8000 steps | 57.8% | 44.7% (77%) | 75.6M |
 
-*200 samples evaluation
-
-### Prefill Speed (torch.compile, H200)
+### Prefill Speed (torch.compile, both sides, H200)
 
 | Model | Visual Tokens | Teacher | Ours (compiled) | Speedup |
 |-------|-------------|---------|-----------------|---------|
@@ -57,27 +52,13 @@ Inject vision encoder KV cache into LLM attention layers via lightweight adapter
 
 ## Key Findings
 
-1. **Speed scales with visual tokens**: More crops/patches = larger speedup (6.5x for LLaVA-1.6)
-2. **ViT K,V projections > hidden states** as source: attention-ready features transfer better
-3. **GQA models need tiny adapters**: 67M for Mistral (8 KV heads), vs 269M for Vicuna (32 heads)
-4. **M-RoPE matters**: Correct 3D position encoding for Qwen3-VL visual tokens
-5. **Phase transition in Method 2**: Sudden loss collapse after ~400 steps when adapter finds the right mapping
-6. **Same vision encoder, multiple LLMs**: One ViT serves different backends via per-LLM adapters
+1. Speed scales with visual tokens: more crops/patches = larger speedup (6.5x for LLaVA-1.6)
+2. ViT K,V projections > hidden states as source
+3. GQA models need tiny adapters: 67M for Mistral (8 KV heads)
+4. Same vision encoder serves multiple LLMs via per-LLM adapters
+5. Bottleneck + Mixed mode can exceed teacher accuracy
 
-## Architecture Details
-
-### Adapter Design (Method 1, per LLM layer)
-- : learnable softmax weights over 2 ViT source layers
-- : Linear(source_dim -> num_kv_heads * head_dim, bias=True)
-- : sigmoid scalar (init=0, gradual injection)
-
-### Training
-- Loss: top-1024 KL divergence (student vs teacher logits)
-- Optimizer: AdamW, lr=1e-4
-- Infrastructure: DeepSpeed ZeRO-2, 8x H200 GPUs
-- Data: PixMo-AMA (VQA)
-
-### Supported Models
+## Supported Models
 - LLaVA-1.5-7B/13B (CLIP ViT + Vicuna)
 - LLaVA-1.6 Mistral (CLIP ViT + Mistral, multi-crop)
 - Qwen3-VL-4B (Qwen3 ViT + M-RoPE)
@@ -86,8 +67,7 @@ Inject vision encoder KV cache into LLM attention layers via lightweight adapter
 
 
 ## TODO
-- [ ] Train Method 2 to 4000 steps (currently shows phase transition at step 400)
-- [ ] Add trajectory loss (intermediate hidden state matching)
+- [ ] Use post-merger tokens (192) instead of pre-merger (768) for Qwen3-VL
+- [ ] Add KV MSE loss for per-layer supervision
 - [ ] Cosine LR schedule with warmup
-- [ ] Qwen3.5-VL validation
-- [ ] Visual token pooling (compress 768 -> 64 tokens)
+- [ ] More training data / longer training
