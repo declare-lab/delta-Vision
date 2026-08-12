@@ -80,7 +80,10 @@ def evaluate(args):
         source_k, source_v = extract_vision_kv(model, pixel_values, source_layers)
 
         # 1. Teacher (original LLaVA)
-        t_logits = teacher_forward(model, input_ids, pixel_values, None)
+        image_sizes = item.get("image_sizes")
+        if image_sizes is not None:
+            image_sizes = image_sizes.unsqueeze(0).to(device) if torch.is_tensor(image_sizes) else image_sizes
+        t_logits = teacher_forward(model, input_ids, pixel_values, image_sizes=image_sizes)
         t_pred = predict_option(t_logits[0, -1], option_ids)
 
         # 2. Adapter only (vision KV inject, no image embeddings)

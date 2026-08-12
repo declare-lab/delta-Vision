@@ -89,8 +89,8 @@ def main():
     source_layers = [int(x) for x in args.source_layers.split(",")]
     language_model = model.model.language_model
     num_llm_layers = len(language_model.layers)
-    num_heads = language_model.config.num_attention_heads
-    head_dim = language_model.config.hidden_size // num_heads
+    num_heads = getattr(language_model.config, "num_key_value_heads", language_model.config.num_attention_heads)
+    head_dim = language_model.config.hidden_size // language_model.config.num_attention_heads
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
     adapter = PerLayerKVAdapter(
@@ -165,22 +165,42 @@ def main():
                 break
 
             input_ids = batch["input_ids"].to(device)
-            pixel_values = batch["pixel_values"].to(device)
+            pixel_values = batch["pixel_values"].to(device) if torch.is_tensor(batch["pixel_values"]) else batch["pixel_values"]
             attention_mask = batch["attention_mask"].to(device)
             prompt_lens = batch["prompt_lens"].to(device)
 
             with torch.no_grad():
-                source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
                 image_sizes = batch.get("image_sizes")
-                teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
+                if isinstance(pixel_values, list):
+                    # Variable crops: process per-sample
+                    source_k_list, source_v_list, teacher_logits_list = [], [], []
+                    for i in range(B):
+                        pv_i = pixel_values[i].unsqueeze(0).to(device)
+                        sk, sv = extract_vision_kv(model, pv_i, source_layer_indices=source_layers)
+                        source_k_list.append(sk)
+                        source_v_list.append(sv)
+                        isz = image_sizes[i:i+1].to(device) if image_sizes is not None and torch.is_tensor(image_sizes) else None
+                        tl = teacher_forward(model, input_ids[i:i+1], pv_i, image_sizes=isz)
+                        teacher_logits_list.append(tl)
+                    source_k = source_v = teacher_logits = None
+                else:
+                    if image_sizes is not None and torch.is_tensor(image_sizes):
+                        image_sizes = image_sizes.to(device)
+                    source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
+                    teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
+                    source_k_list = source_v_list = teacher_logits_list = None
 
             B = input_ids.shape[0]
             total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
             for i in range(B):
                 single_ids = input_ids[i:i+1]
-                single_sk = source_k[i:i+1]
-                single_sv = source_v[i:i+1]
+                if source_k_list is not None:
+                    single_sk = source_k_list[i]
+                    single_sv = source_v_list[i]
+                else:
+                    single_sk = source_k[i:i+1]
+                    single_sv = source_v[i:i+1]
 
                 student_logits = student_forward_with_visual_kv(
                     model, single_ids, engine.module, single_sk, single_sv, image_token_id
@@ -199,8 +219,13 @@ def main():
                 # Answer starts at (576 + text_prompt_len - 1) in teacher space
                 n_image_tokens = (single_ids[0] == image_token_id).sum().item()
                 t_start = n_image_tokens + text_prompt_len - 1
-                t_end = min(t_start + args.max_answer_tokens, teacher_logits.shape[1])
-                t_answer = teacher_logits[i, t_start:t_end]
+                if teacher_logits_list is not None:
+                    t_logits_i = teacher_logits_list[i][0]
+                    t_end = min(t_start + args.max_answer_tokens, t_logits_i.shape[0])
+                    t_answer = t_logits_i[t_start:t_end]
+                else:
+                    t_end = min(t_start + args.max_answer_tokens, teacher_logits.shape[1])
+                    t_answer = teacher_logits[i, t_start:t_end]
 
                 if s_answer.shape[0] > 0 and t_answer.shape[0] > 0:
                     min_len = min(s_answer.shape[0], t_answer.shape[0])

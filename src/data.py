@@ -97,12 +97,16 @@ def collate_fn(batch: list[dict]) -> dict:
 
     result = {
         "input_ids": torch.stack(input_ids),
-        "pixel_values": torch.stack(pixel_values),
+        "pixel_values": torch.stack(pixel_values) if all(p.shape == pixel_values[0].shape for p in pixel_values) else pixel_values,
         "attention_mask": torch.stack(attention_masks),
         "prompt_lens": torch.tensor(prompt_lens, dtype=torch.long),
     }
     if "image_sizes" in batch[0]:
-        result["image_sizes"] = [item["image_sizes"] for item in batch]
+        sizes = [item["image_sizes"] for item in batch]
+        if torch.is_tensor(sizes[0]):
+            result["image_sizes"] = torch.cat(sizes, dim=0)
+        else:
+            result["image_sizes"] = sizes
     return result
 
 
@@ -141,13 +145,16 @@ class MMStarDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         inputs = self.processor(text=prompt, images=image, return_tensors="pt")
 
-        return {
+        result = {
             "input_ids": inputs["input_ids"].squeeze(0),
             "pixel_values": inputs["pixel_values"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
             "gold": gold,
             "index": row.get("index", idx),
         }
+        if "image_sizes" in inputs:
+            result["image_sizes"] = inputs["image_sizes"].squeeze(0)
+        return result
 
 
 class OPDDataset(Dataset):

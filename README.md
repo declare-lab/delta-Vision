@@ -1,122 +1,93 @@
 # Vision KV Inject
 
-**Idea**: Replace visual token embeddings in LLaVA with direct KV injection from the vision encoder into LLM attention layers, enabling faster prefill while maintaining accuracy.
+Inject vision encoder KV cache into LLM attention layers via lightweight adapters, replacing visual token embeddings for faster prefill.
 
-## Architecture
+## Two Methods
 
-```
-Image -> CLIP ViT (frozen) -> Extract K,V from last 2 layers (22, 23)
-                                    |
-                         Per-layer KV Adapter (trainable)
-                                    |
-              LLM Attention: concat(visual_KV, text_KV) -> output
-```
+### Method 1: Direct KV Prediction
 
-### Standard LLaVA
-- Image -> ViT -> Projector -> 576 visual tokens as LLM input embeddings
-- LLM processes 576 + T tokens through all layers (Q, K, V, MLP on every token)
+- Adapter directly predicts each layer's visual K,V
+- Simple architecture, fast training
+- Best for speed (no dependency on frozen LLM weights)
 
-### Ours (Vision KV Inject)
-- Image -> ViT -> Extract K,V projections from layers 22,23 -> Adapter -> Visual KV
-- LLM only processes T text tokens; visual info enters via KV concatenation in attention
-- **No MLP computation on visual tokens** -- the main source of speedup
+### Method 2: Hidden State Adapter (experimental)
 
-### Adapter Design
-Each LLM layer has an independent adapter:
-- `source_mix`: learnable softmax weights over 2 source ViT layers
-- `k_proj`: Linear(1024 -> num_heads * head_dim, bias=True)
-- `v_proj`: Linear(1024 -> num_heads * head_dim, bias=True)
-- `gate`: sigmoid scalar controlling injection strength (init=0)
-
-### Training
-- **Frozen**: Vision encoder + LLM (all parameters)
-- **Trainable**: Only adapter (~269M for 7B, ~420M for 13B)
-- **Loss**: Top-1024 KL divergence between teacher (original LLaVA) and student logits on answer tokens
-- **Infrastructure**: DeepSpeed ZeRO-2, 8x H200 GPUs
+- Adapter maps to LLM hidden space, LLM's own k_proj/v_proj create KV
+- Leverages LLM's native projection weights (already trained for visual tokens)
+- Shows phase-transition learning (sudden loss drop after ~400 steps)
 
 ## Results
 
-### LLaVA-1.5-7B (MMStar 1000 samples)
+### LLaVA Family (shared CLIP ViT-L/14@336)
 
-| Setting | Adapter-only | Mixed (original + adapter KV) |
-|---------|-------------|-------------------------------|
-| Teacher (original LLaVA) | -- | 38.2% |
-| Step 500 | 35.3% | 28.7% |
-| Step 1500 (peak) | **36.4%** (95.3% retention) | 29.8% |
-| Bottleneck 256 + Mixed | 25.9% | **39.0%** (exceeds teacher!) |
-| Single layer 23 + Mixed | 33.6% | **37.4%** |
+| Model | LLM | Teacher | Adapter-only | Params | E2E Speedup | KV Cached |
+|-------|-----|---------|-------------|--------|-------------|-----------|
+| LLaVA-1.5-7B | Vicuna-7B (MHA) | 38.2% | 36.4% (95%) | 269M | 1.87x | 2.50x |
+| LLaVA-1.5-13B | Vicuna-13B (MHA) | 38.7% | 34.6% (89%) | 420M | 1.96x | 2.89x |
+| LLaVA-1.6 Mistral | Mistral-7B (GQA-8) | 48.0% | 43.5% (91%) | 67M | 4.08x | 6.50x |
 
-### LLaVA-1.5-13B (MMStar 1000 samples)
+### Qwen3-VL-4B (Qwen3 ViT, M-RoPE)
 
-| Setting | Adapter-only | Mixed |
-|---------|-------------|-------|
-| Teacher (original LLaVA-13B) | -- | 38.7% |
-| Step 2000 (peak) | **34.5%** (89% retention) | 28.0% |
-| Step 4000 | 34.6% | 28.9% |
+| Config | Teacher | Adapter-only (best) | Params |
+|--------|---------|--------------------|----|
+| Method 1 (4000 steps) | 57.8% | 44.7% (77%) | 75.6M |
+| Method 1 (8000 steps) | 57.8% | 44.7% (77%) | 75.6M |
+| Method 2 (500 steps, phase transition) | 69.5%* | 25.0%* | 94.6M |
 
-### Prefill Speed (torch.compile, both sides, H200)
+*200 samples evaluation
 
-| Model | Method | Latency | Speedup |
-|-------|--------|---------|---------|
-| **7B** | LLaVA compiled | 37.0 ms | 1.00x |
-| | Ours e2e (no cache) | 20.7 ms | **1.87x** |
-| | Ours (KV cached) | 15.4 ms | **2.50x** |
-| **13B** | LLaVA compiled | 35.3 ms | 1.00x |
-| | Ours e2e (no cache) | 18.0 ms | **1.96x** |
-| | Ours (KV cached) | 12.2 ms | **2.89x** |
+### Prefill Speed (torch.compile, H200)
 
-### Ablation (7B, 500 steps, MMStar)
+| Model | Visual Tokens | Teacher | Ours (compiled) | Speedup |
+|-------|-------------|---------|-----------------|---------|
+| LLaVA-1.5-7B | 576 | 37.0 ms | 15.4 ms | 2.50x |
+| LLaVA-1.5-13B | 576 | 35.3 ms | 12.2 ms | 2.89x |
+| LLaVA-1.6 Mistral | 2880 | 391.5 ms | 60.2 ms | 6.50x |
+| Qwen3-VL-4B | 768 | 36.9 ms | 7.1 ms | 5.19x |
 
-| Experiment | Params | Adapter-only | Mixed |
-|------------|--------|-------------|-------|
-| 2-layer (22,23) weighted sum | 269M | 34.5% | 29.5% |
-| 2-layer (22,23) concat | 537M | 35.2% | 31.5% |
-| 1-layer 22 only | 269M | 34.9% | 28.6% |
-| 1-layer 23 only | 269M | 33.6% | 37.4% |
-| 2-layer + bottleneck 256 | ~34M | 25.9% | **39.0%** |
+### Ablation (7B, 500 steps)
+
+| Experiment | Adapter-only | Mixed (original + adapter) |
+|------------|-------------|---------------------------|
+| 2-layer weighted sum | 34.5% | 29.5% |
+| 1-layer 23 only | 33.6% | 37.4% |
+| 2-layer + bottleneck 256 | 25.9% | 39.0% (exceeds teacher) |
+| ViT hidden states as source | 30.1% | -- |
+| ViT K,V projections (default) | 34.5% | -- |
 
 ## Key Findings
 
-1. **Speed**: 1.87-1.96x e2e prefill speedup (2.5-2.9x with KV caching)
-2. **Accuracy**: Adapter-only recovers 89-95% of teacher performance; Mixed + bottleneck can exceed teacher
-3. **Bottleneck is better for Mixed mode**: Constraining adapter capacity forces complementary residuals rather than conflicting replacements
-4. **Same vision encoder across models**: 7B and 13B share identical CLIP ViT -- adapter is the only per-LLM component
-5. **Practical use case**: Multi-turn conversations benefit most (visual KV computed once, reused across turns)
+1. **Speed scales with visual tokens**: More crops/patches = larger speedup (6.5x for LLaVA-1.6)
+2. **ViT K,V projections > hidden states** as source: attention-ready features transfer better
+3. **GQA models need tiny adapters**: 67M for Mistral (8 KV heads), vs 269M for Vicuna (32 heads)
+4. **M-RoPE matters**: Correct 3D position encoding for Qwen3-VL visual tokens
+5. **Phase transition in Method 2**: Sudden loss collapse after ~400 steps when adapter finds the right mapping
+6. **Same vision encoder, multiple LLMs**: One ViT serves different backends via per-LLM adapters
 
-## Usage
+## Architecture Details
+
+### Adapter Design (Method 1, per LLM layer)
+- : learnable softmax weights over 2 ViT source layers
+- : Linear(source_dim -> num_kv_heads * head_dim, bias=True)
+- : sigmoid scalar (init=0, gradual injection)
 
 ### Training
-```bash
-# 7B, 8 GPUs
-bash scripts/train.sh
+- Loss: top-1024 KL divergence (student vs teacher logits)
+- Optimizer: AdamW, lr=1e-4
+- Infrastructure: DeepSpeed ZeRO-2, 8x H200 GPUs
+- Data: PixMo-AMA (VQA)
 
-# 13B
-.venv/bin/python -m torch.distributed.run --nproc_per_node 8 -m src.train \
-  --model-path model/llava-1.5-13b-hf \
-  --data ../delta-vision/data/pixmo_ama_train.jsonl \
-  --data-root ../delta-vision \
-  --output-dir artifacts/run_name \
-  --batch-size 2 --max-steps 4000 --lr 1e-4 \
-  --wandb --wandb-project vision-kv-inject
-```
-
-### Evaluation (8-GPU sharded)
-```bash
-CHECKPOINT=artifacts/run/final.pt bash scripts/eval.sh
-```
+### Supported Models
+- LLaVA-1.5-7B/13B (CLIP ViT + Vicuna)
+- LLaVA-1.6 Mistral (CLIP ViT + Mistral, multi-crop)
+- Qwen3-VL-4B (Qwen3 ViT + M-RoPE)
 
 ## Project Structure
-```
-configs/ds_zero2.json        # DeepSpeed ZeRO-2 config
-src/
-  model.py                   # Adapter, KV extraction, forward variants
-  data.py                    # VQA/OPD/MMStar datasets
-  train.py                   # DeepSpeed training loop
-  eval_mmstar.py             # 8-GPU sharded evaluation
-  eval_three_modes.py        # Teacher/adapter/mixed comparison
-  triton_kernels.py          # Triton fused ops (experimental)
-scripts/
-  train.sh                   # Training launcher
-  eval.sh                    # Eval launcher
-  run_ablation.sh            # Ablation experiments
-```
+
+
+## TODO
+- [ ] Train Method 2 to 4000 steps (currently shows phase transition at step 400)
+- [ ] Add trajectory loss (intermediate hidden state matching)
+- [ ] Cosine LR schedule with warmup
+- [ ] Qwen3.5-VL validation
+- [ ] Visual token pooling (compress 768 -> 64 tokens)

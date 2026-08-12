@@ -2,3 +2,10 @@ __pycache__/
 artifacts/
 *.pyc
 .venv/
+data/
+model/
+artifacts/
+wandb/
+*.pt
+*.pyc
+__pycache__/
