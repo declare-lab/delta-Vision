@@ -81,6 +81,23 @@ Use that file with `--data-root /lustre-data/leijingdi/code/delta-vision/data/pi
 ## Project Structure
 
 
+## Data
+
+### Mixed Training Data (pixmo_clean + FineVision LLaVA-150K)
+
+- Path: `/lustre-data/leijingdi/code/delta-vision/data/pixmo_clean_finevision_llava150k/train.jsonl`
+- Data root: `/lustre-data/leijingdi/code/delta-vision/data/pixmo_clean_finevision_llava150k`
+- Samples: 293,705 (pixmo_clean ~135K + LLaVA-Instruct-150K ~158K)
+- Format: `{image, question, answer, source}`
+- Each sample has `source` field: `pixmo_clean` or `finevision_llava150k`
+- Images: absolute paths, pre-extracted
+- Shuffled
+
+### Other Data
+
+- Pixmo clean only: `/lustre-data/leijingdi/code/delta-vision/artifacts/data_quality/pixmo_ama_full_valid.clean.jsonl` (135K)
+- MMStar eval: `/lustre-data/leijingdi/code/delta-vision/data/mmstar/mmstar_val.jsonl` (1500 samples)
+
 ## TODO
 - [x] Replace hardcoded Qwen 2x2 concat with spatial_merge_size-aware raw ViT QKV concat
 - [x] Add Qwen3-VL MMStar generation eval for this adapter
