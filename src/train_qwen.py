@@ -14,12 +14,12 @@ sys.path.insert(0, ".")
 from src.model import PerLayerKVAdapter, extract_vision_kv_qwen, student_forward_qwen
 
 
-def topk_kl_loss(student_logits, teacher_logits, topk=1024, temperature=2.0):
+def topk_kl_loss(student_logits, teacher_logits, topk=1024):
     k = min(topk, teacher_logits.shape[-1])
     _, indices = teacher_logits.topk(k, dim=-1)
-    t_topk = teacher_logits.gather(-1, indices) / temperature
-    s_topk = student_logits.gather(-1, indices) / temperature
-    return F.kl_div(F.log_softmax(s_topk, dim=-1), F.softmax(t_topk, dim=-1), reduction="batchmean") * (temperature ** 2)
+    t_topk = teacher_logits.gather(-1, indices)
+    s_topk = student_logits.gather(-1, indices)
+    return F.kl_div(F.log_softmax(s_topk, dim=-1), F.softmax(t_topk, dim=-1), reduction="batchmean")
 
 
 class QwenVQADataset(Dataset):
@@ -127,7 +127,7 @@ def main():
 
     adapter = PerLayerKVAdapter(bottleneck_dim=args.bottleneck_dim, use_activation=args.use_activation,
         num_llm_layers=num_llm_layers, num_source_layers=2,
-        source_dim=1024, num_heads=num_kv_heads, head_dim=head_dim,
+        source_dim=4096, num_heads=num_kv_heads, head_dim=head_dim,
     )
     trainable = sum(p.numel() for p in adapter.parameters())
     if is_main:
@@ -195,7 +195,7 @@ def main():
             # Student forward (text only)
             text_mask = input_ids[0] != image_token_id
             text_ids = input_ids[:, text_mask]
-            student_logits = student_forward_qwen(model, text_ids, engine.module, source_k, source_v, image_grid_thw=grid_thw)
+            student_logits = student_forward_qwen(model, text_ids, engine.module, source_k, source_v, image_grid_thw=grid_thw, spatial_merge_size=2)
 
             # Align answer positions
             num_text = student_logits.shape[1]
@@ -210,7 +210,7 @@ def main():
 
             if s_answer.shape[0] > 0 and t_answer.shape[0] > 0:
                 min_len = min(s_answer.shape[0], t_answer.shape[0])
-                loss = args.lambda_kl * topk_kl_loss(s_answer[:min_len].float(), t_answer[:min_len].float(), args.kl_topk, args.temperature)
+                loss = topk_kl_loss(s_answer[:min_len].float(), t_answer[:min_len].float(), args.kl_topk)
             else:
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
 

@@ -613,25 +613,25 @@ def _get_qwen_vision(model):
 
 @torch.no_grad()
 @torch.no_grad()
-def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[22, 23]):
-    """Extract hidden states from Qwen3-VL vision encoder blocks.
-    
-    Uses block output (full hidden states after attn+MLP) instead of raw K,V projections.
-    This gives richer semantic features that are not tied to ViT self-attention patterns.
-    """
+@torch.no_grad()
+@torch.no_grad()
+@torch.no_grad()
+def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[22, 23], spatial_merge=True):
+    """Extract K,V from Qwen3-VL ViT. If spatial_merge=True, do 2x2 concat to match LLM token count."""
     visual = model.model.visual
     num_blocks = len(visual.blocks)
     wanted = {(idx % num_blocks) if idx < 0 else idx for idx in source_layer_indices}
-    collected = {}
+    qkv_outputs = {}
 
-    def make_hook(layer_idx):
+    def make_qkv_hook(layer_idx):
         def hook_fn(module, input, output):
-            collected[layer_idx] = output.float().detach()
+            _, k, v = output.chunk(3, dim=-1)
+            qkv_outputs[layer_idx] = (k.float().detach(), v.float().detach())
         return hook_fn
 
     hooks = []
     for idx in wanted:
-        h = visual.blocks[idx].register_forward_hook(make_hook(idx))
+        h = visual.blocks[idx].attn.qkv.register_forward_hook(make_qkv_hook(idx))
         hooks.append(h)
 
     visual(pixel_values, grid_thw=grid_thw)
@@ -640,13 +640,30 @@ def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[
         h.remove()
 
     ordered = sorted(wanted)
-    # Return as [1, num_source, N_vis, hidden_dim] - same shape for both K and V source
-    # Since hidden states are shared source for K and V, return same tensor for both
-    states = torch.stack([collected[i] for i in ordered], dim=0).unsqueeze(0)
-    return states, states  # source_k = source_v = hidden states
+    source_k = torch.stack([qkv_outputs[i][0] for i in ordered], dim=0).unsqueeze(0)
+    source_v = torch.stack([qkv_outputs[i][1] for i in ordered], dim=0).unsqueeze(0)
+
+    if spatial_merge:
+        t = int(grid_thw[0][0])
+        h = int(grid_thw[0][1])
+        w = int(grid_thw[0][2])
+        merge_size = 2
+        S = source_k.shape[1]
+        D = source_k.shape[3]
+        # [1, S, t*h*w, D] -> [1, S, t*(h//2)*(w//2), 4*D]
+        def do_merge(x):
+            x = x.view(1, S, t, h, w, D)
+            x = x.view(1, S, t, h // merge_size, merge_size, w // merge_size, merge_size, D)
+            x = x.permute(0, 1, 2, 3, 5, 4, 6, 7).contiguous()
+            x = x.view(1, S, t * (h // merge_size) * (w // merge_size), merge_size * merge_size * D)
+            return x
+        source_k = do_merge(source_k)
+        source_v = do_merge(source_v)
+
+    return source_k, source_v
 
 
-def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_grid_thw=None):
+def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_grid_thw=None, spatial_merge_size=1):
     language_model = model.model.language_model
     layers = language_model.layers
     norm = language_model.norm
@@ -658,8 +675,8 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
     dtype = text_embeds.dtype
     if image_grid_thw is not None:
         t_dim = int(image_grid_thw[0][0])
-        h_dim = int(image_grid_thw[0][1])
-        w_dim = int(image_grid_thw[0][2])
+        h_dim = int(image_grid_thw[0][1]) // spatial_merge_size
+        w_dim = int(image_grid_thw[0][2]) // spatial_merge_size
         temporal_ids = torch.zeros(N_vis, dtype=torch.long, device=device)
         height_ids = torch.arange(h_dim, device=device).repeat_interleave(w_dim).repeat(t_dim)[:N_vis]
         width_ids = torch.arange(w_dim, device=device).repeat(h_dim * t_dim)[:N_vis]
