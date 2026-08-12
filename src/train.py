@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -49,8 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--max-answer-tokens", type=int, default=9999)
     parser.add_argument("--kl-topk", type=int, default=1024)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup-ratio", type=float, default=0.2)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--source-layers", default="22,23", help="Comma-separated ViT layer indices")
     parser.add_argument("--bottleneck-dim", type=int, default=0, help="If >0, use bottleneck: source_dim -> bottleneck -> target_dim")
     parser.add_argument("--concat-source", action="store_true", help="Concat source layers instead of weighted sum")
@@ -88,15 +91,28 @@ def main():
 
     source_layers = [int(x) for x in args.source_layers.split(",")]
     language_model = model.model.language_model
+    vision_config = getattr(model.config, "vision_config", None)
+    source_dim = int(getattr(vision_config, "hidden_size", 1024))
     num_llm_layers = len(language_model.layers)
     num_heads = getattr(language_model.config, "num_key_value_heads", language_model.config.num_attention_heads)
     head_dim = language_model.config.hidden_size // language_model.config.num_attention_heads
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
+    adapter_config = {
+        "num_llm_layers": num_llm_layers,
+        "num_source_layers": len(source_layers),
+        "source_dim": source_dim,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "bottleneck_dim": args.bottleneck_dim,
+        "concat_source": args.concat_source,
+        "use_activation": False,
+        "source_layers": source_layers,
+    }
     adapter = PerLayerKVAdapter(
         num_llm_layers=num_llm_layers,
         num_source_layers=len(source_layers),
-        source_dim=1024,
+        source_dim=source_dim,
         num_heads=num_heads,
         head_dim=head_dim,
         bottleneck_dim=args.bottleneck_dim,
@@ -129,11 +145,23 @@ def main():
             print(f"Loaded init checkpoint: {args.init_checkpoint}")
 
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
+    with open(args.deepspeed_config, "r", encoding="utf-8") as f:
+        ds_config = json.load(f)
+    ds_config["train_micro_batch_size_per_gpu"] = args.batch_size
     engine, optimizer, _, _ = deepspeed.initialize(
         model=adapter,
         optimizer=optimizer,
-        config=args.deepspeed_config,
+        config=ds_config,
     )
+
+    warmup_steps = int(args.max_steps * args.warmup_ratio)
+    min_lr = args.lr * args.min_lr_ratio
+
+    def get_lr(step_idx: int) -> float:
+        if step_idx < warmup_steps:
+            return args.lr * step_idx / max(warmup_steps, 1)
+        progress = (step_idx - warmup_steps) / max(args.max_steps - warmup_steps, 1)
+        return min_lr + (args.lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
     DatasetCls = OPDDataset if args.dataset_type == "opd" else VQADataset
     dataset = DatasetCls(
@@ -181,7 +209,13 @@ def main():
                         source_k_list.append(sk)
                         source_v_list.append(sv)
                         isz = image_sizes[i:i+1].to(device) if image_sizes is not None and torch.is_tensor(image_sizes) else None
-                        tl = teacher_forward(model, input_ids[i:i+1], pv_i, image_sizes=isz)
+                        tl = teacher_forward(
+                            model,
+                            input_ids[i:i+1],
+                            pv_i,
+                            attention_mask=attention_mask[i:i+1],
+                            image_sizes=isz,
+                        )
                         teacher_logits_list.append(tl)
                     source_k = source_v = teacher_logits = None
                 else:
@@ -203,7 +237,13 @@ def main():
                     single_sv = source_v[i:i+1]
 
                 student_logits = student_forward_with_visual_kv(
-                    model, single_ids, engine.module, single_sk, single_sv, image_token_id
+                    model,
+                    single_ids,
+                    engine.module,
+                    single_sk,
+                    single_sv,
+                    image_token_id,
+                    attention_mask=attention_mask[i:i+1],
                 )
 
                 # prompt_len is text-only (image tokens excluded)
@@ -219,14 +259,15 @@ def main():
                 s_answer = student_logits[0, s_start:s_end]
 
                 # Teacher: full sequence with image tokens expanded
-                # Answer starts at (576 + text_prompt_len - 1) in teacher space
                 n_image_tokens = (single_ids[0] == image_token_id).sum().item()
+                t_start = max(0, n_image_tokens + text_prompt_len - 1)
+                t_actual_len = int(attention_mask[i].sum().item())
                 if teacher_logits_list is not None:
                     t_logits_i = teacher_logits_list[i][0]
-                    t_end = min(t_start + args.max_answer_tokens, t_logits_i.shape[0])
+                    t_end = min(t_start + args.max_answer_tokens, t_actual_len, t_logits_i.shape[0])
                     t_answer = t_logits_i[t_start:t_end]
                 else:
-                    t_end = min(t_start + args.max_answer_tokens, teacher_logits.shape[1])
+                    t_end = min(t_start + args.max_answer_tokens, t_actual_len, teacher_logits.shape[1])
                     t_answer = teacher_logits[i, t_start:t_end]
 
                 if s_answer.shape[0] > 0 and t_answer.shape[0] > 0:
@@ -240,15 +281,23 @@ def main():
 
             loss = total_loss / B
             engine.backward(loss)
+            current_lr = get_lr(step + 1)
+            for pg in optimizer.param_groups:
+                pg["lr"] = current_lr
             engine.step()
 
             if is_main and step % args.log_every == 0:
-                item = {"step": step, "loss": float(loss.item())}
+                item = {"step": step, "loss": float(loss.item()), "lr": current_lr}
                 print(json.dumps(item), flush=True)
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(item) + "\n")
                 if wandb_run is not None:
-                    wandb_run.log({"train/loss": item["loss"], "train/step": step}, step=step)
+                    wandb_run.log({
+                        "train/loss": item["loss"],
+                        "train/kl_loss": item["loss"],
+                        "train/lr": current_lr,
+                        "train/step": step,
+                    }, step=step)
 
             if is_main and step > 0 and step % args.save_every == 0:
                 ckpt_path = Path(args.output_dir) / f"step_{step}.pt"
@@ -256,6 +305,7 @@ def main():
                     "state_dict": engine.module.state_dict(),
                     "step": step,
                     "args": vars(args),
+                    "adapter_config": adapter_config,
                 }, ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}", flush=True)
 
@@ -270,6 +320,7 @@ def main():
             "state_dict": engine.module.state_dict(),
             "step": step,
             "args": vars(args),
+            "adapter_config": adapter_config,
         }, final_path)
         print(f"Training complete. Final checkpoint: {final_path}", flush=True)
 

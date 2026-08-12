@@ -1557,5 +1557,5 @@ requires-dist = [
     { name = "sentencepiece", specifier = ">=0.2" },
     { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "transformers", specifier = ">=4.46" },
+    { name = "transformers", specifier = ">=5.15,<5.16" },
 ]

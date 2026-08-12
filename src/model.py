@@ -1,11 +1,20 @@
 """Vision KV Adapter: inject vision encoder KV cache into LLM layers."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoProcessor, AutoModelForImageTextToText, LlavaForConditionalGeneration
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+
+try:
+    from torch.nn.attention.bias import causal_lower_right
+except Exception:  # pragma: no cover - older torch fallback
+    causal_lower_right = None
+
+QWEN_SOURCE_RAW_SPATIAL_CONCAT = "raw_spatial_concat"
 
 
 class PerLayerKVAdapter(nn.Module):
@@ -14,7 +23,7 @@ class PerLayerKVAdapter(nn.Module):
     For each of the 32 LLM layers:
       - Learns a soft mixture over source_layers (last 2 ViT layers)
       - Projects mixed source K and V to LLM dim via independent linear layers
-      - gate scalar controls injection strength (init=0 for gradual warmup)
+      - gate scalar controls injection strength (init sigmoid(-5) for gradual warmup)
     """
 
     def __init__(
@@ -122,12 +131,135 @@ class PerLayerKVAdapter(nn.Module):
         return key, value
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def infer_adapter_config_from_checkpoint(
+    ckpt: dict,
+    language_model: nn.Module | None = None,
+) -> tuple[dict, list[int]]:
+    """Infer adapter constructor kwargs from an old or new checkpoint."""
+    state_dict = ckpt["state_dict"]
+    ckpt_args = ckpt.get("args", {})
+    saved_config = ckpt.get("adapter_config", {})
+
+    if "source_mix" not in state_dict:
+        raise ValueError("Adapter checkpoint is missing source_mix; cannot infer layer count")
+    num_llm_layers, num_source_layers = state_dict["source_mix"].shape
+
+    source_layers_raw = saved_config.get("source_layers", ckpt_args.get("source_layers"))
+    if source_layers_raw is None:
+        source_layers = [22, 23] if num_source_layers == 2 else list(range(num_source_layers))
+    elif isinstance(source_layers_raw, str):
+        source_layers = [int(x) for x in source_layers_raw.split(",") if x]
+    else:
+        source_layers = [int(x) for x in source_layers_raw]
+    if len(source_layers) != num_source_layers:
+        source_layers = [22, 23] if num_source_layers == 2 else list(range(num_source_layers))
+
+    bottleneck_dim = int(saved_config.get("bottleneck_dim", ckpt_args.get("bottleneck_dim", 0)))
+    concat_source = _as_bool(saved_config.get("concat_source", ckpt_args.get("concat_source", False)))
+    use_activation = _as_bool(saved_config.get("use_activation", ckpt_args.get("use_activation", False)))
+
+    if "k_projs.0.weight" in state_dict:
+        target_dim, input_dim = state_dict["k_projs.0.weight"].shape
+        bottleneck_dim = 0
+    elif "k_down.0.weight" in state_dict and "k_up.0.weight" in state_dict:
+        input_dim = state_dict["k_down.0.weight"].shape[1]
+        bottleneck_dim = state_dict["k_down.0.weight"].shape[0]
+        target_dim = state_dict["k_up.0.weight"].shape[0]
+    else:
+        raise ValueError("Adapter checkpoint has no recognizable projection weights")
+
+    source_dim = saved_config.get("source_dim", ckpt_args.get("source_dim"))
+    if source_dim is None:
+        source_dim = input_dim // num_source_layers if concat_source else input_dim
+    source_dim = int(source_dim)
+
+    head_dim = saved_config.get("head_dim", ckpt_args.get("head_dim"))
+    num_heads = saved_config.get("num_heads", ckpt_args.get("num_heads"))
+    if language_model is not None:
+        first_attn = language_model.layers[0].self_attn
+        cfg_head_dim = int(
+            getattr(
+                first_attn,
+                "head_dim",
+                language_model.config.hidden_size // language_model.config.num_attention_heads,
+            )
+        )
+        if target_dim % cfg_head_dim == 0:
+            head_dim = cfg_head_dim
+            num_heads = target_dim // cfg_head_dim
+
+    if head_dim is None:
+        head_dim = 128 if target_dim % 128 == 0 else target_dim
+    head_dim = int(head_dim)
+    if num_heads is None:
+        if target_dim % head_dim != 0:
+            raise ValueError(f"Cannot infer num_heads: target_dim={target_dim}, head_dim={head_dim}")
+        num_heads = target_dim // head_dim
+    num_heads = int(num_heads)
+
+    config = {
+        "num_llm_layers": int(num_llm_layers),
+        "num_source_layers": int(num_source_layers),
+        "source_dim": source_dim,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "bottleneck_dim": int(bottleneck_dim),
+        "concat_source": concat_source,
+        "use_activation": use_activation,
+    }
+    return config, source_layers
+
+
+def load_adapter_checkpoint(
+    checkpoint_path: str | Path,
+    device: torch.device | str,
+    language_model: nn.Module | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[PerLayerKVAdapter, list[int], dict]:
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config, source_layers = infer_adapter_config_from_checkpoint(ckpt, language_model=language_model)
+    adapter = PerLayerKVAdapter(**config)
+    adapter.load_state_dict(ckpt["state_dict"])
+    adapter.to(device=device, dtype=dtype)
+    adapter.eval()
+    metadata = {
+        **config,
+        **{
+            key: value
+            for key, value in ckpt.get("adapter_config", {}).items()
+            if key not in config
+        },
+    }
+    return adapter, source_layers, metadata
+
+
 def _get_vision_tower(model: LlavaForConditionalGeneration):
     return model.model.vision_tower
 
 
 def _get_language_model(model: LlavaForConditionalGeneration):
     return model.model.language_model
+
+
+def _normalize_layer_indices(layer_indices: list[int], num_layers: int) -> list[int]:
+    """Normalize negative layer indices while preserving user-specified order."""
+    normalized = []
+    seen = set()
+    for layer_idx in layer_indices:
+        idx = (layer_idx % num_layers) if layer_idx < 0 else layer_idx
+        if idx < 0 or idx >= num_layers:
+            raise ValueError(f"Layer index {layer_idx} resolves to {idx}, outside [0, {num_layers})")
+        if idx in seen:
+            raise ValueError(f"Duplicate source layer {layer_idx} resolves to {idx}")
+        normalized.append(idx)
+        seen.add(idx)
+    return normalized
 
 
 @torch.no_grad()
@@ -157,22 +289,22 @@ def extract_vision_kv(
 
     layers = vision_model.encoder.layers
     num_layers = len(layers)
-    wanted = {(idx % num_layers) if idx < 0 else idx for idx in source_layer_indices}
+    wanted = _normalize_layer_indices(source_layer_indices, num_layers)
+    wanted_set = set(wanted)
 
     collected_k = {}
     collected_v = {}
 
     for idx, layer in enumerate(layers):
         normed = layer.layer_norm1(hidden)
-        if idx in wanted:
+        if idx in wanted_set:
             collected_k[idx] = layer.self_attn.k_proj(normed)[:, 1:].float()
             collected_v[idx] = layer.self_attn.v_proj(normed)[:, 1:].float()
         layer_out = layer(hidden, attention_mask=None)
         hidden = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-    ordered_indices = sorted(wanted)
-    source_k = torch.stack([collected_k[i] for i in ordered_indices], dim=1)
-    source_v = torch.stack([collected_v[i] for i in ordered_indices], dim=1)
+    source_k = torch.stack([collected_k[i] for i in wanted], dim=1)
+    source_v = torch.stack([collected_v[i] for i in wanted], dim=1)
 
     # For multi-crop: merge crops into token dimension [B, S, num_crops*N_vis, D]
     if num_crops > 1:
@@ -202,6 +334,7 @@ def student_forward_with_visual_kv(
     source_k: torch.Tensor,
     source_v: torch.Tensor,
     image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run LLM forward with adapter-predicted visual KV instead of image token embeddings.
 
@@ -211,7 +344,9 @@ def student_forward_with_visual_kv(
     Returns:
         logits: [B, text_seq_len, vocab_size]
     """
-    text_mask = input_ids[0] != image_token_id
+    valid_mask = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(input_ids[0], dtype=torch.bool)
+    text_mask = (input_ids[0] != image_token_id) & valid_mask
+    image_mask = (input_ids[0] == image_token_id) & valid_mask
     text_ids = input_ids[:, text_mask]
 
     language_model = _get_language_model(model)
@@ -226,8 +361,16 @@ def student_forward_with_visual_kv(
     device = text_embeds.device
     dtype = text_embeds.dtype
 
-    text_position_ids = torch.arange(N_vis, N_vis + T, device=device).unsqueeze(0)
-    image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0)
+    text_positions = torch.where(text_mask)[0].to(device)
+    image_positions = torch.where(image_mask)[0].to(device)
+    text_position_ids = text_positions.unsqueeze(0).expand(B, -1)
+    if image_positions.numel() == N_vis:
+        image_position_ids = image_positions.unsqueeze(0).expand(B, -1)
+    elif image_positions.numel() > 0:
+        start_pos = int(image_positions[0].item())
+        image_position_ids = torch.arange(start_pos, start_pos + N_vis, device=device).unsqueeze(0).expand(B, -1)
+    else:
+        image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0).expand(B, -1)
 
     hidden = text_embeds
 
@@ -261,16 +404,10 @@ def student_forward_with_visual_kv(
             k = repeat_kv(k, num_q_heads // num_kv_heads)
             v = repeat_kv(v, num_q_heads // num_kv_heads)
 
-        # Build causal mask: text can attend to all image tokens + causally to text
+        # Build a position-based causal mask in the original prompt order.
         text_pos = text_position_ids[0]
         img_pos = image_position_ids[0]
-        # image tokens are always visible to all text (they precede text)
-        # Position-based causal: text sees image only if text_pos >= img_pos
-        img_allowed = torch.ones(T, N_vis, device=device, dtype=torch.bool)
-        text_allowed = text_pos.unsqueeze(1) >= text_pos.unsqueeze(0)
-
-
-
+        img_allowed = text_pos.unsqueeze(1) >= img_pos.unsqueeze(0)
         text_allowed = text_pos.unsqueeze(1) >= text_pos.unsqueeze(0)
         causal_mask = torch.cat([img_allowed, text_allowed], dim=1)
         attn_mask = torch.zeros(1, 1, T, N_vis + T, device=device, dtype=dtype)
@@ -343,6 +480,9 @@ def student_forward_mixed(
     Standard LLaVA embeds image as 576 tokens. In each attention layer, the KV
     at image token positions gets the adapter-predicted KV added on top.
     """
+    if pixel_values.ndim != 4 or hasattr(model.model, "image_newline"):
+        raise NotImplementedError("student_forward_mixed only supports fixed-grid LLaVA-style image features")
+
     # Standard LLaVA: merge image features into embeddings
     image_outputs = model.model.vision_tower(pixel_values, output_hidden_states=True)
     image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
@@ -361,7 +501,8 @@ def student_forward_mixed(
     for i in range(B):
         img_positions = torch.where(image_mask[i])[0]
         if img_positions.numel() > 0:
-            final_embeds[i, img_positions[:n_image]] = image_features[i, :img_positions.numel()].to(final_embeds.dtype)
+            n = min(img_positions.numel(), n_image)
+            final_embeds[i, img_positions[:n]] = image_features[i, :n].to(final_embeds.dtype)
 
     language_model = _get_language_model(model)
     layers = language_model.layers
@@ -404,10 +545,14 @@ def student_forward_mixed(
         # Apply RoPE to adapter K using image positions
         for i in range(B):
             img_pos = img_pos_list[i]
+            n = min(img_pos.numel(), vis_k_t.shape[2])
+            if n == 0:
+                continue
+            img_pos = img_pos[:n]
             img_position_ids = img_pos.unsqueeze(0)
-            adapter_k_roped = _apply_rope(rotary_emb, vis_k_t[i:i+1], img_position_ids, normed[i:i+1])
+            adapter_k_roped = _apply_rope(rotary_emb, vis_k_t[i:i+1, :, :n], img_position_ids, normed[i:i+1])
             k[i:i+1, :, img_pos] = k[i:i+1, :, img_pos] + adapter_k_roped
-            v[i:i+1, :, img_pos] = v[i:i+1, :, img_pos] + vis_v_t[i:i+1]
+            v[i:i+1, :, img_pos] = v[i:i+1, :, img_pos] + vis_v_t[i:i+1, :, :n]
 
         # Standard causal attention
         causal_mask = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
@@ -434,91 +579,17 @@ def student_forward_optimized(
     source_k: torch.Tensor,
     source_v: torch.Tensor,
     image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Optimized forward using flash attention via Q-padding trick.
+    """Compatibility wrapper for the older flash-attention experiment.
 
-    Pads Q with zeros to match KV length so is_causal=True (flash attn) works.
-    The padded output rows are discarded.
+    The old Q-padding trick only matched a synthetic image-prefix layout. Route
+    through the canonical path so benchmarks cannot silently use different
+    sequence semantics.
     """
-    text_mask = input_ids[0] != image_token_id
-    text_ids = input_ids[:, text_mask]
-
-    language_model = _get_language_model(model)
-    text_embeds = language_model.embed_tokens(text_ids)
-
-    layers = language_model.layers
-    norm = language_model.norm
-    rotary_emb = language_model.rotary_emb
-
-    B, T, _ = text_embeds.shape
-    N_vis = source_k.shape[2]
-    device = text_embeds.device
-    dtype = text_embeds.dtype
-
-    text_position_ids = torch.arange(N_vis, N_vis + T, device=device).unsqueeze(0)
-    image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0)
-    full_position_ids = torch.arange(N_vis + T, device=device).unsqueeze(0)
-
-    # Pre-compute adapter KV for all layers
-    src_k_cast = source_k.to(dtype=dtype)
-    src_v_cast = source_v.to(dtype=dtype)
-
-    all_vis_k = []
-    all_vis_v = []
-    dummy_ref = text_embeds[:, :1, :]
-    cos_img, sin_img = rotary_emb(dummy_ref, image_position_ids)
-    for layer_idx in range(len(layers)):
-        vis_k, vis_v = adapter.forward_layer(src_k_cast, src_v_cast, layer_idx)
-        vis_k = vis_k.transpose(1, 2)  # [B, heads, N_vis, head_dim]
-        vis_v = vis_v.transpose(1, 2)
-        vis_k, _ = apply_rotary_pos_emb(vis_k, vis_k, cos_img, sin_img)
-        all_vis_k.append(vis_k)
-        all_vis_v.append(vis_v)
-
-    hidden = text_embeds
-
-    for layer_idx, layer in enumerate(layers):
-        residual = hidden
-        normed = layer.input_layernorm(hidden)
-        attn = layer.self_attn
-
-        input_shape = normed.shape[:-1]
-        hidden_shape = (*input_shape, -1, attn.head_dim)
-
-        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-
-        cos_txt, sin_txt = rotary_emb(normed, text_position_ids)
-        q, text_k = apply_rotary_pos_emb(q, text_k, cos_txt, sin_txt)
-
-        # K, V: [vis | text] = N_vis + T columns
-        k = torch.cat([all_vis_k[layer_idx], text_k], dim=2)
-        v = torch.cat([all_vis_v[layer_idx], text_v], dim=2)
-
-        # Pad Q with zeros to length N_vis + T so we can use is_causal=True (flash attn)
-        # Padded Q rows (0..N_vis-1) produce garbage output that we discard
-        q_pad = torch.zeros(B, q.shape[1], N_vis, q.shape[3], device=device, dtype=dtype)
-        q_full = torch.cat([q_pad, q], dim=2)  # [B, heads, N_vis+T, head_dim]
-
-        attn_out_full = F.scaled_dot_product_attention(
-            q_full, k, v,
-            dropout_p=0.0,
-            is_causal=True,
-        )
-        # Slice out only the text rows
-        attn_out = attn_out_full[:, :, N_vis:, :]
-
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        attn_out = attn.o_proj(attn_out)
-
-        hidden = residual + attn_out
-        residual = hidden
-        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
-
-    hidden = norm(hidden)
-    logits = model.lm_head(hidden)
-    return logits
+    return student_forward_with_visual_kv(
+        model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
+    )
 
 
 def student_forward_flex(
@@ -528,86 +599,12 @@ def student_forward_flex(
     source_k: torch.Tensor,
     source_v: torch.Tensor,
     image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Optimized forward using flex_attention (no Q-padding waste).
-
-    flex_attention compiles a custom prefix-causal mask into an efficient kernel,
-    computing attention only for the 67 actual Q rows instead of padding to 643.
-    """
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-
-    text_mask = input_ids[0] != image_token_id
-    text_ids = input_ids[:, text_mask]
-
-    language_model = _get_language_model(model)
-    text_embeds = language_model.embed_tokens(text_ids)
-
-    layers = language_model.layers
-    norm = language_model.norm
-    rotary_emb = language_model.rotary_emb
-
-    B, T, _ = text_embeds.shape
-    N_vis = source_k.shape[2]
-    device = text_embeds.device
-    dtype = text_embeds.dtype
-
-    text_position_ids = torch.arange(N_vis, N_vis + T, device=device).unsqueeze(0)
-    image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0)
-
-    # Create prefix-causal block mask once
-    def prefix_causal(b, h, q_idx, kv_idx):
-        return kv_idx <= q_idx + N_vis
-
-    block_mask = create_block_mask(prefix_causal, B=1, H=1, Q_LEN=T, KV_LEN=N_vis + T, device=device)
-
-    # Pre-compute adapter KV
-    src_k_cast = source_k.to(dtype=dtype)
-    src_v_cast = source_v.to(dtype=dtype)
-
-    all_vis_k = []
-    all_vis_v = []
-    dummy_ref = text_embeds[:, :1, :]
-    cos_img, sin_img = rotary_emb(dummy_ref, image_position_ids)
-    for layer_idx in range(len(layers)):
-        vis_k, vis_v = adapter.forward_layer(src_k_cast, src_v_cast, layer_idx)
-        vis_k = vis_k.transpose(1, 2)
-        vis_v = vis_v.transpose(1, 2)
-        vis_k, _ = apply_rotary_pos_emb(vis_k, vis_k, cos_img, sin_img)
-        all_vis_k.append(vis_k)
-        all_vis_v.append(vis_v)
-
-    hidden = text_embeds
-
-    for layer_idx, layer in enumerate(layers):
-        residual = hidden
-        normed = layer.input_layernorm(hidden)
-        attn = layer.self_attn
-
-        input_shape = normed.shape[:-1]
-        hidden_shape = (*input_shape, -1, attn.head_dim)
-
-        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-
-        cos_txt, sin_txt = rotary_emb(normed, text_position_ids)
-        q, text_k = apply_rotary_pos_emb(q, text_k, cos_txt, sin_txt)
-
-        k = torch.cat([all_vis_k[layer_idx], text_k], dim=2)
-        v = torch.cat([all_vis_v[layer_idx], text_v], dim=2)
-
-        attn_out = flex_attention(q, k, v, block_mask=block_mask)
-
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        attn_out = attn.o_proj(attn_out)
-
-        hidden = residual + attn_out
-        residual = hidden
-        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
-
-    hidden = norm(hidden)
-    logits = model.lm_head(hidden)
-    return logits
+    """Compatibility wrapper for the older flex-attention experiment."""
+    return student_forward_with_visual_kv(
+        model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
+    )
 
 
 # === Qwen3-VL Support ===
@@ -616,16 +613,36 @@ def _get_qwen_vision(model):
     return model.model.visual
 
 
+def qwen_source_dim(model, source_mode: str) -> int:
+    visual = model.model.visual
+    if source_mode == QWEN_SOURCE_RAW_SPATIAL_CONCAT:
+        hidden_size = int(getattr(visual.config, "hidden_size"))
+        merge_unit = int(getattr(visual, "spatial_merge_unit", getattr(visual, "spatial_merge_size", 2) ** 2))
+        return hidden_size * merge_unit
+    raise ValueError(f"Unknown Qwen source_mode={source_mode!r}; expected {QWEN_SOURCE_RAW_SPATIAL_CONCAT!r}")
+
+
 @torch.no_grad()
-@torch.no_grad()
-@torch.no_grad()
-@torch.no_grad()
-@torch.no_grad()
-def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[22, 23], spatial_merge=True):
-    """Extract K,V from Qwen3-VL ViT. If spatial_merge=True, do 2x2 concat to match LLM token count."""
+def extract_vision_kv_qwen(
+    model,
+    pixel_values,
+    grid_thw,
+    source_layer_indices=[22, 23],
+    source_mode: str = QWEN_SOURCE_RAW_SPATIAL_CONCAT,
+):
+    """Extract Qwen3-VL visual source features for the adapter.
+
+    source_mode="raw_spatial_concat" hooks raw ViT attention K/V projections
+    and concatenates each spatial_merge_size**2 patch group. This matches the
+    LLM image-token count without passing source features through Qwen's
+    learned PatchMerger.
+    """
     visual = model.model.visual
     num_blocks = len(visual.blocks)
-    wanted = {(idx % num_blocks) if idx < 0 else idx for idx in source_layer_indices}
+    wanted = _normalize_layer_indices(source_layer_indices, num_blocks)
+    if source_mode != QWEN_SOURCE_RAW_SPATIAL_CONCAT:
+        raise ValueError(f"Unknown Qwen source_mode={source_mode!r}; expected {QWEN_SOURCE_RAW_SPATIAL_CONCAT!r}")
+
     qkv_outputs = {}
 
     def make_qkv_hook(layer_idx):
@@ -636,29 +653,45 @@ def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[
 
     hooks = []
     for idx in wanted:
-        h = visual.blocks[idx].attn.qkv.register_forward_hook(make_qkv_hook(idx))
-        hooks.append(h)
+        hooks.append(visual.blocks[idx].attn.qkv.register_forward_hook(make_qkv_hook(idx)))
 
-    visual(pixel_values, grid_thw=grid_thw)
+    try:
+        visual(pixel_values, grid_thw=grid_thw)
+    finally:
+        for h in hooks:
+            h.remove()
 
-    for h in hooks:
-        h.remove()
+    for idx in wanted:
+        if idx not in qkv_outputs:
+            raise RuntimeError(f"Qwen vision layer {idx} was not captured")
+    source_k = torch.stack([qkv_outputs[i][0] for i in wanted], dim=0).unsqueeze(0)
+    source_v = torch.stack([qkv_outputs[i][1] for i in wanted], dim=0).unsqueeze(0)
 
-    ordered = sorted(wanted)
-    source_k = torch.stack([qkv_outputs[i][0] for i in ordered], dim=0).unsqueeze(0)
-    source_v = torch.stack([qkv_outputs[i][1] for i in ordered], dim=0).unsqueeze(0)
-
-    if spatial_merge:
-        S = source_k.shape[1]
-        N = source_k.shape[2]
-        D = source_k.shape[3]
-        source_k = source_k.view(1, S, N // 4, 4 * D)
-        source_v = source_v.view(1, S, N // 4, 4 * D)
+    S = source_k.shape[1]
+    N = source_k.shape[2]
+    D = source_k.shape[3]
+    merge_unit = int(getattr(visual, "spatial_merge_unit", getattr(visual, "spatial_merge_size", 2) ** 2))
+    if N % merge_unit != 0:
+        raise ValueError(f"Cannot spatial-merge {N} Qwen tokens by merge_unit={merge_unit}")
+    source_k = source_k.view(1, S, N // merge_unit, merge_unit * D)
+    source_v = source_v.view(1, S, N // merge_unit, merge_unit * D)
 
     return source_k, source_v
 
 
-def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_grid_thw=None, spatial_merge_size=1, full_input_ids=None, mm_token_type_ids=None):
+def student_forward_qwen(
+    model,
+    input_ids,
+    adapter,
+    source_k,
+    source_v,
+    image_grid_thw=None,
+    spatial_merge_size=1,
+    full_input_ids=None,
+    mm_token_type_ids=None,
+    attention_mask=None,
+    use_lower_right_causal=True,
+):
     language_model = model.model.language_model
     layers = language_model.layers
     norm = language_model.norm
@@ -679,23 +712,51 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
         height_ids = (torch.arange(h_dim, device=device) + start_pos).repeat_interleave(w_dim).repeat(t_dim)[:N_vis]
         width_ids = (torch.arange(w_dim, device=device) + start_pos).repeat(h_dim * t_dim)[:N_vis]
         img_pos_3d = torch.stack([temporal_ids, height_ids, width_ids], dim=0).unsqueeze(1)
+        img_causal_pos = torch.arange(N_vis, device=device)
         # Text positions: start at max(h_dim, w_dim) after image, all 3 dims same
         text_start = start_pos + max(h_dim, w_dim)
     else:
         img_pos_3d = torch.zeros(3, 1, N_vis, dtype=torch.long, device=device)
+        img_causal_pos = torch.arange(N_vis, device=device)
         text_start = N_vis
     text_pos_1d = torch.arange(text_start, text_start + T, device=device)
     text_pos_3d = text_pos_1d.unsqueeze(0).expand(3, -1).unsqueeze(1)
+    text_causal_pos = torch.arange(N_vis, N_vis + T, device=device)
     rope_dim = rotary_emb.inv_freq.shape[0] * 2
     if full_input_ids is not None and mm_token_type_ids is not None and image_grid_thw is not None:
-        position_ids, _ = model.model.get_rope_index(full_input_ids, mm_token_type_ids, image_grid_thw=image_grid_thw)
+        position_ids, _ = model.model.get_rope_index(
+            full_input_ids,
+            mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
         img_token_id = 151655
-        img_mask_full = (full_input_ids[0] == img_token_id)
-        txt_mask_full = ~img_mask_full
+        valid_full = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(full_input_ids[0], dtype=torch.bool)
+        img_mask_full = (full_input_ids[0] == img_token_id) & valid_full
+        txt_mask_full = (~img_mask_full) & valid_full
         img_positions_full = position_ids[:, 0, img_mask_full]
         # source_k already post-merge, no further downsample
         img_pos_3d = img_positions_full.unsqueeze(1)
         text_pos_3d = position_ids[:, 0, txt_mask_full].unsqueeze(1)
+        full_order = torch.arange(full_input_ids.shape[1], device=device)
+        img_causal_pos = full_order[img_mask_full]
+        text_causal_pos = full_order[txt_mask_full]
+    if img_pos_3d.shape[-1] != N_vis:
+        raise ValueError(f"Qwen image RoPE position count {img_pos_3d.shape[-1]} != source tokens {N_vis}")
+    if text_pos_3d.shape[-1] != T:
+        raise ValueError(f"Qwen text RoPE position count {text_pos_3d.shape[-1]} != text tokens {T}")
+    split_causal = False
+    pre_text_len = 0
+    post_text_len = T
+    if use_lower_right_causal and causal_lower_right is not None and img_causal_pos.numel() > 0:
+        img_start = int(img_causal_pos[0].item())
+        img_end = int(img_causal_pos[-1].item())
+        image_is_contiguous = bool(torch.equal(img_causal_pos, torch.arange(img_start, img_end + 1, device=device)))
+        text_outside_image = bool(((text_causal_pos < img_start) | (text_causal_pos > img_end)).all().item())
+        if image_is_contiguous and text_outside_image:
+            pre_text_len = int((text_causal_pos < img_start).sum().item())
+            post_text_len = T - pre_text_len
+            split_causal = True
     cos_img, sin_img = rotary_emb(torch.zeros(1, N_vis, rope_dim, device=device), img_pos_3d)
     cos_txt, sin_txt = rotary_emb(torch.zeros(1, T, rope_dim, device=device), text_pos_3d)
     hidden = text_embeds
@@ -723,20 +784,56 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
         if hasattr(attn, "k_norm") and attn.k_norm is not None:
             vis_k = attn.k_norm(vis_k)
         vis_k, _ = apply_rotary_pos_emb(vis_k, vis_k, cos_img, sin_img)
-        k = torch.cat([vis_k, text_k], dim=2)
-        v = torch.cat([vis_v, text_v], dim=2)
-        if num_q_heads != num_kv_heads:
-            k = repeat_kv(k, num_q_heads // num_kv_heads)
-            v = repeat_kv(v, num_q_heads // num_kv_heads)
-        # Position-based causal: text sees image only if text_pos >= img_pos
-        t_text_pos = text_pos_3d[0, 0]
-        t_img_pos = img_pos_3d[0, 0]
-        img_allowed = t_text_pos.unsqueeze(1) >= t_img_pos.unsqueeze(0)
-        text_allowed = t_text_pos.unsqueeze(1) >= t_text_pos.unsqueeze(0)
-        causal_mask = torch.cat([img_allowed, text_allowed], dim=1)
-        attn_mask = torch.zeros(1, 1, T, N_vis + T, device=device, dtype=dtype)
-        attn_mask.masked_fill_(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(dtype).min)
-        attn_out = F.scaled_dot_product_attention(q.to(dtype), k.to(dtype), v.to(dtype), attn_mask=attn_mask, dropout_p=0.0)
+        if split_causal:
+            attn_parts = []
+            if pre_text_len > 0:
+                pre_q = q[:, :, :pre_text_len].to(dtype)
+                pre_k = text_k[:, :, :pre_text_len].to(dtype)
+                pre_v = text_v[:, :, :pre_text_len].to(dtype)
+                if num_q_heads != num_kv_heads:
+                    pre_k = repeat_kv(pre_k, num_q_heads // num_kv_heads)
+                    pre_v = repeat_kv(pre_v, num_q_heads // num_kv_heads)
+                attn_parts.append(
+                    F.scaled_dot_product_attention(pre_q, pre_k, pre_v, dropout_p=0.0, is_causal=True)
+                )
+            if post_text_len > 0:
+                post_q = q[:, :, pre_text_len:].to(dtype)
+                post_k = torch.cat(
+                    [text_k[:, :, :pre_text_len], vis_k, text_k[:, :, pre_text_len:]],
+                    dim=2,
+                ).to(dtype)
+                post_v = torch.cat(
+                    [text_v[:, :, :pre_text_len], vis_v, text_v[:, :, pre_text_len:]],
+                    dim=2,
+                ).to(dtype)
+                if num_q_heads != num_kv_heads:
+                    post_k = repeat_kv(post_k, num_q_heads // num_kv_heads)
+                    post_v = repeat_kv(post_v, num_q_heads // num_kv_heads)
+                attn_parts.append(
+                    F.scaled_dot_product_attention(
+                        post_q,
+                        post_k,
+                        post_v,
+                        attn_mask=causal_lower_right(post_text_len, pre_text_len + N_vis + post_text_len),
+                        dropout_p=0.0,
+                    )
+                )
+            attn_out = torch.cat(attn_parts, dim=2)
+        else:
+            k = torch.cat([vis_k, text_k], dim=2)
+            v = torch.cat([vis_v, text_v], dim=2)
+            if num_q_heads != num_kv_heads:
+                k = repeat_kv(k, num_q_heads // num_kv_heads)
+                v = repeat_kv(v, num_q_heads // num_kv_heads)
+            # Preserve original prompt causality even though visual KV is prepended.
+            img_allowed = text_causal_pos.unsqueeze(1) >= img_causal_pos.unsqueeze(0)
+            text_allowed = text_causal_pos.unsqueeze(1) >= text_causal_pos.unsqueeze(0)
+            causal_mask = torch.cat([img_allowed, text_allowed], dim=1)
+            attn_mask = torch.zeros(1, 1, T, N_vis + T, device=device, dtype=dtype)
+            attn_mask.masked_fill_(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(dtype).min)
+            attn_out = F.scaled_dot_product_attention(
+                q.to(dtype), k.to(dtype), v.to(dtype), attn_mask=attn_mask, dropout_p=0.0
+            )
         attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, T, -1)
         attn_out = attn.o_proj(attn_out)
         hidden = residual + attn_out
@@ -745,4 +842,3 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
     hidden = norm(hidden)
     logits = model.lm_head(hidden)
     return logits
-

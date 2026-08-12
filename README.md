@@ -9,7 +9,7 @@ Inject vision encoder KV cache into LLM attention layers via per-layer adapters,
 Each LLM layer has an independent adapter that maps ViT KV to LLM KV space:
 - source_mix: learnable softmax weights over source ViT layers
 - k_proj / v_proj: Linear(source_dim -> num_kv_heads * head_dim, bias=True)
-- gate: sigmoid scalar (init=0)
+- gate: sigmoid scalar (initialized at -5.0 before sigmoid)
 
 Text tokens go through the LLM normally. Visual info enters only via KV injection in attention.
 No MLP computation on visual tokens at any layer -- the main source of speedup.
@@ -29,7 +29,6 @@ No MLP computation on visual tokens at any layer -- the main source of speedup.
 | Config | Teacher | Adapter-only (best) | Params |
 |--------|---------|--------------------|----|
 | ViT KV source, 4000 steps | 57.8% | 44.7% (77%) | 75.6M |
-| ViT KV source, 8000 steps | 57.8% | 44.7% (77%) | 75.6M |
 
 ### Prefill Speed (torch.compile, both sides, H200)
 
@@ -67,7 +66,9 @@ No MLP computation on visual tokens at any layer -- the main source of speedup.
 
 
 ## TODO
-- [ ] Use post-merger tokens (192) instead of pre-merger (768) for Qwen3-VL
-- [ ] Add KV MSE loss for per-layer supervision
-- [ ] Cosine LR schedule with warmup
+- [x] Replace default Qwen raw 2x2 KV concat with official PatchMerger source features
+- [x] Add Qwen3-VL MMStar generation eval for this adapter
+- [ ] Add DeepStack-aware Qwen source features
+- [x] Add optional KV MSE loss for per-layer Qwen supervision
+- [x] Cosine LR schedule with warmup for training
 - [ ] More training data / longer training

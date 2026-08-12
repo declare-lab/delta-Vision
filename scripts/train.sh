@@ -43,6 +43,7 @@ $PY -m torch.distributed.run \
   --data-root "$DATA_ROOT" \
   --output-dir "$OUT_DIR" \
   --max-steps "${MAX_STEPS:-4000}" \
+  --batch-size "${BATCH_SIZE:-1}" \
   --lr "${LR:-1e-4}" \
   --kl-topk "${KL_TOPK:-1024}" \
   --log-every "${LOG_EVERY:-10}" \

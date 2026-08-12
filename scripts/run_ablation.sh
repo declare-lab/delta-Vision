@@ -43,6 +43,7 @@ run_experiment() {
       --source-layers "$source_layers" \
       --bottleneck-dim "$bottleneck" \
       --max-steps "$MAX_STEPS" \
+      --batch-size "${BATCH_SIZE:-1}" \
       --lr 1e-4 \
       --kl-topk 1024 \
       --log-every 10 \

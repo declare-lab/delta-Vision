@@ -5,49 +5,20 @@ from pathlib import Path
 import torch
 sys.path.insert(0, ".")
 from src.model import (
-    PerLayerKVAdapter, extract_vision_kv, load_frozen_llava,
+    extract_vision_kv, load_adapter_checkpoint, load_frozen_llava,
     student_forward_with_visual_kv, teacher_forward, student_forward_mixed,
 )
 from src.eval_mmstar import get_option_token_ids, predict_option
 from src.data import MMStarDataset
 
 
-def load_adapter_from_ckpt(checkpoint_path: str, device: torch.device):
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    ckpt_args = ckpt.get("args", {})
-    source_layers_str = ckpt_args.get("source_layers", "22,23")
-    source_layers = [int(x) for x in source_layers_str.split(",")]
-    bottleneck_dim = int(ckpt_args.get("bottleneck_dim", 0))
-    from src.model import PerLayerKVAdapter
-    concat_source = bool(ckpt_args.get("concat_source", False))
-    # Infer adapter dims from checkpoint weights
-    state_dict = ckpt["state_dict"]
-    # Find num_llm_layers from source_mix shape or k_projs count
-    if "source_mix" in state_dict:
-        num_llm_layers = state_dict["source_mix"].shape[0]
-    else:
-        num_llm_layers = sum(1 for k in state_dict if k.startswith("k_projs.") and k.endswith(".weight"))
-    # Find target_dim from k_projs.0.weight or k_up.0.weight
-    if "k_projs.0.weight" in state_dict:
-        target_dim = state_dict["k_projs.0.weight"].shape[0]
-    elif "k_up.0.weight" in state_dict:
-        target_dim = state_dict["k_up.0.weight"].shape[0]
-    else:
-        target_dim = 4096
-    head_dim = 128
-    num_heads = target_dim // head_dim
-    adapter = PerLayerKVAdapter(
-        num_llm_layers=num_llm_layers,
-        num_source_layers=len(source_layers),
-        source_dim=1024,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        bottleneck_dim=bottleneck_dim,
-        concat_source=concat_source,
+def load_adapter_from_ckpt(checkpoint_path: str, model, device: torch.device):
+    adapter, source_layers, _ = load_adapter_checkpoint(
+        checkpoint_path,
+        device=device,
+        language_model=model.model.language_model,
+        dtype=torch.bfloat16,
     )
-    adapter.load_state_dict(ckpt["state_dict"])
-    adapter.to(device=device, dtype=torch.bfloat16)
-    adapter.eval()
     return adapter, source_layers
 
 
@@ -55,7 +26,7 @@ def load_adapter_from_ckpt(checkpoint_path: str, device: torch.device):
 def evaluate(args):
     device = torch.device("cuda:0")
     processor, model = load_frozen_llava(args.model_path, dtype=torch.bfloat16, device="cuda:0")
-    adapter, source_layers = load_adapter_from_ckpt(args.checkpoint, device)
+    adapter, source_layers = load_adapter_from_ckpt(args.checkpoint, model, device)
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
     option_ids = get_option_token_ids(processor.tokenizer)
 
@@ -69,12 +40,14 @@ def evaluate(args):
     dataset.rows = dataset.rows[start:end]
     print(f"Shard {args.shard_id}: [{start}, {end}) = {len(dataset)} samples", flush=True)
 
-    stats = {"teacher": 0, "adapter": 0, "mixed": 0, "scored": 0}
+    stats = {"teacher": 0, "adapter": 0, "mixed": 0, "scored": 0, "mixed_scored": 0}
+    mixed_supported = not hasattr(model.model, "image_newline")
 
     for idx in range(len(dataset)):
         item = dataset[idx]
         input_ids = item["input_ids"].unsqueeze(0).to(device)
         pixel_values = item["pixel_values"].unsqueeze(0).to(device)
+        attention_mask = item["attention_mask"].unsqueeze(0).to(device)
         gold = item["gold"]
 
         source_k, source_v = extract_vision_kv(model, pixel_values, source_layers)
@@ -83,25 +56,33 @@ def evaluate(args):
         image_sizes = item.get("image_sizes")
         if image_sizes is not None:
             image_sizes = image_sizes.unsqueeze(0).to(device) if torch.is_tensor(image_sizes) else image_sizes
-        t_logits = teacher_forward(model, input_ids, pixel_values, image_sizes=image_sizes)
-        t_pred = predict_option(t_logits[0, -1], option_ids)
+        t_logits = teacher_forward(model, input_ids, pixel_values, attention_mask=attention_mask, image_sizes=image_sizes)
+        full_last_idx = int(attention_mask[0].sum().item()) - 1
+        t_pred = predict_option(t_logits[0, full_last_idx], option_ids)
 
         # 2. Adapter only (vision KV inject, no image embeddings)
-        a_logits = student_forward_with_visual_kv(model, input_ids, adapter, source_k, source_v, image_token_id)
+        a_logits = student_forward_with_visual_kv(
+            model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
+        )
         a_pred = predict_option(a_logits[0, -1], option_ids)
 
         # 3. Mixed (original + adapter KV added)
-        m_logits = student_forward_mixed(model, input_ids, pixel_values, adapter, source_k, source_v, image_token_id)
-        m_pred = predict_option(m_logits[0, -1], option_ids)
+        m_pred = None
+        if mixed_supported and pixel_values.ndim == 4:
+            m_logits = student_forward_mixed(model, input_ids, pixel_values, adapter, source_k, source_v, image_token_id)
+            m_pred = predict_option(m_logits[0, full_last_idx], option_ids)
 
         stats["scored"] += 1
         stats["teacher"] += int(t_pred == gold)
         stats["adapter"] += int(a_pred == gold)
-        stats["mixed"] += int(m_pred == gold)
+        if m_pred is not None:
+            stats["mixed"] += int(m_pred == gold)
+            stats["mixed_scored"] += 1
 
         if (idx + 1) % 25 == 0:
             n = stats["scored"]
-            ta, aa, ma = stats["teacher"]/n, stats["adapter"]/n, stats["mixed"]/n
+            mixed_n = max(stats["mixed_scored"], 1)
+            ta, aa, ma = stats["teacher"]/n, stats["adapter"]/n, stats["mixed"]/mixed_n
             print(f"[{idx+1}/{len(dataset)}] teacher={ta:.3f} adapter={aa:.3f} mixed={ma:.3f}", flush=True)
 
     out_path = Path(args.output_dir) / f"shard_{args.shard_id}.json"
@@ -112,7 +93,7 @@ def evaluate(args):
 
 
 def merge(args):
-    total = {"teacher": 0, "adapter": 0, "mixed": 0, "scored": 0}
+    total = {"teacher": 0, "adapter": 0, "mixed": 0, "scored": 0, "mixed_scored": 0}
     for shard in range(args.num_shards):
         path = Path(args.output_dir) / f"shard_{shard}.json"
         with open(path) as f:
@@ -124,7 +105,8 @@ def merge(args):
         "total_samples": total["scored"],
         "teacher_accuracy": total["teacher"] / n,
         "adapter_only_accuracy": total["adapter"] / n,
-        "mixed_accuracy": total["mixed"] / n,
+        "mixed_accuracy": total["mixed"] / max(total["mixed_scored"], 1),
+        "mixed_scored": total["mixed_scored"],
     }
     out = Path(args.output_dir) / "results.json"
     with open(out, "w") as f:
