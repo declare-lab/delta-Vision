@@ -653,7 +653,7 @@ def extract_vision_kv_qwen(model, pixel_values, grid_thw, source_layer_indices=[
     return source_k, source_v
 
 
-def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_grid_thw=None, spatial_merge_size=1):
+def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_grid_thw=None, spatial_merge_size=1, full_input_ids=None, mm_token_type_ids=None):
     language_model = model.model.language_model
     layers = language_model.layers
     norm = language_model.norm
@@ -682,10 +682,17 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
     text_pos_1d = torch.arange(text_start, text_start + T, device=device)
     text_pos_3d = text_pos_1d.unsqueeze(0).expand(3, -1).unsqueeze(1)
     rope_dim = rotary_emb.inv_freq.shape[0] * 2
-    dummy_img = torch.zeros(1, N_vis, rope_dim, device=device)
-    cos_img, sin_img = rotary_emb(dummy_img, img_pos_3d)
-    dummy_txt = torch.zeros(1, T, rope_dim, device=device)
-    cos_txt, sin_txt = rotary_emb(dummy_txt, text_pos_3d)
+    if full_input_ids is not None and mm_token_type_ids is not None and image_grid_thw is not None:
+        position_ids = model.get_rope_index(full_input_ids, mm_token_type_ids, image_grid_thw=image_grid_thw)
+        img_token_id = 151655
+        img_mask_full = (full_input_ids[0] == img_token_id)
+        txt_mask_full = ~img_mask_full
+        img_positions_full = position_ids[:, 0, img_mask_full]
+        merge_factor = spatial_merge_size * spatial_merge_size
+        img_pos_3d = img_positions_full[:, ::merge_factor].unsqueeze(1)
+        text_pos_3d = position_ids[:, 0, txt_mask_full].unsqueeze(1)
+    cos_img, sin_img = rotary_emb(torch.zeros(1, N_vis, rope_dim, device=device), img_pos_3d)
+    cos_txt, sin_txt = rotary_emb(torch.zeros(1, T, rope_dim, device=device), text_pos_3d)
     hidden = text_embeds
     for layer_idx, layer in enumerate(layers):
         residual = hidden

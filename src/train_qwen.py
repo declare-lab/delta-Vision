@@ -208,7 +208,7 @@ def main():
             # Student forward (text only)
             text_mask = input_ids[0] != image_token_id
             text_ids = input_ids[:, text_mask]
-            student_logits = student_forward_qwen(model, text_ids, engine.module, source_k, source_v, image_grid_thw=grid_thw, spatial_merge_size=2)
+            student_logits = student_forward_qwen(model, text_ids, engine.module, source_k, source_v, image_grid_thw=grid_thw, spatial_merge_size=2, full_input_ids=input_ids, mm_token_type_ids=mm_ids)
 
             # Align answer positions
             num_text = student_logits.shape[1]
