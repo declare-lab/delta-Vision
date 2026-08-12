@@ -266,9 +266,11 @@ def student_forward_with_visual_kv(
         img_pos = image_position_ids[0]
         # image tokens are always visible to all text (they precede text)
         # Position-based causal: text sees image only if text_pos >= img_pos
-        t_text_pos = text_pos_3d[0, 0]
-        t_img_pos = img_pos_3d[0, 0]
-        img_allowed = t_text_pos.unsqueeze(1) >= t_img_pos.unsqueeze(0)
+        img_allowed = torch.ones(T, N_vis, device=device, dtype=torch.bool)
+        text_allowed = text_pos.unsqueeze(1) >= text_pos.unsqueeze(0)
+
+
+
         text_allowed = text_pos.unsqueeze(1) >= text_pos.unsqueeze(0)
         causal_mask = torch.cat([img_allowed, text_allowed], dim=1)
         attn_mask = torch.zeros(1, 1, T, N_vis + T, device=device, dtype=dtype)
@@ -686,7 +688,7 @@ def student_forward_qwen(model, input_ids, adapter, source_k, source_v, image_gr
     text_pos_3d = text_pos_1d.unsqueeze(0).expand(3, -1).unsqueeze(1)
     rope_dim = rotary_emb.inv_freq.shape[0] * 2
     if full_input_ids is not None and mm_token_type_ids is not None and image_grid_thw is not None:
-        position_ids = model.model.get_rope_index(full_input_ids, mm_token_type_ids, image_grid_thw=image_grid_thw)
+        position_ids, _ = model.model.get_rope_index(full_input_ids, mm_token_type_ids, image_grid_thw=image_grid_thw)
         img_token_id = 151655
         img_mask_full = (full_input_ids[0] == img_token_id)
         txt_mask_full = ~img_mask_full
