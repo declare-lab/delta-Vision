@@ -44,6 +44,8 @@ WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_split}
 VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
+READER_MLP_RATIO=${READER_MLP_RATIO:-4.0}
+READER_ACTIVATION=${READER_ACTIVATION:-situ_glu}
 
 export CUDA_VISIBLE_DEVICES
 if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
@@ -82,6 +84,7 @@ echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
 echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK reader_mlp_ratio=$READER_MLP_RATIO reader_activation=$READER_ACTIVATION"
 
 CMD=(
   "$PY" -m torch.distributed.run
@@ -105,7 +108,7 @@ CMD=(
   --lambda-trajectory 0.5 --lambda-logit 4.0 --lambda-kv-mse 0.0 \
   --output-mode "$OUTPUT_MODE" \
   --visual-adapter-rank "$VISUAL_ADAPTER_RANK" \
-  --reader-mlp-ratio 4.0 --reader-activation situ_glu \
+  --reader-mlp-ratio "$READER_MLP_RATIO" --reader-activation "$READER_ACTIVATION" \
   --batch-sampling pixel_bucket \
   --pixel-bucket-size 512 \
   --pixel-area-cache "$PIXEL_AREA_CACHE" \
