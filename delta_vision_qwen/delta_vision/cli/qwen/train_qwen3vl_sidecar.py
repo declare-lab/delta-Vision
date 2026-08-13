@@ -28,13 +28,14 @@ from delta_vision.models.qwen3vl import (
     prepare_qwen3vl_batch_inputs,
     qwen3vl_text_attention_heads,
     qwen3vl_text_attention_output,
+    qwen3vl_text_attention_output_with_visual_kv,
     qwen3vl_visual_memory_by_layer,
     qwen3vl_prefix_visual_memory_by_layer,
     run_qwen3vl_layer_text_from_attention_output,
     run_qwen3vl_layer_text_with_attention_delta,
     scatter_batched_positions,
 )
-from delta_vision.models.sidecar import DeltaVisionModule
+from delta_vision.models.sidecar import DeltaVisionModule, HEADWISE_NATIVE_DELTA_MODES
 from delta_vision.runtime.basis import reconstruct_delta
 from delta_vision.runtime.ops import VisualKVCache
 
@@ -100,6 +101,8 @@ def parse_args() -> argparse.Namespace:
             "factorized_native_head_o_pure",
             "factorized_native_head_o_residual",
             "native_cross_attention",
+            "native_visual_kv_injection",
+            "native_visual_kv_split",
         ),
         default="residual",
         help="residual predicts low-rank basis coefficients; residual_full directly predicts the hidden residual.",
@@ -1229,13 +1232,17 @@ def compute_loss_for_row(
     # original multimodal position_ids; using text-like positions here is a
     # silent mismatch for native visual attention.
     _vis_pos_ids = None
-    if getattr(args, "use_rope", False) or args.sidecar_visual_kv_source in {
-        "qwen_native",
-        "qwen_first_layer",
-        "qwen_first_layer_film",
-        "qwen_trainable_native",
-        "qwen_anchor_trainable",
-    }:
+    if (
+        getattr(args, "use_rope", False)
+        or args.output_mode in {"native_visual_kv_injection", "native_visual_kv_split"}
+        or args.sidecar_visual_kv_source in {
+            "qwen_native",
+            "qwen_first_layer",
+            "qwen_first_layer_film",
+            "qwen_trainable_native",
+            "qwen_anchor_trainable",
+        }
+    ):
         _vis_pos_ids = torch.zeros(
             3,
             image_positions.shape[0],
@@ -1359,7 +1366,7 @@ def compute_loss_for_row(
         else:
             _dynamic_visual_pos_emb = None
         text_attention = None
-        if sidecar_module.output_mode.startswith("factorized"):
+        if sidecar_module.output_mode.startswith("factorized") or sidecar_module.output_mode == "native_visual_kv_split":
             op_start = mark_start()
             text_attention = qwen3vl_text_attention_output(
                 language_model,
@@ -1370,11 +1377,7 @@ def compute_loss_for_row(
             )
             mark("text_attention_s", op_start)
         text_attention_heads = None
-        if sidecar_module.output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        if sidecar_module.output_mode in HEADWISE_NATIVE_DELTA_MODES:
             op_start = mark_start()
             text_attention_heads = qwen3vl_text_attention_heads(
                 language_model,
@@ -1434,17 +1437,26 @@ def compute_loss_for_row(
                         image_mask,
                         reduce_heads=(
                             "none"
-                            if sidecar_module.output_mode
-                            in {
-                                "factorized_native_head_o",
-                                "factorized_native_head_o_pure",
-                                "factorized_native_head_o_residual",
-                            }
+                            if sidecar_module.output_mode in HEADWISE_NATIVE_DELTA_MODES
                             else "mean"
                         ),
                     ).detach()
         op_start = mark_start()
-        if not sidecar_layer_active:
+        if sidecar_module.output_mode == "native_visual_kv_injection":
+            if _vis_pos_ids is None:
+                raise RuntimeError(f"visual position ids are required for {sidecar_module.output_mode}")
+            text_attention = qwen3vl_text_attention_output_with_visual_kv(
+                language_model,
+                layer_idx,
+                h,
+                text_position_ids,
+                vision_states,
+                _vis_pos_ids,
+                text_padding_mask=text_padding_mask,
+                vision_padding_mask=~image_mask,
+            )
+            pred_delta = h.new_zeros(h.shape)
+        elif not sidecar_layer_active:
             pred_delta = residual_from_cached_coeff(sidecar_module, cached_anchor_coeff, layer_tensor, h)
         else:
             if args.sidecar_visual_kv_source == "qwen_native":
@@ -1487,7 +1499,6 @@ def compute_loss_for_row(
                 _call_kv = qwen_first_layer_film_visual_kv(sidecar_module, _first_layer_visual_kv, layer_idx)
             else:
                 _call_kv = _rope_visual_kv if _rope_visual_kv is not None else None
-            _call_pos = _rope_text_pos_emb if _rope_text_pos_emb is not None else None
             _call_vis = None if _call_kv is not None else vision_states
             _call_mask = None if _call_kv is not None else ~image_mask
             if getattr(sidecar_module, "visual_transform_mode", "none") == "latent_compressor":
@@ -1503,11 +1514,12 @@ def compute_loss_for_row(
                     h,
                     text_position_ids,
                 )
+            _call_pos = None if query_override is not None else _rope_text_pos_emb
             if args.state_tokens > 0:
                 pred_delta, sidecar_state, coeff = sidecar(
-                    h,
-                    _call_vis,
-                    layer_tensor,
+                    hidden_states=h,
+                    vision_states=_call_vis,
+                    layer_idx=layer_tensor,
                     sidecar_state=sidecar_state,
                     visual_kv=_call_kv,
                     vision_padding_mask=_call_mask,
@@ -1524,9 +1536,9 @@ def compute_loss_for_row(
                 )
             else:
                 pred_delta, coeff = sidecar(
-                    h,
-                    _call_vis,
-                    layer_tensor,
+                    hidden_states=h,
+                    vision_states=_call_vis,
+                    layer_idx=layer_tensor,
                     visual_kv=_call_kv,
                     vision_padding_mask=_call_mask,
                     text_attention=text_attention,
@@ -1576,12 +1588,7 @@ def compute_loss_for_row(
                 target_mass = None
                 if (
                     args.lambda_mass > 0.0
-                    and sidecar_module.output_mode
-                    in {
-                        "factorized_native_head_o",
-                        "factorized_native_head_o_pure",
-                        "factorized_native_head_o_residual",
-                    }
+                    and sidecar_module.output_mode in HEADWISE_NATIVE_DELTA_MODES
                     and args.factorized_mass_mode == "learned"
                 ):
                     target_mass = compute_qwen3vl_visual_attention_mass_batched(
@@ -1878,6 +1885,23 @@ def main() -> None:
             param.requires_grad_(False)
         for param in sidecar.v_proj.parameters():
             param.requires_grad_(False)
+    if args.output_mode == "native_visual_kv_injection":
+        for param in sidecar.parameters():
+            param.requires_grad_(False)
+        for name, param in sidecar.named_parameters():
+            if name.startswith("visual_"):
+                param.requires_grad_(True)
+    elif args.output_mode == "native_visual_kv_split":
+        for param in sidecar.parameters():
+            param.requires_grad_(False)
+        for name, param in sidecar.named_parameters():
+            if (
+                name == "gate"
+                or name.startswith("visual_")
+                or name.startswith("reader_")
+                or name.startswith("mass_head")
+            ):
+                param.requires_grad_(True)
     sync_module_state(sidecar)
     sidecar.train()
     basis_param_ids = {id(sidecar.basis)} if isinstance(sidecar.basis, nn.Parameter) else set()

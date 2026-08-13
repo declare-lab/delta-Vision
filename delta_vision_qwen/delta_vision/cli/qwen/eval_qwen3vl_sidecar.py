@@ -24,13 +24,14 @@ from delta_vision.models.qwen3vl import (
     qwen3vl_prefix_visual_memory_by_layer,
     qwen3vl_text_attention_heads,
     qwen3vl_text_attention_output,
+    qwen3vl_text_attention_output_with_visual_kv,
     qwen3vl_visual_memory_by_layer,
     run_qwen3vl_full_layer_with_text_delta,
     run_qwen3vl_layer_text_from_attention_output,
     run_qwen3vl_layer_text_with_attention_delta,
     scatter_batched_positions,
 )
-from delta_vision.models.sidecar import DeltaVisionModule
+from delta_vision.models.sidecar import DeltaVisionModule, HEADWISE_NATIVE_DELTA_MODES
 from delta_vision.cli.qwen.train_qwen3vl_sidecar import (
     attach_qwen_anchor_trainable_visual_kv,
     attach_qwen_first_layer_film_visual_kv,
@@ -102,6 +103,8 @@ def parse_args() -> argparse.Namespace:
             "factorized_native_head_o_pure",
             "factorized_native_head_o_residual",
             "native_cross_attention",
+            "native_visual_kv_injection",
+            "native_visual_kv_split",
         ),
         default="residual",
     )
@@ -408,12 +411,7 @@ def factorized_visual_mass_override(
         image_mask,
         reduce_heads=(
             "none"
-            if sidecar.output_mode
-            in {
-                "factorized_native_head_o",
-                "factorized_native_head_o_pure",
-                "factorized_native_head_o_residual",
-            }
+            if sidecar.output_mode in HEADWISE_NATIVE_DELTA_MODES
             else "mean"
         ),
     )
@@ -562,6 +560,25 @@ def sidecar_logits(
             current_visual_memory=visual_memory_state,
             vision_padding_mask=~image_mask,
         )
+        if sidecar.output_mode == "native_visual_kv_injection":
+            text_attention = qwen3vl_text_attention_output_with_visual_kv(
+                language_model,
+                layer_idx,
+                h,
+                text_position_ids,
+                visual_memory_for_layer,
+                visual_position_ids,
+                text_padding_mask=text_padding_mask,
+                vision_padding_mask=~image_mask,
+            )
+            h = run_qwen3vl_layer_text_from_attention_output(
+                language_model,
+                layer_idx,
+                h,
+                text_attention,
+                attention_delta=None,
+            )
+            continue
         if layer_idx not in sidecar_active_layers:
             delta = residual_from_cached_coeff(sidecar, cached_anchor_coeff, layer_tensor, h)
             delta = delta * float(sidecar_scale)
@@ -644,8 +661,9 @@ def sidecar_logits(
                 h,
                 text_position_ids,
             )
+        call_position_embeddings = None if query_override is not None else text_pos_emb
         text_attention = None
-        if sidecar.output_mode.startswith("factorized"):
+        if sidecar.output_mode.startswith("factorized") or sidecar.output_mode == "native_visual_kv_split":
             text_attention = qwen3vl_text_attention_output(
                 language_model,
                 layer_idx,
@@ -654,11 +672,7 @@ def sidecar_logits(
                 padding_mask=text_padding_mask,
             )
         text_attention_heads = None
-        if sidecar.output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        if sidecar.output_mode in HEADWISE_NATIVE_DELTA_MODES:
             text_attention_heads = qwen3vl_text_attention_heads(
                 language_model,
                 layer_idx,
@@ -689,9 +703,9 @@ def sidecar_logits(
             call_vision_mask = None
         if sidecar.state_tokens > 0:
             delta, sidecar_state, coeff = sidecar(
-                h,
-                call_vision_states,
-                layer_tensor,
+                hidden_states=h,
+                vision_states=call_vision_states,
+                layer_idx=layer_tensor,
                 sidecar_state=sidecar_state,
                 visual_kv=visual_kv,
                 vision_padding_mask=call_vision_mask,
@@ -699,7 +713,7 @@ def sidecar_logits(
                 visual_mass=visual_mass,
                 output_projection=language_model.layers[layer_idx].self_attn.o_proj,
                 text_attention_heads=text_attention_heads,
-                position_embeddings=text_pos_emb,
+                position_embeddings=call_position_embeddings,
                 visual_position_embeddings=visual_pos_emb,
                 query_states=query_override,
                 initial_hidden_states=initial_text_hidden,
@@ -708,16 +722,16 @@ def sidecar_logits(
             )
         else:
             delta, coeff = sidecar(
-                h,
-                call_vision_states,
-                layer_tensor,
+                hidden_states=h,
+                vision_states=call_vision_states,
+                layer_idx=layer_tensor,
                 visual_kv=visual_kv,
                 vision_padding_mask=call_vision_mask,
                 text_attention=text_attention,
                 visual_mass=visual_mass,
                 output_projection=language_model.layers[layer_idx].self_attn.o_proj,
                 text_attention_heads=text_attention_heads,
-                position_embeddings=text_pos_emb,
+                position_embeddings=call_position_embeddings,
                 visual_position_embeddings=visual_pos_emb,
                 query_states=query_override,
                 initial_hidden_states=initial_text_hidden,
@@ -842,6 +856,24 @@ def hybrid_logits(
     fixed_visual_mass: float = 0.12,
     sidecar_active_layers_spec: str = "",
 ) -> torch.Tensor:
+    if sidecar.output_mode == "native_visual_kv_injection":
+        return sidecar_logits(
+            processor,
+            model,
+            language_model,
+            sidecar,
+            row,
+            benchmark,
+            device,
+            dtype,
+            sidecar_scale,
+            visual_memory_mode,
+            sidecar_query_source,
+            sidecar_visual_kv_source,
+            factorized_mass_mode,
+            fixed_visual_mass,
+            sidecar_active_layers_spec,
+        )
     with Image.open(row_image_path(row)) as image:
         inputs = processor(text=build_prompt(processor, row, benchmark), images=image.convert("RGB"), return_tensors="pt")
     inputs = {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
@@ -1007,8 +1039,9 @@ def hybrid_logits(
                 text_hidden,
                 text_position_ids,
             )
+        call_position_embeddings = None if query_override is not None else text_pos_emb
         text_attention = None
-        if sidecar.output_mode.startswith("factorized"):
+        if sidecar.output_mode.startswith("factorized") or sidecar.output_mode == "native_visual_kv_split":
             text_attention = qwen3vl_text_attention_output(
                 language_model,
                 layer_idx,
@@ -1017,11 +1050,7 @@ def hybrid_logits(
                 padding_mask=~text_mask,
             )
         text_attention_heads = None
-        if sidecar.output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        if sidecar.output_mode in HEADWISE_NATIVE_DELTA_MODES:
             text_attention_heads = qwen3vl_text_attention_heads(
                 language_model,
                 layer_idx,
@@ -1052,9 +1081,9 @@ def hybrid_logits(
             call_vision_mask = None
         if sidecar.state_tokens > 0:
             delta, sidecar_state, coeff = sidecar(
-                text_hidden,
-                call_vision_states,
-                layer_tensor,
+                hidden_states=text_hidden,
+                vision_states=call_vision_states,
+                layer_idx=layer_tensor,
                 sidecar_state=sidecar_state,
                 visual_kv=visual_kv,
                 vision_padding_mask=call_vision_mask,
@@ -1062,7 +1091,7 @@ def hybrid_logits(
                 visual_mass=visual_mass,
                 output_projection=language_model.layers[layer_idx].self_attn.o_proj,
                 text_attention_heads=text_attention_heads,
-                position_embeddings=text_pos_emb,
+                position_embeddings=call_position_embeddings,
                 visual_position_embeddings=visual_pos_emb,
                 query_states=query_override,
                 initial_hidden_states=initial_text_hidden,
@@ -1071,16 +1100,16 @@ def hybrid_logits(
             )
         else:
             delta, coeff = sidecar(
-                text_hidden,
-                call_vision_states,
-                layer_tensor,
+                hidden_states=text_hidden,
+                vision_states=call_vision_states,
+                layer_idx=layer_tensor,
                 visual_kv=visual_kv,
                 vision_padding_mask=call_vision_mask,
                 text_attention=text_attention,
                 visual_mass=visual_mass,
                 output_projection=language_model.layers[layer_idx].self_attn.o_proj,
                 text_attention_heads=text_attention_heads,
-                position_embeddings=text_pos_emb,
+                position_embeddings=call_position_embeddings,
                 visual_position_embeddings=visual_pos_emb,
                 query_states=query_override,
                 initial_hidden_states=initial_text_hidden,

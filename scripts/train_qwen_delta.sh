@@ -42,6 +42,7 @@ LR_SCHEDULER=${LR_SCHEDULER:-constant}
 WARMUP_RATIO=${WARMUP_RATIO:-0.0}
 WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.0}
+OUTPUT_MODE=${OUTPUT_MODE:-factorized_native_head_o}
 
 export CUDA_VISIBLE_DEVICES
 if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
@@ -79,7 +80,7 @@ echo "pixel_area_cache=$PIXEL_AREA_CACHE"
 echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
-echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
 
 CMD=(
   "$PY" -m torch.distributed.run
@@ -104,7 +105,7 @@ CMD=(
   --lambda-mass 0.0 --lambda-ce 0.0 \
   --lambda-mass-after-effect-start 0.0 \
   --lambda-trajectory-rms 0.0 \
-  --output-mode factorized_native_head_o \
+  --output-mode "$OUTPUT_MODE" \
   --visual-memory-mode v0 \
   --effect-target static_memory \
   --effect-layers-per-sample 0 \

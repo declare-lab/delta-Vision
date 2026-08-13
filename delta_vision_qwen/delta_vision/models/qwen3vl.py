@@ -479,6 +479,81 @@ def qwen3vl_text_attention_heads(
     return out.transpose(1, 2).contiguous()
 
 
+def qwen3vl_text_attention_output_with_visual_kv(
+    language_model: torch.nn.Module,
+    layer_idx: int,
+    hidden_states: Tensor,
+    position_ids: Tensor,
+    vision_states: Tensor,
+    visual_position_ids: Tensor,
+    text_padding_mask: Tensor | None = None,
+    vision_padding_mask: Tensor | None = None,
+) -> Tensor:
+    """Run Qwen native text attention over text K/V plus injected visual K/V."""
+    layer = language_model.layers[layer_idx]
+    self_attn = layer.self_attn
+
+    normed_text = layer.input_layernorm(hidden_states)
+    text_shape = normed_text.shape[:-1]
+    hidden_shape = (*text_shape, -1, self_attn.head_dim)
+    query_states = self_attn.q_norm(self_attn.q_proj(normed_text).view(hidden_shape)).transpose(1, 2)
+    text_key_states = self_attn.k_norm(self_attn.k_proj(normed_text).view(hidden_shape)).transpose(1, 2)
+    text_value_states = self_attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
+    query_states, text_key_states = apply_rotary_pos_emb(
+        query_states,
+        text_key_states,
+        *language_model.rotary_emb(normed_text, position_ids),
+    )
+
+    normed_visual = layer.input_layernorm(vision_states)
+    visual_shape = normed_visual.shape[:-1]
+    visual_hidden_shape = (*visual_shape, -1, self_attn.head_dim)
+    visual_key_states = self_attn.k_norm(self_attn.k_proj(normed_visual).view(visual_hidden_shape)).transpose(1, 2)
+    visual_value_states = self_attn.v_proj(normed_visual).view(visual_hidden_shape).transpose(1, 2)
+    _, visual_key_states = apply_rotary_pos_emb(
+        visual_key_states,
+        visual_key_states,
+        *language_model.rotary_emb(normed_visual, visual_position_ids),
+    )
+
+    num_key_value_groups = int(self_attn.num_key_value_groups)
+    text_key_states = repeat_kv(text_key_states, num_key_value_groups)
+    text_value_states = repeat_kv(text_value_states, num_key_value_groups)
+    visual_key_states = repeat_kv(visual_key_states, num_key_value_groups)
+    visual_value_states = repeat_kv(visual_value_states, num_key_value_groups)
+
+    key_states = torch.cat([visual_key_states, text_key_states], dim=2)
+    value_states = torch.cat([visual_value_states, text_value_states], dim=2)
+
+    batch, text_len = hidden_states.shape[:2]
+    visual_len = vision_states.shape[1]
+    device = hidden_states.device
+    if text_padding_mask is None:
+        valid_text = torch.ones((batch, text_len), device=device, dtype=torch.bool)
+    else:
+        valid_text = ~text_padding_mask.to(device=device, dtype=torch.bool)
+    if vision_padding_mask is None:
+        valid_visual = torch.ones((batch, visual_len), device=device, dtype=torch.bool)
+    else:
+        valid_visual = ~vision_padding_mask.to(device=device, dtype=torch.bool)
+    causal = torch.ones((text_len, text_len), device=device, dtype=torch.bool).tril()
+    text_allowed = causal.view(1, text_len, text_len) & valid_text.view(batch, 1, text_len)
+    visual_allowed = valid_visual.view(batch, 1, visual_len).expand(batch, text_len, visual_len)
+    attention_mask = torch.cat([visual_allowed, text_allowed], dim=-1).unsqueeze(1)
+
+    heads = F.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=float(self_attn.scaling),
+    )
+    heads = heads.transpose(1, 2).contiguous()
+    return self_attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
+
+
 def qwen3vl_text_attention_outputs_cache(
     language_model: torch.nn.Module,
     layer_idx: int,

@@ -10,6 +10,41 @@ from delta_vision.runtime.basis import reconstruct_delta
 from delta_vision.runtime.ops import VisualKVCache, cross_attention, merge_heads, split_heads
 
 
+SUPPORTED_OUTPUT_MODES = {
+    "residual",
+    "residual_full",
+    "factorized_lowrank",
+    "factorized_full",
+    "factorized_native_o",
+    "factorized_native_head_o",
+    "factorized_native_head_o_pure",
+    "factorized_native_head_o_residual",
+    "native_cross_attention",
+    "native_visual_kv_injection",
+    "native_visual_kv_split",
+}
+LOWRANK_OUTPUT_MODES = {
+    "residual",
+    "factorized_lowrank",
+    "factorized_native_head_o",
+    "factorized_native_head_o_residual",
+}
+HEADWISE_NATIVE_DELTA_MODES = {
+    "factorized_native_head_o",
+    "factorized_native_head_o_pure",
+    "factorized_native_head_o_residual",
+    "native_visual_kv_split",
+}
+NATIVE_OUTPUT_PROJECTION_MODES = HEADWISE_NATIVE_DELTA_MODES | {
+    "factorized_native_o",
+    "native_cross_attention",
+}
+NO_LAYER_CONDITION_MODES = {
+    "native_visual_kv_injection",
+    "native_visual_kv_split",
+}
+
+
 class ReaderMLP(nn.Module):
     def __init__(self, hidden_size: int, mlp_dim: int, activation: str = "gelu") -> None:
         super().__init__()
@@ -131,18 +166,10 @@ class DeltaVisionModule(nn.Module):
         super().__init__()
         if sidecar_dim % num_heads != 0:
             raise ValueError("sidecar_dim must be divisible by num_heads")
-        if output_mode not in (
-            "residual",
-            "residual_full",
-            "factorized_lowrank",
-            "factorized_full",
-            "factorized_native_o",
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-            "native_cross_attention",
-        ):
+        if output_mode not in SUPPORTED_OUTPUT_MODES:
             raise ValueError(f"unsupported Sidecar output_mode: {output_mode}")
+        if output_mode in NO_LAYER_CONDITION_MODES:
+            layer_condition_mode = "none"
         expected_basis_shape = (1, rank, hidden_size) if shared_basis else (num_layers, rank, hidden_size)
         if basis is not None and basis.shape != expected_basis_shape:
             raise ValueError(f"basis must have shape {expected_basis_shape}")
@@ -185,12 +212,7 @@ class DeltaVisionModule(nn.Module):
         self.normalize_basis_rows = bool(normalize_basis_rows)
         self.shared_basis = bool(shared_basis)
         self.output_mode = output_mode
-        self.uses_lowrank_output = output_mode in {
-            "residual",
-            "factorized_lowrank",
-            "factorized_native_head_o",
-            "factorized_native_head_o_residual",
-        }
+        self.uses_lowrank_output = output_mode in LOWRANK_OUTPUT_MODES
         self.corrector_layers = self._parse_corrector_layers(corrector_layers, num_layers)
         self.corrector_dim = int(corrector_dim)
         self.block_corrector_groups = self._parse_block_corrector_groups(block_corrector_groups, num_layers)
@@ -258,11 +280,7 @@ class DeltaVisionModule(nn.Module):
         else:
             self.reader_mlp = None
         self.coeff_head = nn.Linear(sidecar_dim, rank, bias=False) if self.uses_lowrank_output else None
-        if output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        if output_mode in HEADWISE_NATIVE_DELTA_MODES:
             self.mass_head = nn.Linear(sidecar_dim, num_heads, bias=True)
         elif output_mode.startswith("factorized"):
             self.mass_head = nn.Linear(sidecar_dim, 1, bias=True)
@@ -1326,19 +1344,9 @@ class DeltaVisionModule(nn.Module):
             )
         if self.output_mode.startswith("factorized") and text_attention is None:
             raise ValueError(f"text_attention is required for Sidecar output_mode={self.output_mode}")
-        if self.output_mode in {
-            "factorized_native_o",
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-            "native_cross_attention",
-        } and output_projection is None:
+        if self.output_mode in NATIVE_OUTPUT_PROJECTION_MODES and output_projection is None:
             raise ValueError(f"output_projection is required for {self.output_mode}")
-        if (
-            self.output_mode
-            in {"factorized_native_head_o", "factorized_native_head_o_pure", "factorized_native_head_o_residual"}
-            and text_attention_heads is None
-        ):
+        if self.output_mode in HEADWISE_NATIVE_DELTA_MODES and text_attention_heads is None:
             raise ValueError(f"text_attention_heads is required for {self.output_mode}")
         if self.reader_mode != "pooled" and visual_kv is None:
             if vision_states is None:
@@ -1379,6 +1387,8 @@ class DeltaVisionModule(nn.Module):
             layer_idx_tensor=layer_idx_tensor,
         )
 
+        if query_states is not None:
+            position_embeddings = None
         q_content = query_states if query_states is not None else self.q_proj(hidden_states)
         if query_states is None and self.use_rope and position_embeddings is not None:
             cos, sin = position_embeddings
@@ -1572,11 +1582,7 @@ class DeltaVisionModule(nn.Module):
             residual = self.visual_full_head(reader_features)
         elif self.output_mode == "factorized_native_o":
             residual = output_projection(text_attn_out)
-        elif self.output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        elif self.output_mode in HEADWISE_NATIVE_DELTA_MODES:
             if text_attention_heads is None:
                 raise RuntimeError("text_attention_heads unexpectedly missing")
             if text_attention_heads.shape != text_attn_heads_out.shape:
@@ -1605,7 +1611,9 @@ class DeltaVisionModule(nn.Module):
                         f"visual_mass shape {tuple(visual_mass.shape)} is not broadcastable to {tuple(text_attn_heads_out.shape)}"
                     )
             self.last_visual_mass = visual_mass_heads.squeeze(-1)
-            residual_heads = visual_mass_heads * (text_attn_heads_out - text_attention_heads.to(dtype=text_attn_heads_out.dtype))
+            residual_heads = visual_mass_heads * (
+                text_attn_heads_out - text_attention_heads.to(dtype=text_attn_heads_out.dtype)
+            )
             residual = output_projection(merge_heads(residual_heads))
             if self.output_mode == "factorized_native_head_o_residual":
                 if coeff is None or basis is None:
@@ -1615,11 +1623,7 @@ class DeltaVisionModule(nn.Module):
             if coeff is None or basis is None:
                 raise RuntimeError("low-rank residual path is not initialized")
             residual = reconstruct_delta(coeff, basis)
-        if self.output_mode in {
-            "factorized_native_head_o",
-            "factorized_native_head_o_pure",
-            "factorized_native_head_o_residual",
-        }:
+        if self.output_mode in HEADWISE_NATIVE_DELTA_MODES:
             pass
         elif self.output_mode != "residual":
             if text_attention is None:
