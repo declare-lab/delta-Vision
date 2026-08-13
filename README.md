@@ -29,6 +29,43 @@ No MLP computation on visual tokens at any layer -- the main source of speedup.
 | Config | Teacher | Adapter-only (best) | Params |
 |--------|---------|--------------------|----|
 | ViT KV source, 4000 steps | 57.8% | 44.7% (77%) | 75.6M |
+| delta-vision sidecar, 500 steps | 65.3% | 54.9% sidecar-only / 65.0% hybrid | 691M checkpoint |
+
+The delta-vision sidecar row is a separate architecture from the KV-injection adapter above. It reproduces
+`qwen_topk1024_freezeqkv_no_layer_20260807_100141`: V0 visual memory, frozen Qwen native Q/K/V
+references, `factorized_native_head_o`, `lambda_logit=4.0`, and `lambda_trajectory=0.5`.
+
+Exact-repro training entry:
+
+```bash
+scripts/train_qwen_delta.sh
+```
+
+Useful overrides:
+
+```bash
+RUN_NAME=qwen_topk1024_freezeqkv_no_layer_repro \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+scripts/train_qwen_delta.sh
+```
+
+The original target run used constant LR. For a new non-exact experiment, set `LR_SCHEDULER=cosine`
+and `WARMUP_RATIO=0.2`.
+
+MMStar prompt-logit eval for the sidecar checkpoint:
+
+```bash
+RUN_DIR=artifacts/experiments/qwen_topk1024_freezeqkv/qwen_topk1024_freezeqkv_no_layer_repro \
+scripts/eval_qwen_delta_mmstar.sh
+```
+
+Compare against the 20260807_100141 reference loss/eval:
+
+```bash
+.venv/bin/python scripts/check_qwen_delta_repro.py \
+  --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/qwen_topk1024_freezeqkv_no_layer_repro/checkpoints \
+  --eval-json artifacts/eval/qwen_topk1024_freezeqkv/qwen_topk1024_freezeqkv_no_layer_repro/step500_mmstar_8gpu/mmstar_merged_qwen_format.json
+```
 
 ### Prefill Speed (torch.compile, both sides, H200)
 

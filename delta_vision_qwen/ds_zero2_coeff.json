@@ -1,6 +1,6 @@
 {
-  "train_micro_batch_size_per_gpu": 1,
-  "gradient_accumulation_steps": 4,
+  "train_micro_batch_size_per_gpu": 4,
+  "gradient_accumulation_steps": 1,
   "bf16": {
     "enabled": true
   },
@@ -13,7 +13,15 @@
     "reduce_bucket_size": 200000000,
     "contiguous_gradients": true
   },
-  "gradient_clipping": 1.0,
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 0.0001,
+      "betas": [0.9, 0.95],
+      "eps": 1e-8,
+      "weight_decay": 0.01
+    }
+  },
   "steps_per_print": 100,
   "wall_clock_breakdown": false
 }

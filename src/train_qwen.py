@@ -34,6 +34,13 @@ def topk_kl_loss(student_logits, teacher_logits, topk=1024, temperature=1.0):
     ) * (temperature * temperature)
 
 
+def directional_mse_loss(pred, target, eps=1e-6):
+    """Directional MSE: normalize both to unit norm, then MSE."""
+    pred_n = pred / (pred.norm(dim=-1, keepdim=True) + eps)
+    target_n = target / (target.norm(dim=-1, keepdim=True) + eps)
+    return ((pred_n - target_n) ** 2).mean()
+
+
 def adapter_kv_mse_loss(model, adapter, source_k, source_v, teacher_kvs):
     if not teacher_kvs:
         return source_k.new_tensor(0.0)
@@ -59,8 +66,14 @@ def adapter_kv_mse_loss(model, adapter, source_k, source_v, teacher_kvs):
             continue
         teacher_k = teacher_k[:, :, :n].to(device=vis_k.device)
         teacher_v = teacher_v[:, :, :n].to(device=vis_v.device)
-        total = total + F.mse_loss(vis_k[:, :, :n].float(), teacher_k.float())
-        total = total + F.mse_loss(vis_v[:, :, :n].float(), teacher_v.float())
+        # Normalized MSE: mse / (variance of target + eps) to avoid scale explosion
+        tk = teacher_k.float()
+        tv = teacher_v.float()
+        pk = vis_k[:, :, :n].float()
+        pv = vis_v[:, :, :n].float()
+        mse_k = ((pk - tk) ** 2).mean() / (tk.var() + 1e-4)
+        mse_v = ((pv - tv) ** 2).mean() / (tv.var() + 1e-4)
+        total = total + mse_k + mse_v
         count += 2
     return total / max(count, 1)
 
@@ -131,8 +144,11 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--lambda-kl", type=float, default=1.0)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.5)
+    parser.add_argument("--lambda-trajectory", type=float, default=0.5)
+    parser.add_argument("--trajectory-layers", default="4,8,12,16,20,24,28,32,36")
     parser.add_argument("--use-activation", action="store_true")
     parser.add_argument("--bottleneck-dim", type=int, default=0)
+    parser.add_argument("--expansion-dim", type=int, default=0)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.2)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
@@ -219,7 +235,7 @@ def main():
         "source_mode": source_mode,
         "qwen_source_mode": source_mode,
     }
-    adapter = PerLayerKVAdapter(bottleneck_dim=args.bottleneck_dim, use_activation=args.use_activation,
+    adapter = PerLayerKVAdapter(bottleneck_dim=args.bottleneck_dim, use_activation=args.use_activation, expansion_dim=args.expansion_dim,
         num_llm_layers=num_llm_layers, num_source_layers=len(source_layers),
         source_dim=source_dim, num_heads=num_kv_heads, head_dim=head_dim,
     )
@@ -315,8 +331,11 @@ def main():
                     pixel_values=pixel_values,
                     image_grid_thw=grid_thw,
                     mm_token_type_ids=mm_ids,
+                    output_hidden_states=True,
                 )
                 teacher_logits = teacher_out.logits
+                # teacher hidden states: [num_layers+1, B, seq_len, hidden] for all layers
+                teacher_hidden_states = teacher_out.hidden_states
                 for h in hooks:
                     h.remove()
 
@@ -348,6 +367,34 @@ def main():
             t_end = min(t_start + args.max_answer_tokens, t_actual_len, teacher_logits.shape[1])
             t_answer = teacher_logits[0, t_start:t_end]
 
+            # Trajectory loss: compare student hidden states to teacher at specified layers
+            trajectory_layers = [int(x) for x in args.trajectory_layers.split(",")]
+            # We need student hidden states per layer - hook them during student forward
+            # For now, compute by running student forward with hooks
+            student_hidden_dict = {}
+            student_hooks = []
+            lm_layers_list = model.model.language_model.layers
+            text_mask_full = (input_ids[0] != image_token_id) & attention_mask[0].bool()
+            def make_student_hook(idx):
+                def hook_fn(module, input, output):
+                    h = output[0] if isinstance(output, tuple) else output
+                    student_hidden_dict[idx] = h
+                return hook_fn
+            for idx in trajectory_layers:
+                if idx <= len(lm_layers_list):
+                    h_hook = lm_layers_list[idx - 1].register_forward_hook(make_student_hook(idx))
+                    student_hooks.append(h_hook)
+            # Rerun student forward to collect hidden states (only if trajectory loss enabled)
+            if args.lambda_trajectory > 0:
+                _ = student_forward_qwen(
+                    model, text_ids, engine.module, source_k, source_v,
+                    image_grid_thw=grid_thw, spatial_merge_size=spatial_merge_size,
+                    full_input_ids=input_ids, mm_token_type_ids=mm_ids,
+                    attention_mask=attention_mask,
+                )
+            for h_hook in student_hooks:
+                h_hook.remove()
+
             kl_loss = student_logits.sum() * 0.0
             if s_answer.shape[0] > 0 and t_answer.shape[0] > 0:
                 min_len = min(s_answer.shape[0], t_answer.shape[0])
@@ -361,7 +408,21 @@ def main():
                 kv_loss = adapter_kv_mse_loss(model, engine.module, source_k, source_v, teacher_kvs)
             else:
                 kv_loss = student_logits.sum() * 0.0
-            loss = args.lambda_kl * kl_loss + args.lambda_kv_mse * kv_loss
+            traj_loss = student_logits.sum() * 0.0
+            if args.lambda_trajectory > 0 and teacher_hidden_states is not None and student_hidden_dict:
+                traj_terms = []
+                for traj_idx in trajectory_layers:
+                    if traj_idx not in student_hidden_dict or traj_idx >= len(teacher_hidden_states):
+                        continue
+                    student_h = student_hidden_dict[traj_idx]
+                    # teacher hidden state at layer traj_idx: [B, seq_len, hidden], take text positions
+                    teacher_h = teacher_hidden_states[traj_idx][:, text_mask_full]
+                    # Match: student_h is [B, T_text, hidden], teacher_h is [B, T_text, hidden]
+                    n = min(student_h.shape[1], teacher_h.shape[1])
+                    traj_terms.append(directional_mse_loss(student_h[:, :n].float(), teacher_h[:, :n].float()))
+                if traj_terms:
+                    traj_loss = torch.stack(traj_terms).mean()
+            loss = args.lambda_kl * kl_loss + args.lambda_kv_mse * kv_loss + args.lambda_trajectory * traj_loss
 
             engine.backward(loss)
             # Update LR before step
@@ -376,6 +437,7 @@ def main():
                     "loss": float(loss.item()),
                     "kl_loss": float(kl_loss.item()),
                     "kv_mse": float(kv_loss.item()),
+                    "traj": float(traj_loss.item()),
                     "lr": current_lr,
                 }
                 print(json.dumps(item), flush=True)
@@ -386,6 +448,7 @@ def main():
                         "train/loss": item["loss"],
                         "train/kl_loss": item["kl_loss"],
                         "train/kv_mse": item["kv_mse"],
+                        "train/traj": item["traj"],
                         "train/lr": current_lr,
                     }, step=step)
 

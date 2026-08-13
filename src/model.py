@@ -36,6 +36,7 @@ class PerLayerKVAdapter(nn.Module):
         bottleneck_dim: int = 0,
         concat_source: bool = False,
         use_activation: bool = False,
+        expansion_dim: int = 0,
     ):
         super().__init__()
         self.num_llm_layers = num_llm_layers
@@ -43,6 +44,7 @@ class PerLayerKVAdapter(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.bottleneck_dim = bottleneck_dim
+        self.expansion_dim = expansion_dim
         self.concat_source = concat_source
         self.use_activation = use_activation
         target_dim = num_heads * head_dim
@@ -52,7 +54,21 @@ class PerLayerKVAdapter(nn.Module):
 
         self.source_mix = nn.Parameter(torch.zeros(num_llm_layers, num_source_layers))
 
-        if bottleneck_dim > 0:
+        if expansion_dim > 0:
+            # GLU MLP: Linear -> gate * up -> Linear (SwiGLU style)
+            self.k_gate = nn.ModuleList([nn.Linear(input_dim, expansion_dim, bias=True) for _ in range(num_llm_layers)])
+            self.k_up_mlp = nn.ModuleList([nn.Linear(input_dim, expansion_dim, bias=True) for _ in range(num_llm_layers)])
+            self.k_down_mlp = nn.ModuleList([nn.Linear(expansion_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
+            self.v_gate = nn.ModuleList([nn.Linear(input_dim, expansion_dim, bias=True) for _ in range(num_llm_layers)])
+            self.v_up_mlp = nn.ModuleList([nn.Linear(input_dim, expansion_dim, bias=True) for _ in range(num_llm_layers)])
+            self.v_down_mlp = nn.ModuleList([nn.Linear(expansion_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
+            self.k_projs = None
+            self.v_projs = None
+            self.k_down = None
+            self.k_up = None
+            self.v_down = None
+            self.v_up = None
+        elif bottleneck_dim > 0:
             self.k_down = nn.ModuleList([nn.Linear(input_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
             self.k_up = nn.ModuleList([nn.Linear(bottleneck_dim, target_dim, bias=True) for _ in range(num_llm_layers)])
             self.v_down = nn.ModuleList([nn.Linear(input_dim, bottleneck_dim, bias=True) for _ in range(num_llm_layers)])
@@ -71,16 +87,30 @@ class PerLayerKVAdapter(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        if self.k_projs is not None:
+        if hasattr(self, "k_gate") and self.k_gate is not None:
+            for gate, up in zip(self.k_gate, self.k_up_mlp):
+                nn.init.xavier_normal_(gate.weight, gain=1.0)
+                nn.init.zeros_(gate.bias)
+                nn.init.xavier_normal_(up.weight, gain=1.0)
+                nn.init.zeros_(up.bias)
+            for gate, up in zip(self.v_gate, self.v_up_mlp):
+                nn.init.xavier_normal_(gate.weight, gain=1.0)
+                nn.init.zeros_(gate.bias)
+                nn.init.xavier_normal_(up.weight, gain=1.0)
+                nn.init.zeros_(up.bias)
+            for down in list(self.k_down_mlp) + list(self.v_down_mlp):
+                nn.init.xavier_normal_(down.weight, gain=0.1)
+                nn.init.zeros_(down.bias)
+        elif self.k_projs is not None:
             for proj in list(self.k_projs) + list(self.v_projs):
-                nn.init.xavier_normal_(proj.weight, gain=0.01)
+                nn.init.xavier_normal_(proj.weight, gain=0.1)
                 nn.init.zeros_(proj.bias)
         else:
             for proj in list(self.k_down) + list(self.v_down):
-                nn.init.xavier_normal_(proj.weight, gain=0.02)
+                nn.init.xavier_normal_(proj.weight, gain=1.0)
                 nn.init.zeros_(proj.bias)
             for proj in list(self.k_up) + list(self.v_up):
-                nn.init.xavier_normal_(proj.weight, gain=0.01)
+                nn.init.xavier_normal_(proj.weight, gain=0.1)
                 nn.init.zeros_(proj.bias)
 
     def forward_layer(
@@ -121,6 +151,10 @@ class PerLayerKVAdapter(nn.Module):
             if self.use_activation:
                 key = F.silu(key)
                 value = F.silu(value)
+        elif self.expansion_dim > 0:
+            # SwiGLU: silu(gate(x)) * up(x), then down proj
+            key = self.k_down_mlp[layer_idx](F.silu(self.k_gate[layer_idx](mixed_k)) * self.k_up_mlp[layer_idx](mixed_k))
+            value = self.v_down_mlp[layer_idx](F.silu(self.v_gate[layer_idx](mixed_v)) * self.v_up_mlp[layer_idx](mixed_v))
         else:
             key = self.k_up[layer_idx](F.silu(self.k_down[layer_idx](mixed_k)))
             value = self.v_up[layer_idx](F.silu(self.v_down[layer_idx](mixed_v)))
@@ -164,7 +198,13 @@ def infer_adapter_config_from_checkpoint(
     concat_source = _as_bool(saved_config.get("concat_source", ckpt_args.get("concat_source", False)))
     use_activation = _as_bool(saved_config.get("use_activation", ckpt_args.get("use_activation", False)))
 
-    if "k_projs.0.weight" in state_dict:
+    expansion_dim = int(saved_config.get("expansion_dim", ckpt_args.get("expansion_dim", 0)))
+    if "k_gate.0.weight" in state_dict and "k_up_mlp.0.weight" in state_dict:
+        expansion_dim = state_dict["k_gate.0.weight"].shape[0]
+        input_dim = state_dict["k_gate.0.weight"].shape[1]
+        target_dim = state_dict["k_down_mlp.0.weight"].shape[0]
+        bottleneck_dim = 0
+    elif "k_projs.0.weight" in state_dict:
         target_dim, input_dim = state_dict["k_projs.0.weight"].shape
         bottleneck_dim = 0
     elif "k_down.0.weight" in state_dict and "k_up.0.weight" in state_dict:
@@ -210,6 +250,7 @@ def infer_adapter_config_from_checkpoint(
         "num_heads": num_heads,
         "head_dim": head_dim,
         "bottleneck_dim": int(bottleneck_dim),
+        "expansion_dim": int(expansion_dim),
         "concat_source": concat_source,
         "use_activation": use_activation,
     }
