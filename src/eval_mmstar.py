@@ -15,8 +15,12 @@ from src.model import (
     PerLayerKVAdapter,
     student_forward_with_visual_kv,
     teacher_forward,
+    dtype_from_name,
+    load_frozen_qwen3vl,
+    load_qwen_visual_delta_checkpoint,
+    qwen_visual_delta_logits,
 )
-from src.data import MMStarDataset
+from src.data import MMStarDataset, QwenMMStarDataset
 
 
 OPTION_LETTERS = ["A", "B", "C", "D"]
@@ -169,7 +173,7 @@ def load_adapter(checkpoint_path: str, model, device: torch.device) -> tuple[Per
 
 
 @torch.inference_mode()
-def evaluate_shard(
+def evaluate_llava_shard(
     model,
     processor,
     adapter: PerLayerKVAdapter,
@@ -269,7 +273,8 @@ def evaluate_shard(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser("Unified MMStar evaluation for LLaVA KV adapters and Qwen3-VL visual-delta adapters.")
+    parser.add_argument("--model-kind", choices=("llava", "qwen"), default="llava")
     parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
     parser.add_argument("--data", default="../delta-vision/data/mmstar/mmstar_val.jsonl")
     parser.add_argument("--data-root", default="../delta-vision", help="Root for resolving image paths")
@@ -280,15 +285,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-id", type=int, default=None, help="If set, only run this shard")
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--eval-mode", choices=["generate", "logits"], default="generate")
-    parser.add_argument(
-        "--answer-instruction",
-        default="Answer directly with only the letter of the correct option.",
-    )
+    parser.add_argument("--eval-mode", choices=("generate", "logits"), default="generate")
+    parser.add_argument("--answer-instruction", default="Answer directly with only the letter of the correct option.")
+    parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
+    parser.add_argument("--attn-implementation", default="flash_attention_2")
     return parser.parse_args()
 
 
-def run_single_shard(args, shard_id: int, num_shards: int):
+def run_llava_single_shard(args, shard_id: int, num_shards: int):
     """Run evaluation on a single shard (one GPU)."""
     device = torch.device("cuda:0")
     processor, model = load_frozen_llava(args.model_path, dtype=torch.bfloat16, device="cuda:0")
@@ -310,7 +314,7 @@ def run_single_shard(args, shard_id: int, num_shards: int):
     full_dataset.rows = full_dataset.rows[start:end]
     print(f"Shard {shard_id}: samples [{start}, {end}) = {len(full_dataset)} items", flush=True)
 
-    result = evaluate_shard(
+    result = evaluate_llava_shard(
         model,
         processor,
         adapter,
@@ -331,8 +335,189 @@ def run_single_shard(args, shard_id: int, num_shards: int):
     return result
 
 
+
+@torch.inference_mode()
+def generate_teacher_qwen(
+    model,
+    processor,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    mm_token_type_ids: torch.Tensor,
+    max_new_tokens: int,
+) -> tuple[str | None, str]:
+    if hasattr(model.model, "rope_deltas"):
+        model.model.rope_deltas = None
+    eos_ids = sorted(_eos_token_ids(processor.tokenizer))
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+        "mm_token_type_ids": mm_token_type_ids,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+    }
+    if eos_ids:
+        kwargs["eos_token_id"] = eos_ids
+    pad_token_id = getattr(processor.tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(processor.tokenizer, "eos_token_id", None)
+    if pad_token_id is not None:
+        kwargs["pad_token_id"] = pad_token_id
+    generated = model.generate(**kwargs)
+    text = processor.tokenizer.decode(generated[0, input_ids.shape[1] :], skip_special_tokens=True)
+    return extract_option_from_text(text), text
+
+
+@torch.inference_mode()
+def generate_adapter_qwen(
+    model,
+    processor,
+    adapter,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    mm_token_type_ids: torch.Tensor,
+    max_new_tokens: int,
+) -> tuple[str | None, str]:
+    full_ids = input_ids.clone()
+    full_mask = attention_mask.clone()
+    full_mm_ids = mm_token_type_ids.clone()
+    generated: list[int] = []
+    eos_ids = _eos_token_ids(processor.tokenizer)
+    for _ in range(max_new_tokens):
+        inputs = {
+            "input_ids": full_ids,
+            "attention_mask": full_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "mm_token_type_ids": full_mm_ids,
+        }
+        logits, text_mask, _ = qwen_visual_delta_logits(model, adapter, inputs, collect_states=False)
+        next_token = int(torch.argmax(logits[0, int(text_mask[0].sum().item()) - 1]).item())
+        generated.append(next_token)
+        token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
+        full_ids = torch.cat([full_ids, token], dim=1)
+        full_mask = torch.cat([full_mask, torch.ones_like(token)], dim=1)
+        full_mm_ids = torch.cat([full_mm_ids, torch.zeros_like(token)], dim=1)
+        if next_token in eos_ids:
+            break
+    text = processor.tokenizer.decode(generated, skip_special_tokens=True)
+    return extract_option_from_text(text), text
+
+
+@torch.inference_mode()
+def evaluate_qwen_shard(
+    model,
+    processor,
+    adapter,
+    dataset: QwenMMStarDataset,
+    device: torch.device,
+    log_every: int,
+    max_new_tokens: int,
+) -> dict:
+    stats = {
+        "scored": 0,
+        "teacher_correct": 0,
+        "adapter_correct": 0,
+        "adapter_correct_when_teacher_correct": 0,
+        "agree": 0,
+        "teacher_invalid": 0,
+        "adapter_invalid": 0,
+    }
+    predictions = []
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        input_ids = item["input_ids"].unsqueeze(0).to(device)
+        attention_mask = item["attention_mask"].unsqueeze(0).to(device)
+        pixel_values = item["pixel_values"].to(device)
+        image_grid_thw = item["image_grid_thw"].to(device)
+        mm_token_type_ids = item["mm_token_type_ids"].unsqueeze(0).to(device)
+        gold = item["gold"]
+
+        teacher_pred, teacher_text = generate_teacher_qwen(
+            model,
+            processor,
+            input_ids,
+            attention_mask,
+            pixel_values,
+            image_grid_thw,
+            mm_token_type_ids,
+            max_new_tokens,
+        )
+        adapter_pred, adapter_text = generate_adapter_qwen(
+            model,
+            processor,
+            adapter,
+            input_ids,
+            attention_mask,
+            pixel_values,
+            image_grid_thw,
+            mm_token_type_ids,
+            max_new_tokens,
+        )
+
+        stats["scored"] += 1
+        stats["teacher_correct"] += int(teacher_pred == gold)
+        stats["adapter_correct"] += int(adapter_pred == gold)
+        stats["adapter_correct_when_teacher_correct"] += int(teacher_pred == gold and adapter_pred == gold)
+        stats["agree"] += int(teacher_pred == adapter_pred)
+        stats["teacher_invalid"] += int(teacher_pred is None)
+        stats["adapter_invalid"] += int(adapter_pred is None)
+        predictions.append(
+            {
+                "index": item["index"],
+                "gold": gold,
+                "teacher": teacher_pred,
+                "adapter": adapter_pred,
+                "teacher_text": teacher_text,
+                "adapter_text": adapter_text,
+            }
+        )
+        if (idx + 1) % log_every == 0:
+            n = max(stats["scored"], 1)
+            print(
+                f"[{idx+1}/{len(dataset)}] teacher={stats['teacher_correct']/n:.4f} "
+                f"adapter={stats['adapter_correct']/n:.4f} agreement={stats['agree']/n:.4f}",
+                flush=True,
+            )
+    return {"stats": stats, "predictions": predictions, "output_mode": adapter.mode}
+
+
+def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: int) -> dict:
+    device = torch.device("cuda:0")
+    dtype = dtype_from_name(args.dtype)
+    processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    adapter, meta = load_qwen_visual_delta_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
+    if meta["missing"] or meta["unexpected"]:
+        print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
+
+    dataset = QwenMMStarDataset(
+        args.data,
+        processor,
+        data_root=args.data_root,
+        max_samples=args.max_samples,
+        answer_instruction=args.answer_instruction,
+    )
+    total = len(dataset)
+    per_shard = (total + num_shards - 1) // num_shards
+    start = shard_id * per_shard
+    end = min(start + per_shard, total)
+    dataset.rows = dataset.rows[start:end]
+    print(f"Shard {shard_id}: samples [{start}, {end}) = {len(dataset)} items; mode={adapter.mode}", flush=True)
+    result = evaluate_qwen_shard(model, processor, adapter, dataset, device, args.log_every, args.max_new_tokens)
+    out_path = Path(args.output_dir) / f"shard_{shard_id}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Shard {shard_id} done. Saved to {out_path}", flush=True)
+    return result
+
+
+
 def merge_shards(output_dir: str, num_shards: int) -> dict:
-    """Merge results from all shards."""
     all_stats = {
         "scored": 0,
         "teacher_correct": 0,
@@ -343,16 +528,19 @@ def merge_shards(output_dir: str, num_shards: int) -> dict:
         "adapter_invalid": 0,
     }
     all_predictions = []
+    output_modes = set()
 
     for shard_id in range(num_shards):
         path = Path(output_dir) / f"shard_{shard_id}.json"
         if not path.exists():
             raise FileNotFoundError(f"Missing shard result: {path}")
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         for key in all_stats:
-            all_stats[key] += data["stats"].get(key, 0)
-        all_predictions.extend(data["predictions"])
+            all_stats[key] += int(data["stats"].get(key, 0))
+        all_predictions.extend(data.get("predictions", []))
+        if data.get("output_mode"):
+            output_modes.add(data["output_mode"])
 
     n = max(all_stats["scored"], 1)
     tc = all_stats["teacher_correct"]
@@ -365,19 +553,23 @@ def merge_shards(output_dir: str, num_shards: int) -> dict:
         "teacher_invalid_rate": all_stats["teacher_invalid"] / n,
         "adapter_invalid_rate": all_stats["adapter_invalid"] / n,
     }
+    if output_modes:
+        merged["output_modes"] = sorted(output_modes)
 
-    out_path = Path(output_dir) / "results.json"
-    with open(out_path, "w") as f:
-        json.dump(merged, f, indent=2)
+    out_dir = Path(output_dir)
+    (out_dir / "results.json").write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "predictions.json").write_text(json.dumps(all_predictions, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(merged, indent=2), flush=True)
     return merged
 
 
-def main():
+def main() -> None:
     args = parse_args()
-
     if args.shard_id is not None:
-        run_single_shard(args, args.shard_id, args.num_shards)
+        if args.model_kind == "qwen":
+            run_qwen_single_shard(args, args.shard_id, args.num_shards)
+        else:
+            run_llava_single_shard(args, args.shard_id, args.num_shards)
     else:
         merge_shards(args.output_dir, args.num_shards)
 

@@ -5,9 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA_ROOT=${DATA_ROOT:-/lustre-data/leijingdi/code/delta-vision}
 
 PY=${PY:-$ROOT_DIR/.venv/bin/python}
-export PYTHONPATH="$ROOT_DIR/delta_vision_qwen${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
-RUN_NAME=${RUN_NAME:-qwen_topk1024_freezeqkv_no_layer_$(date +%Y%m%d_%H%M%S)}
+RUN_NAME=${RUN_NAME:-qwen_visual_delta_$(date +%Y%m%d_%H%M%S)}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/qwen_topk1024_freezeqkv/$RUN_NAME/checkpoints}
 LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
 METRICS_JSONL=${METRICS_JSONL:-$OUTPUT_DIR/train_metrics.jsonl}
@@ -41,8 +41,9 @@ LR=${LR:-5e-5}
 LR_SCHEDULER=${LR_SCHEDULER:-constant}
 WARMUP_RATIO=${WARMUP_RATIO:-0.0}
 WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
-MIN_LR_RATIO=${MIN_LR_RATIO:-0.0}
-OUTPUT_MODE=${OUTPUT_MODE:-factorized_native_head_o}
+MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_split}
+VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
 
 export CUDA_VISIBLE_DEVICES
 if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
@@ -70,7 +71,7 @@ export DELTA_VISION_IMAGE_ROOT="$DATA_ROOT"
 
 mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$PIXEL_AREA_CACHE")"
 
-echo "=== Qwen3-VL sidecar exact-repro train ==="
+echo "=== Qwen3-VL visual-delta train ==="
 echo "root=$ROOT_DIR"
 echo "data_root=$DATA_ROOT"
 echo "run_name=$RUN_NAME"
@@ -86,7 +87,8 @@ CMD=(
   "$PY" -m torch.distributed.run
   --nproc_per_node "$NPROC_PER_NODE"
   --master_port "$MASTER_PORT"
-  -m delta_vision.cli.qwen.train_qwen3vl_sidecar \
+  -m src.train \
+  --model-kind qwen \
   --data "$DATA" \
   --image-root "$DATA_ROOT" \
   --model-path "$MODEL_PATH" \
@@ -100,36 +102,10 @@ CMD=(
   --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO" \
   --min-lr-ratio "$MIN_LR_RATIO" \
   --weight-decay 0.01 --temperature 2.0 \
-  --lambda-trajectory 0.5 --lambda-logit 4.0 \
-  --lambda-effect 0.0 --lambda-effect-cos 0.0 --lambda-effect-rms 0.0 \
-  --lambda-mass 0.0 --lambda-ce 0.0 \
-  --lambda-mass-after-effect-start 0.0 \
-  --lambda-trajectory-rms 0.0 \
+  --lambda-trajectory 0.5 --lambda-logit 4.0 --lambda-kv-mse 0.0 \
   --output-mode "$OUTPUT_MODE" \
-  --visual-memory-mode v0 \
-  --effect-target static_memory \
-  --effect-layers-per-sample 0 \
-  --effect-layer-sampling uniform \
-  --hard-effect-layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35 \
-  --visual-transform-mode layer_kv_adapter \
-  --visual-transform-rank 128 \
-  --sidecar-dim 4096 --num-heads 32 --rank 512 \
-  --layer-adapter-rank 512 \
+  --visual-adapter-rank "$VISUAL_ADAPTER_RANK" \
   --reader-mlp-ratio 4.0 --reader-activation situ_glu \
-  --reader-mode cross_attention \
-  --layer-condition-mode none \
-  --sidecar-query-source qwen_native \
-  --sidecar-visual-kv-source qwen_native \
-  --teacher-force-steps 0 --teacher-force-mix 0.0 \
-  --teacher-mix-end-step 0 \
-  --basis-lr-mult 1.0 \
-  --factorized-mass-mode learned \
-  --fixed-visual-mass 0.12 \
-  --native-qkv-init none \
-  --output-init-std 0.0001 \
-  --mass-positive-threshold 0.01 \
-  --mass-positive-weight 0.0 \
-  --state-tokens 0 \
   --batch-sampling pixel_bucket \
   --pixel-bucket-size 512 \
   --pixel-area-cache "$PIXEL_AREA_CACHE" \
@@ -147,7 +123,7 @@ CMD=(
 if [[ "${WANDB:-0}" == "1" ]]; then
   CMD+=(
     --wandb
-    --wandb-project "${WANDB_PROJECT:-delta-vision}"
+    --wandb-project "${WANDB_PROJECT:-vision-kv-inject}"
     --wandb-run-name "${WANDB_RUN_NAME:-$RUN_NAME}"
     --wandb-mode "${WANDB_MODE:-online}"
   )

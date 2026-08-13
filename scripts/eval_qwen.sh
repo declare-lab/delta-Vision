@@ -43,7 +43,8 @@ fi
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
   gpu="${DEVICES[$shard]}"
   echo "Launching shard $shard on GPU $gpu"
-  CUDA_VISIBLE_DEVICES="$gpu" $PY -m src.eval_qwen_mmstar \
+  CUDA_VISIBLE_DEVICES="$gpu" $PY -m src.eval_mmstar \
+    --model-kind qwen \
     --model-path "$MODEL_PATH" \
     --data "$DATA" \
     --data-root "$DATA_ROOT" \
@@ -63,7 +64,8 @@ for pid in "${pids[@]}"; do
 done
 
 echo "=== Merging results ==="
-$PY -m src.eval_qwen_mmstar \
+$PY -m src.eval_mmstar \
+  --model-kind qwen \
   --model-path "$MODEL_PATH" \
   --data "$DATA" \
   --data-root "$DATA_ROOT" \
