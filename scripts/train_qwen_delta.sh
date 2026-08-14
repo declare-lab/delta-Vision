@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
 DATA_ROOT=${DATA_ROOT:-/lustre-data/leijingdi/code/delta-vision}
 
 PY=${PY:-$ROOT_DIR/.venv/bin/python}
@@ -21,7 +22,11 @@ if [[ "$MODEL_PATH" != /* ]]; then
   MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
 fi
 if [[ "$DATA" != /* ]]; then
-  DATA="$DATA_ROOT/$DATA"
+  if [[ -f "$ROOT_DIR/$DATA" ]]; then
+    DATA="$ROOT_DIR/$DATA"
+  else
+    DATA="$DATA_ROOT/$DATA"
+  fi
 fi
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
@@ -42,6 +47,7 @@ LR_SCHEDULER=${LR_SCHEDULER:-constant}
 WARMUP_RATIO=${WARMUP_RATIO:-0.0}
 WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-sample}
 OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_split}
 VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
 READER_MLP_RATIO=${READER_MLP_RATIO:-4.0}
@@ -83,7 +89,7 @@ echo "pixel_area_cache=$PIXEL_AREA_CACHE"
 echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
-echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
 echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK reader_mlp_ratio=$READER_MLP_RATIO reader_activation=$READER_ACTIVATION"
 
 CMD=(
@@ -106,6 +112,7 @@ CMD=(
   --min-lr-ratio "$MIN_LR_RATIO" \
   --weight-decay 0.01 --temperature 2.0 \
   --lambda-trajectory 0.5 --lambda-logit 4.0 --lambda-kv-mse 0.0 \
+  --loss-normalization "$LOSS_NORMALIZATION" \
   --output-mode "$OUTPUT_MODE" \
   --visual-adapter-rank "$VISUAL_ADAPTER_RANK" \
   --reader-mlp-ratio "$READER_MLP_RATIO" --reader-activation "$READER_ACTIVATION" \

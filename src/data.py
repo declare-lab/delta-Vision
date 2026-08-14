@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
+from src.benchmarks import build_benchmark_prompt, get_benchmark_spec
+
 
 class VQADataset(Dataset):
     """Load pixmo_ama style JSONL: {image, question, answer}.
@@ -218,6 +220,68 @@ class QwenMMStarDataset(Dataset):
             "index": row.get("index", idx),
         }
         return result
+
+
+class QwenBenchmarkDataset(Dataset):
+    """Generic Qwen3-VL benchmark dataset using the unified benchmark JSONL schema."""
+
+    def __init__(
+        self,
+        jsonl_path: str,
+        processor,
+        benchmark: str,
+        data_root: str | None = None,
+        max_samples: int | None = None,
+        answer_instruction: str | None = None,
+    ):
+        self.processor = processor
+        self.spec = get_benchmark_spec(benchmark)
+        self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
+        self.answer_instruction = answer_instruction
+
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            self.rows = [json.loads(line) for line in f if line.strip()]
+
+        if max_samples is not None:
+            self.rows = self.rows[:max_samples]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.rows[idx]
+        image_path = Path(str(row["image"]))
+        if not image_path.is_absolute():
+            image_path = self.data_root / image_path
+
+        question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
+        image = Image.open(image_path).convert("RGB")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": question},
+                ],
+            }
+        ]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=[text], images=[image], return_tensors="pt", padding=True)
+        if "mm_token_type_ids" not in inputs:
+            raise ValueError("Qwen processor did not return mm_token_type_ids; M-RoPE positions would be invalid")
+
+        return {
+            "input_ids": inputs["input_ids"].squeeze(0),
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+            "pixel_values": inputs["pixel_values"],
+            "image_grid_thw": inputs["image_grid_thw"],
+            "mm_token_type_ids": inputs["mm_token_type_ids"].squeeze(0),
+            "answer": row.get("answer"),
+            "answers": row.get("answers"),
+            "choices": row.get("choices"),
+            "row": row,
+            "index": row.get("index", idx),
+        }
 
 
 class OPDDataset(Dataset):

@@ -32,9 +32,24 @@ from src.model import (
     prepare_qwen3vl_batch_inputs,
     qwen_position_ids,
     qwen_visual_delta_logits,
+    resolve_row_image_path,
     student_forward_with_visual_kv,
     teacher_forward,
 )
+
+
+def configure_torch_runtime() -> None:
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
 
 def topk_kl_loss(
     student_logits: torch.Tensor,
@@ -129,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-logit", type=float, default=4.0)
     parser.add_argument("--lambda-trajectory", type=float, default=0.5)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
+    parser.add_argument("--loss-normalization", choices=("token", "sample"), default="sample")
     parser.add_argument("--trajectory-layers", default="4,8,12,16,20,24,28,32,36")
     parser.add_argument("--micro-batch-size-per-gpu", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -266,29 +282,46 @@ def parse_trajectory_layers(spec: str, num_layers: int) -> set[int]:
     return out
 
 
-def masked_directional_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_directional_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    normalization: str = "token",
+) -> torch.Tensor:
     valid = mask.to(device=pred.device, dtype=pred.float().dtype).unsqueeze(-1)
     pred_norm = pred.float() / pred.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
     target_norm = target.float() / target.float().pow(2).mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
-    return ((pred_norm - target_norm).pow(2) * valid).sum() / valid.sum().mul(pred.shape[-1]).clamp_min(1.0)
+    per_token = (pred_norm - target_norm).pow(2).mean(dim=-1)
+    valid_2d = valid.squeeze(-1)
+    if normalization == "sample":
+        per_sample = (per_token * valid_2d).sum(dim=1) / valid_2d.sum(dim=1).clamp_min(1.0)
+        has_valid = valid_2d.sum(dim=1) > 0
+        if int(has_valid.sum().item()) == 0:
+            return pred.new_zeros(())
+        return per_sample[has_valid].mean()
+    return (per_token * valid_2d).sum() / valid_2d.sum().clamp_min(1.0)
 
 
-def masked_topk_kl(
+def masked_topk_kl_stats(
     student_logits: Tensor,
     teacher_logits: Tensor,
     target_ids: Tensor,
     answer_mask: Tensor,
     temperature: float,
     k: int,
-) -> Tensor:
+) -> tuple[Tensor, Tensor, Tensor]:
+    batch = student_logits.shape[0]
     if k <= 0:
-        return student_logits.new_zeros(())
-    shift_student = student_logits[:, :-1].float()
-    shift_teacher = teacher_logits[:, :-1].float()
-    shift_targets = target_ids[:, 1:]
-    shift_mask = answer_mask[:, 1:]
-    if shift_mask.float().sum() == 0:
-        return student_logits.new_zeros(())
+        return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), student_logits.new_zeros((batch,))
+    shift_mask = answer_mask[:, 1:].bool()
+    answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
+    valid_count = answer_counts.sum()
+    if int(valid_count.item()) == 0:
+        return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), answer_counts
+    shift_student = student_logits[:, :-1][shift_mask].float()
+    shift_teacher = teacher_logits[:, :-1][shift_mask].float()
+    shift_targets = target_ids[:, 1:][shift_mask]
     k_eff = min(k, shift_teacher.shape[-1])
     topk = torch.topk(shift_teacher, k=k_eff, dim=-1).indices
     target_idx = shift_targets.unsqueeze(-1)
@@ -304,14 +337,47 @@ def masked_topk_kl(
         F.softmax(gathered_teacher, dim=-1),
         reduction="none",
     ).sum(dim=-1)
-    denom = shift_mask.float().sum().clamp_min(1.0)
-    return (kl * shift_mask.float()).sum() * (temperature * temperature) / denom
+    kl = kl * (temperature * temperature)
+    batch_ids = (
+        torch.arange(batch, device=student_logits.device)
+        .unsqueeze(1)
+        .expand_as(shift_mask)[shift_mask]
+    )
+    per_sample_sum = student_logits.new_zeros((batch,), dtype=torch.float32)
+    per_sample_sum.scatter_add_(0, batch_ids, kl.to(device=student_logits.device, dtype=torch.float32))
+    per_sample = per_sample_sum / answer_counts.clamp_min(1.0)
+    token_mean = kl.sum() / valid_count.float().clamp_min(1.0)
+    return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
+
+
+def masked_topk_kl(
+    student_logits: Tensor,
+    teacher_logits: Tensor,
+    target_ids: Tensor,
+    answer_mask: Tensor,
+    temperature: float,
+    k: int,
+    *,
+    normalization: str = "token",
+) -> tuple[Tensor, Tensor, Tensor]:
+    token_mean, per_sample, answer_counts = masked_topk_kl_stats(
+        student_logits,
+        teacher_logits,
+        target_ids,
+        answer_mask,
+        temperature,
+        k,
+    )
+    if normalization == "sample":
+        has_answer = answer_counts > 0
+        if int(has_answer.sum().item()) == 0:
+            return token_mean, per_sample, answer_counts
+        return per_sample[has_answer].mean(), per_sample, answer_counts
+    return token_mean, per_sample, answer_counts
 
 
 def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
-    path = Path(str(row.get("image", "")))
-    if image_root is not None and not path.is_absolute():
-        path = image_root / path
+    path = resolve_row_image_path(row, image_root)
     try:
         with Image.open(path) as image:
             width, height = image.size
@@ -322,7 +388,10 @@ def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
 
 def load_or_build_pixel_areas(args: argparse.Namespace, dataset: JsonlDataset) -> list[int]:
     cache_path = Path(args.pixel_area_cache) if args.pixel_area_cache else Path(str(args.data) + ".pixel_areas.json")
-    if cache_path.exists():
+
+    def read_cache() -> list[int] | None:
+        if not cache_path.exists():
+            return None
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
             areas = payload.get("areas") if isinstance(payload, dict) else payload
@@ -330,13 +399,30 @@ def load_or_build_pixel_areas(args: argparse.Namespace, dataset: JsonlDataset) -
                 return [int(x) for x in areas]
         except Exception:
             pass
+        return None
+
+    cached = read_cache()
+    if cached is not None:
+        return cached
+
+    if distributed_is_initialized() and not is_rank0():
+        distributed_barrier()
+        cached = read_cache()
+        if cached is None:
+            raise RuntimeError(f"rank0 did not create a valid pixel-area cache: {cache_path}")
+        return cached
+
     root = Path(args.image_root) if str(args.image_root).strip() else None
     areas = [image_pixel_area(row, root) for row in dataset.rows]
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps({"data": str(args.data), "count": len(dataset), "areas": areas}), encoding="utf-8")
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
+        tmp_path.write_text(json.dumps({"data": str(args.data), "count": len(dataset), "areas": areas}), encoding="utf-8")
+        tmp_path.replace(cache_path)
     except Exception:
         pass
+    if distributed_is_initialized():
+        distributed_barrier()
     return areas
 
 
@@ -411,6 +497,7 @@ def compute_loss_for_rows(
         include_answers=True,
     )
     assert text_ids is not None and answer_mask is not None
+    trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
     with torch.no_grad():
         teacher = model(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
         full_position_ids = qwen_position_ids(model, inputs)
@@ -420,10 +507,11 @@ def compute_loss_for_rows(
             inputs["mm_token_type_ids"],
             full_position_ids,
         )
-        teacher_text_states = [
-            gather_batched_positions(state.detach(), text_positions, text_mask).detach()
-            for state in teacher.hidden_states
-        ]
+        teacher_text_states = {
+            state_idx: gather_batched_positions(teacher.hidden_states[state_idx].detach(), text_positions, text_mask).detach()
+            for state_idx in sorted(trajectory_layers)
+            if state_idx < len(teacher.hidden_states)
+        }
         teacher_logits = gather_batched_positions(teacher.logits.detach(), text_positions, text_mask)
 
     student_logits, student_text_mask, student_states = qwen_visual_delta_logits(
@@ -433,23 +521,40 @@ def compute_loss_for_rows(
         initial_hidden=teacher.hidden_states[0].detach(),
         position_ids=full_position_ids,
         collect_states=True,
+        collect_state_indices=trajectory_layers,
     )
     if student_states is None:
         raise RuntimeError("student states were not collected")
     if student_text_mask.shape != text_mask.shape:
         raise RuntimeError("student/teacher text masks differ")
 
-    trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
     traj_terms = []
     for state_idx in sorted(trajectory_layers):
-        if state_idx >= len(teacher_text_states) or state_idx >= len(student_states):
+        if state_idx not in teacher_text_states or state_idx >= len(student_states):
             continue
         pred_h = student_states[state_idx]
+        if pred_h.numel() == 0:
+            continue
         if state_idx == num_layers:
             pred_h = model.model.language_model.norm(pred_h)
-        traj_terms.append(masked_directional_mse(pred_h, teacher_text_states[state_idx].to(dtype=pred_h.dtype), text_mask))
+        traj_terms.append(
+            masked_directional_mse(
+                pred_h,
+                teacher_text_states[state_idx].to(dtype=pred_h.dtype),
+                text_mask,
+                normalization=args.loss_normalization,
+            )
+        )
     trajectory = torch.stack(traj_terms).mean() if traj_terms else student_logits.new_zeros(())
-    logit_kl = masked_topk_kl(student_logits, teacher_logits, text_ids, answer_mask, args.temperature, args.kl_topk)
+    logit_kl, per_sample_kl, answer_counts = masked_topk_kl(
+        student_logits,
+        teacher_logits,
+        text_ids,
+        answer_mask,
+        args.temperature,
+        args.kl_topk,
+        normalization=args.loss_normalization,
+    )
     kv_mse = student_logits.new_zeros(())
     loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
 
@@ -457,13 +562,41 @@ def compute_loss_for_rows(
     if adapter.last_visual_mass is not None:
         valid = text_mask.to(device=adapter.last_visual_mass.device).bool()
         mass_mean = adapter.last_visual_mass.float()[valid].mean()
+    sources = [str(row.get("source", "")) for row in rows]
+    ocrvqa_mask = torch.tensor(
+        [source == "ocrvqa" for source in sources],
+        device=student_logits.device,
+        dtype=torch.bool,
+    )
+    pixmo_mask = torch.tensor(
+        [source == "pixmo_clean" for source in sources],
+        device=student_logits.device,
+        dtype=torch.bool,
+    )
+
+    def masked_mean(values: Tensor, valid_mask: Tensor) -> Tensor:
+        valid_mask = valid_mask.to(device=values.device, dtype=torch.bool)
+        if int(valid_mask.sum().item()) == 0:
+            return values.new_zeros(())
+        return values[valid_mask].float().mean()
+
+    answer_total = answer_counts.float().sum().clamp_min(1.0)
+    ocr_answer_tokens = answer_counts.float()[ocrvqa_mask].sum() if int(ocrvqa_mask.sum().item()) else answer_counts.new_zeros(())
+    pixmo_answer_tokens = answer_counts.float()[pixmo_mask].sum() if int(pixmo_mask.sum().item()) else answer_counts.new_zeros(())
     metrics: dict[str, float | int | str] = {
         "loss": float(loss.detach()),
         "logit_kl": float(logit_kl.detach()),
+        "logit_kl_ocrvqa": float(masked_mean(per_sample_kl.detach(), ocrvqa_mask).detach()),
+        "logit_kl_pixmo_clean": float(masked_mean(per_sample_kl.detach(), pixmo_mask).detach()),
         "trajectory": float(trajectory.detach()),
         "kv_mse": float(kv_mse.detach()),
         "visual_mass": float(mass_mean.detach()),
         "text_tokens": float(text_mask.sum().item()) / max(1, len(rows)),
+        "answer_tokens": float(answer_counts.sum().item()) / max(1, len(rows)),
+        "ocrvqa_frac": float(ocrvqa_mask.float().mean().item()),
+        "pixmo_clean_frac": float(pixmo_mask.float().mean().item()),
+        "ocrvqa_answer_token_frac": float((ocr_answer_tokens / answer_total).item()),
+        "pixmo_clean_answer_token_frac": float((pixmo_answer_tokens / answer_total).item()),
         "image": image_paths[0],
         "batch_size": int(len(rows)),
     }
@@ -747,6 +880,7 @@ def run_qwen(args: argparse.Namespace) -> None:
         device = torch.device(args.device)
     rank_id = dist.get_rank() if distributed_is_initialized() else 0
     world_size = dist.get_world_size() if distributed_is_initialized() else 1
+    configure_torch_runtime()
     random.seed(args.seed + rank_id)
     torch.manual_seed(args.seed + rank_id)
     dtype = dtype_from_name(args.dtype)
