@@ -171,7 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     if args.kl_topk is None:
-        args.kl_topk = 128 if args.supervision_loss == "opd" else 1024
+        args.kl_topk = 1024
     return args
 
 
