@@ -140,6 +140,7 @@ fi
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$ROOT_DIR/artifacts/torch_compile_cache}
+export TORCHINDUCTOR_COMPILE_THREADS=${TORCHINDUCTOR_COMPILE_THREADS:-4}
 export DELTA_VISION_IMAGE_ROOT="$DATA_ROOT"
 
 SHARD_DIR="$OUT_DIR/shards"
@@ -154,11 +155,16 @@ echo "output=$OUT_DIR"
 echo "benchmark=$BENCHMARK max_samples=$MAX_SAMPLES shards=$NUM_SHARDS"
 echo "attn=$ATTN_IMPL dtype=$DTYPE"
 echo "compile_adapter=${COMPILE_ADAPTER:-1} compile_mode=${COMPILE_MODE:-reduce-overhead} compile_dynamic=${COMPILE_DYNAMIC:-1} compile_warmup=${COMPILE_WARMUP:-1}"
+echo "torchinductor_cache=$TORCHINDUCTOR_CACHE_DIR compile_threads=$TORCHINDUCTOR_COMPILE_THREADS"
 echo "fast_split_text=${FAST_SPLIT_TEXT:-0}"
 echo "fast_injection_prefix=${FAST_INJECTION_PREFIX:-0}"
 echo "adapter_decode_cache=${ADAPTER_DECODE_CACHE:-0}"
 echo "structured_answer_early_stop=${STRUCTURED_ANSWER_EARLY_STOP:-1}"
 echo "teacher_cache=${TEACHER_CACHE:-1} teacher_cache_dir=${TEACHER_CACHE_DIR:-}"
+echo "require_teacher_cache=${REQUIRE_TEACHER_CACHE:-0}"
+echo "last_logits_only=${LAST_LOGITS_ONLY:-1}"
+echo "input_cache=${INPUT_CACHE:-1} input_cache_dir=${INPUT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_benchmark_inputs}"
+echo "context_cache=${CONTEXT_CACHE:-0} context_cache_dir=${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}"
 
 IFS=',' read -r -a DEVICES <<< "$CUDA_DEVICES_CSV"
 if [[ "${#DEVICES[@]}" -lt "$NUM_SHARDS" ]]; then
@@ -225,6 +231,23 @@ if [[ "${TEACHER_CACHE:-1}" == "1" ]]; then
 else
   TEACHER_CACHE_ARGS=(--no-teacher-cache)
 fi
+if [[ "${REQUIRE_TEACHER_CACHE:-0}" == "1" ]]; then
+  TEACHER_CACHE_ARGS+=(--require-teacher-cache)
+fi
+LAST_LOGITS_ARGS=()
+if [[ "${LAST_LOGITS_ONLY:-1}" == "1" ]]; then
+  LAST_LOGITS_ARGS=(--last-logits-only)
+else
+  LAST_LOGITS_ARGS=(--no-last-logits-only)
+fi
+INPUT_CACHE_ARGS=()
+if [[ "${INPUT_CACHE:-1}" == "1" ]]; then
+  INPUT_CACHE_ARGS=(--input-cache-dir "${INPUT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_benchmark_inputs}")
+fi
+CONTEXT_CACHE_ARGS=()
+if [[ "${CONTEXT_CACHE:-0}" == "1" ]]; then
+  CONTEXT_CACHE_ARGS=(--context-cache-dir "${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}")
+fi
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
   gpu="${DEVICES[$shard]}"
   echo "Launching shard $shard on GPU $gpu"
@@ -248,6 +271,9 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     "${EARLY_STOP_ARGS[@]}" \
     "${COMPILE_ARGS[@]}" \
     "${TEACHER_CACHE_ARGS[@]}" \
+    "${LAST_LOGITS_ARGS[@]}" \
+    "${INPUT_CACHE_ARGS[@]}" \
+    "${CONTEXT_CACHE_ARGS[@]}" \
     --dtype "$DTYPE" \
     --attn-implementation "$ATTN_IMPL" \
     > "$SHARD_DIR/shard_$(printf '%02d' "$shard").log" 2>&1 &
@@ -276,6 +302,9 @@ done
   "${DECODE_CACHE_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \
   "${TEACHER_CACHE_ARGS[@]}" \
+  "${LAST_LOGITS_ARGS[@]}" \
+  "${INPUT_CACHE_ARGS[@]}" \
+  "${CONTEXT_CACHE_ARGS[@]}" \
   --dtype "$DTYPE" \
   --attn-implementation "$ATTN_IMPL"
 

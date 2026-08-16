@@ -136,6 +136,17 @@ Qwen mixed Pixmo-clean + OCRvQA 12k run:
 - Full metrics: `all_ckpt_benchmark_summary.csv`, `all_ckpt_benchmark_summary.json`, `all_ckpt_scores_wide.csv`.
 - Validation: 132/132 checkpoint-benchmark results completed. `all_ckpt_benchmark_summary.json` has 132 rows.
 
+OCR-aligned training data:
+
+- Pixmo-clean + OCR-heavy 300k source mix: `data/pixmo_clean_ocrmix_300k/train.jsonl`
+- No-Pixmo short-answer aligned OCR mix: `data/ocr_aligned_no_pixmo_filtered/train.jsonl` (148,667 rows)
+- OCRBench-targeted v1 mix: `data/ocrbench_target_mix_v1/train.jsonl` (205,242 rows)
+
+The OCRBench-targeted v1 mix keeps the no-Pixmo aligned rows and appends 50k HME100K formula
+recognition samples plus 6,575 CORD receipt/KIE field-QA samples. It preserves existing prompts
+for base rows and avoids full-page OCR dumps, binary yes/no targets, unanswerable labels, and long
+generic answers.
+
 Adapter scores, 1000-sample subsets:
 
 | Step | MMStar | GQA | MMB | MMB-CN | MME | POPE | SQA | VQA-v2 | TextVQA | VizWiz | OCRBench |

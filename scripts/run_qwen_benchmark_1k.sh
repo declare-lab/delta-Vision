@@ -117,6 +117,9 @@ fi
 OUT_ROOT=${OUT_ROOT:-$ROOT_DIR/artifacts/eval/qwen_topk1024_freezeqkv/$RUN_LABEL/$RUNTIME_TAG}
 TEACHER_CACHE=${TEACHER_CACHE:-1}
 TEACHER_CACHE_DIR=${TEACHER_CACHE_DIR:-$OUT_ROOT/teacher_cache}
+LAST_LOGITS_ONLY=${LAST_LOGITS_ONLY:-1}
+INPUT_CACHE=${INPUT_CACHE:-1}
+INPUT_CACHE_DIR=${INPUT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_benchmark_inputs}
 
 if [[ -z "${STEPS:-}" && "$EVAL_ALL_CKPTS" == "1" ]]; then
   CKPT_DIR="$RUN_DIR"
@@ -148,6 +151,8 @@ echo "compile_adapter=$COMPILE_ADAPTER compile_mode=$COMPILE_MODE compile_dynami
 echo "adapter_decode_cache=$ADAPTER_DECODE_CACHE"
 echo "runtime_tag=$RUNTIME_TAG out_root=$OUT_ROOT"
 echo "teacher_cache=$TEACHER_CACHE teacher_cache_dir=$TEACHER_CACHE_DIR"
+echo "last_logits_only=$LAST_LOGITS_ONLY input_cache=$INPUT_CACHE input_cache_dir=$INPUT_CACHE_DIR"
+echo "context_cache=${CONTEXT_CACHE:-0} context_cache_dir=${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}"
 echo "force_eval=$FORCE_EVAL"
 echo "start=$(date)"
 
@@ -174,6 +179,11 @@ for step in $STEPS; do
     ADAPTER_DECODE_CACHE="$ADAPTER_DECODE_CACHE" \
     TEACHER_CACHE="$TEACHER_CACHE" \
     TEACHER_CACHE_DIR="$TEACHER_CACHE_DIR" \
+    LAST_LOGITS_ONLY="$LAST_LOGITS_ONLY" \
+    INPUT_CACHE="$INPUT_CACHE" \
+    INPUT_CACHE_DIR="$INPUT_CACHE_DIR" \
+    CONTEXT_CACHE="${CONTEXT_CACHE:-0}" \
+    CONTEXT_CACHE_DIR="${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}" \
     bash scripts/eval_qwen_delta_mmstar.sh "$benchmark"
     echo "=== DONE step=$step benchmark=$benchmark $(date) ==="
   done

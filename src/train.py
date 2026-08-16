@@ -23,6 +23,7 @@ from src.model import (
     PerLayerKVAdapter,
     QWEN_VISUAL_DELTA_MODES,
     QwenVisualDeltaAdapter,
+    build_qwen_initial_context,
     dtype_from_name,
     extract_vision_kv,
     gather_batched_positions,
@@ -30,12 +31,24 @@ from src.model import (
     load_frozen_llava,
     load_frozen_qwen3vl,
     prepare_qwen3vl_batch_inputs,
+    qwen3vl_text_ids_and_answer_mask,
     qwen_position_ids,
     qwen_visual_delta_logits,
     resolve_row_image_path,
     student_forward_with_visual_kv,
     teacher_forward,
 )
+
+
+QWEN_SOURCE_METRIC_GROUPS = {
+    "doc": ("docvqa", "pdfvqa", "ureader_qa_processed"),
+    "scene_text": ("textvqa", "st_vqa"),
+    "chart": ("chartqa", "plotqa", "infographic_vqa"),
+    "kie": ("sroie", "funsd", "cord_receipt_kie"),
+    "hme": ("hme100k",),
+    "ocrvqa": ("ocrvqa",),
+    "pixmo_clean": ("pixmo_clean",),
+}
 
 
 def configure_torch_runtime() -> None:
@@ -141,6 +154,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--reader-mlp-ratio", type=float, default=4.0)
     parser.add_argument("--reader-activation", choices=("gelu", "silu", "swiglu", "situ_glu"), default="situ_glu")
+    parser.add_argument("--supervision-loss", choices=("distill", "ce", "opd"), default="distill")
+    parser.add_argument("--opd-rollout-max-new-tokens", type=int, default=32)
     parser.add_argument("--lambda-logit", type=float, default=4.0)
     parser.add_argument("--lambda-trajectory", type=float, default=0.5)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
@@ -190,6 +205,17 @@ def reduce_metric_dict(metrics: dict[str, float], device: torch.device) -> dict[
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     values /= dist.get_world_size()
     return {key: float(value.item()) for key, value in zip(keys, values)}
+
+
+def finalize_source_loss_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    for group_name in QWEN_SOURCE_METRIC_GROUPS:
+        weighted_key = f"source_loss_weighted_{group_name}"
+        frac_key = f"source_frac_{group_name}"
+        out_key = f"source_loss_{group_name}"
+        weighted = float(metrics.pop(weighted_key, 0.0))
+        frac = float(metrics.get(frac_key, 0.0))
+        metrics[out_key] = weighted / frac if frac > 0.0 else 0.0
+    return metrics
 
 
 class SimpleEngine:
@@ -376,6 +402,153 @@ def masked_topk_kl(
     return token_mean, per_sample, answer_counts
 
 
+def masked_ce_stats(
+    student_logits: Tensor,
+    target_ids: Tensor,
+    answer_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    batch = student_logits.shape[0]
+    shift_mask = answer_mask[:, 1:].bool()
+    answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
+    valid_count = answer_counts.sum()
+    if int(valid_count.item()) == 0:
+        return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), answer_counts
+    shift_student = student_logits[:, :-1][shift_mask].float()
+    shift_targets = target_ids[:, 1:][shift_mask]
+    ce = F.cross_entropy(shift_student, shift_targets, reduction="none")
+    batch_ids = (
+        torch.arange(batch, device=student_logits.device)
+        .unsqueeze(1)
+        .expand_as(shift_mask)[shift_mask]
+    )
+    per_sample_sum = student_logits.new_zeros((batch,), dtype=torch.float32)
+    per_sample_sum.scatter_add_(0, batch_ids, ce.to(device=student_logits.device, dtype=torch.float32))
+    per_sample = per_sample_sum / answer_counts.clamp_min(1.0)
+    token_mean = ce.sum() / valid_count.float().clamp_min(1.0)
+    return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
+
+
+def masked_ce_loss(
+    student_logits: Tensor,
+    target_ids: Tensor,
+    answer_mask: Tensor,
+    *,
+    normalization: str = "token",
+) -> tuple[Tensor, Tensor, Tensor]:
+    token_mean, per_sample, answer_counts = masked_ce_stats(student_logits, target_ids, answer_mask)
+    if normalization == "sample":
+        has_answer = answer_counts > 0
+        if int(has_answer.sum().item()) == 0:
+            return token_mean, per_sample, answer_counts
+        return per_sample[has_answer].mean(), per_sample, answer_counts
+    return token_mean, per_sample, answer_counts
+
+
+def qwen_eos_token_ids(tokenizer: Any) -> set[int]:
+    raw_ids = tokenizer.eos_token_id
+    if raw_ids is None:
+        return set()
+    if isinstance(raw_ids, int):
+        return {int(raw_ids)}
+    return {int(token_id) for token_id in raw_ids}
+
+
+def qwen_last_token_logits(logits: Tensor, text_mask: Tensor) -> Tensor:
+    if logits.shape[1] == 1:
+        return logits[:, -1]
+    last_idx = text_mask.long().sum(dim=1).sub(1).clamp_min(0)
+    batch_idx = torch.arange(logits.shape[0], device=logits.device)
+    return logits[batch_idx, last_idx]
+
+
+def qwen_append_generated_text_tokens(inputs: dict[str, Tensor], generated_ids: list[int]) -> dict[str, Tensor]:
+    if inputs["input_ids"].shape[0] != 1:
+        raise ValueError("qwen_append_generated_text_tokens expects a single-row Qwen input")
+    if not generated_ids:
+        raise ValueError("cannot append an empty OPD rollout")
+    token_tensor = torch.tensor([generated_ids], device=inputs["input_ids"].device, dtype=inputs["input_ids"].dtype)
+    out = dict(inputs)
+    out["input_ids"] = torch.cat([inputs["input_ids"], token_tensor], dim=1)
+    out["attention_mask"] = torch.cat([inputs["attention_mask"], torch.ones_like(token_tensor)], dim=1)
+    out["mm_token_type_ids"] = torch.cat([inputs["mm_token_type_ids"], torch.zeros_like(token_tensor)], dim=1)
+    return out
+
+
+@torch.no_grad()
+def qwen_student_rollout_token_ids(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    prompt_inputs: dict[str, Tensor],
+    tokenizer: Any,
+    *,
+    max_new_tokens: int,
+) -> list[int]:
+    if prompt_inputs["input_ids"].shape[0] != 1:
+        raise ValueError("OPD rollout currently expects single-row Qwen inputs")
+    eos_ids = qwen_eos_token_ids(tokenizer)
+    fallback_id = tokenizer.eos_token_id
+    if isinstance(fallback_id, list):
+        fallback_id = fallback_id[0] if fallback_id else None
+    if fallback_id is None:
+        fallback_id = tokenizer.pad_token_id
+    if max_new_tokens <= 0:
+        return [int(fallback_id)] if fallback_id is not None else []
+
+    full_ids = prompt_inputs["input_ids"].clone()
+    full_mask = prompt_inputs["attention_mask"].clone()
+    full_mm_ids = prompt_inputs["mm_token_type_ids"].clone()
+    inputs = {
+        "input_ids": full_ids,
+        "attention_mask": full_mask,
+        "pixel_values": prompt_inputs["pixel_values"],
+        "image_grid_thw": prompt_inputs["image_grid_thw"],
+        "mm_token_type_ids": full_mm_ids,
+    }
+    initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
+    token_embeddings = model.model.get_input_embeddings()
+    last_pos_idx = full_mask.long().sum(dim=1).sub(1).view(1, -1, 1).expand(position_ids.shape[0], -1, 1)
+    token_position_ids = position_ids.gather(2, last_pos_idx)
+
+    generated: list[int] = []
+    for _ in range(int(max_new_tokens)):
+        logits, text_mask, _ = qwen_visual_delta_logits(
+            model,
+            adapter,
+            inputs,
+            initial_hidden=initial_hidden,
+            position_ids=position_ids,
+            collect_states=False,
+            compact_no_padding=True,
+            logits_to_keep=1,
+        )
+        next_token = int(torch.argmax(qwen_last_token_logits(logits, text_mask), dim=-1).item())
+        generated.append(next_token)
+        if next_token in eos_ids:
+            break
+
+        token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
+        full_ids = torch.cat([full_ids, token], dim=1)
+        full_mask = torch.cat([full_mask, torch.ones_like(token)], dim=1)
+        full_mm_ids = torch.cat([full_mm_ids, torch.zeros_like(token)], dim=1)
+        initial_hidden = torch.cat(
+            [initial_hidden, token_embeddings(token).to(device=initial_hidden.device, dtype=initial_hidden.dtype)],
+            dim=1,
+        )
+        token_position_ids = token_position_ids + 1
+        position_ids = torch.cat([position_ids, token_position_ids], dim=2)
+        inputs = {
+            "input_ids": full_ids,
+            "attention_mask": full_mask,
+            "pixel_values": prompt_inputs["pixel_values"],
+            "image_grid_thw": prompt_inputs["image_grid_thw"],
+            "mm_token_type_ids": full_mm_ids,
+        }
+
+    if not generated and fallback_id is not None:
+        generated.append(int(fallback_id))
+    return generated
+
+
 def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
     path = resolve_row_image_path(row, image_root)
     try:
@@ -479,6 +652,244 @@ def trainable_parameters_for_mode(adapter: QwenVisualDeltaAdapter) -> list[nn.Pa
     return [param for param in adapter.parameters() if param.requires_grad]
 
 
+def compute_qwen_loss_for_prepared_inputs(
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    inputs: dict[str, Tensor],
+    text_ids: Tensor,
+    answer_mask: Tensor,
+    num_layers: int,
+) -> tuple[torch.Tensor, dict[str, float], Tensor, Tensor, Tensor]:
+    loss_mode = "distill" if args.supervision_loss == "opd" else str(args.supervision_loss)
+    need_trajectory = loss_mode == "distill" and float(args.lambda_trajectory) != 0.0
+    trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
+    teacher_text_states: dict[int, Tensor] = {}
+    teacher_logits: Tensor | None = None
+    full_position_ids: Tensor | None = None
+    initial_hidden: Tensor | None = None
+    if loss_mode == "distill":
+        with torch.no_grad():
+            teacher = model(**inputs, output_hidden_states=need_trajectory, return_dict=True, use_cache=False)
+            full_position_ids = qwen_position_ids(model, inputs)
+            text_positions, _, _, text_mask, _, _ = get_qwen_text_image_positions(
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["mm_token_type_ids"],
+                full_position_ids,
+            )
+            teacher_logits = gather_batched_positions(teacher.logits.detach(), text_positions, text_mask)
+            if need_trajectory:
+                teacher_text_states = {
+                    state_idx: gather_batched_positions(teacher.hidden_states[state_idx].detach(), text_positions, text_mask).detach()
+                    for state_idx in sorted(trajectory_layers)
+                    if state_idx < len(teacher.hidden_states)
+                }
+                initial_hidden = teacher.hidden_states[0].detach()
+            else:
+                initial_hidden, _ = build_qwen_initial_context(model, inputs)
+
+    student_logits, student_text_mask, student_states = qwen_visual_delta_logits(
+        model,
+        adapter,
+        inputs,
+        initial_hidden=initial_hidden,
+        position_ids=full_position_ids,
+        collect_states=need_trajectory,
+        collect_state_indices=trajectory_layers if need_trajectory else None,
+    )
+
+    if loss_mode == "ce":
+        ce_loss, per_sample_supervision, answer_counts = masked_ce_loss(
+            student_logits,
+            text_ids,
+            answer_mask,
+            normalization=args.loss_normalization,
+        )
+        logit_kl = student_logits.new_zeros(())
+        trajectory = student_logits.new_zeros(())
+        kv_mse = student_logits.new_zeros(())
+        loss = ce_loss
+    else:
+        if need_trajectory and student_states is None:
+            raise RuntimeError("student states were not collected")
+        if teacher_logits is None or full_position_ids is None:
+            raise RuntimeError("distillation requires teacher logits and position ids")
+        _, _, _, text_mask, _, _ = get_qwen_text_image_positions(
+            inputs["input_ids"],
+            inputs["attention_mask"],
+            inputs["mm_token_type_ids"],
+            full_position_ids,
+        )
+        if student_text_mask.shape != text_mask.shape:
+            raise RuntimeError("student/teacher text masks differ")
+
+        traj_terms = []
+        if need_trajectory:
+            assert student_states is not None
+            for state_idx in sorted(trajectory_layers):
+                if state_idx not in teacher_text_states or state_idx >= len(student_states):
+                    continue
+                pred_h = student_states[state_idx]
+                if pred_h.numel() == 0:
+                    continue
+                if state_idx == num_layers:
+                    pred_h = model.model.language_model.norm(pred_h)
+                traj_terms.append(
+                    masked_directional_mse(
+                        pred_h,
+                        teacher_text_states[state_idx].to(dtype=pred_h.dtype),
+                        text_mask,
+                        normalization=args.loss_normalization,
+                    )
+                )
+        trajectory = torch.stack(traj_terms).mean() if traj_terms else student_logits.new_zeros(())
+        logit_kl, per_sample_supervision, answer_counts = masked_topk_kl(
+            student_logits,
+            teacher_logits,
+            text_ids,
+            answer_mask,
+            args.temperature,
+            args.kl_topk,
+            normalization=args.loss_normalization,
+        )
+        ce_loss = student_logits.new_zeros(())
+        kv_mse = student_logits.new_zeros(())
+        loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
+
+    mass_mean = student_logits.new_zeros(())
+    if adapter.last_visual_mass is not None:
+        valid = student_text_mask.to(device=adapter.last_visual_mass.device).bool()
+        mass_mean = adapter.last_visual_mass.float()[valid].mean()
+    metrics = {
+        "loss": float(loss.detach()),
+        "ce_loss": float(ce_loss.detach()),
+        "logit_kl": float(logit_kl.detach()),
+        "trajectory": float(trajectory.detach()),
+        "kv_mse": float(kv_mse.detach()),
+        "visual_mass": float(mass_mean.detach()),
+        "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
+        "answer_tokens": float(answer_counts.sum().item()) / max(1, answer_counts.shape[0]),
+    }
+    return loss, metrics, per_sample_supervision, answer_counts, student_text_mask
+
+
+def add_qwen_source_metrics(
+    metrics: dict[str, float | int | str],
+    rows: list[dict[str, Any]],
+    per_sample_supervision: Tensor,
+    answer_counts: Tensor,
+) -> None:
+    sources = [str(row.get("source", "")) for row in rows]
+    source_masks = {
+        group_name: torch.tensor(
+            [source in group_sources for source in sources],
+            device=per_sample_supervision.device,
+            dtype=torch.bool,
+        )
+        for group_name, group_sources in QWEN_SOURCE_METRIC_GROUPS.items()
+    }
+    answer_total = answer_counts.float().sum().clamp_min(1.0)
+    for group_name, group_mask in source_masks.items():
+        group_count = group_mask.float().sum()
+        group_answer_tokens = answer_counts.float()[group_mask].sum() if int(group_count.item()) else answer_counts.new_zeros(())
+        group_loss_sum = (
+            per_sample_supervision.detach().float()[group_mask].sum()
+            if int(group_count.item())
+            else per_sample_supervision.new_zeros(())
+        )
+        metrics[f"source_frac_{group_name}"] = float((group_count / max(1, len(rows))).detach())
+        metrics[f"source_answer_token_frac_{group_name}"] = float((group_answer_tokens / answer_total).detach())
+        metrics[f"source_loss_weighted_{group_name}"] = float((group_loss_sum / max(1, len(rows))).detach())
+
+
+def compute_qwen_opd_loss_for_rows(
+    args: argparse.Namespace,
+    processor: Any,
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    rows: list[dict[str, Any]],
+    device: torch.device,
+    num_layers: int,
+) -> tuple[torch.Tensor, dict[str, float | int | str]]:
+    image_root = Path(args.image_root) if str(args.image_root).strip() else None
+    row_losses: list[Tensor] = []
+    metric_sums: dict[str, float] = {}
+    row_supervision: list[Tensor] = []
+    row_answer_counts: list[Tensor] = []
+    rollout_token_counts: list[int] = []
+    empty_text = 0
+    eos_hits = 0
+    eos_ids = qwen_eos_token_ids(processor.tokenizer)
+    pad_id = int(processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id)
+    image_paths: list[str] = []
+
+    for row in rows:
+        prompt_inputs, _, _, prompt_images = prepare_qwen3vl_batch_inputs(
+            processor,
+            [row],
+            image_root,
+            device,
+            include_answers=False,
+        )
+        generated_ids = qwen_student_rollout_token_ids(
+            model,
+            adapter,
+            prompt_inputs,
+            processor.tokenizer,
+            max_new_tokens=args.opd_rollout_max_new_tokens,
+        )
+        if not generated_ids:
+            raise RuntimeError("OPD rollout produced no token ids")
+        rollout_token_counts.append(len(generated_ids))
+        eos_hits += int(generated_ids[-1] in eos_ids)
+        decoded = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        empty_text += int(not decoded)
+        full_inputs = qwen_append_generated_text_tokens(prompt_inputs, generated_ids)
+        text_ids, answer_mask, _ = qwen3vl_text_ids_and_answer_mask(
+            full_inputs["input_ids"],
+            full_inputs["attention_mask"],
+            full_inputs["mm_token_type_ids"],
+            [len(generated_ids)],
+            pad_id,
+        )
+        row_loss, row_metrics, per_sample_supervision, answer_counts, _ = compute_qwen_loss_for_prepared_inputs(
+            args,
+            model,
+            adapter,
+            full_inputs,
+            text_ids,
+            answer_mask,
+            num_layers,
+        )
+        row_losses.append(row_loss)
+        row_supervision.append(per_sample_supervision.detach())
+        row_answer_counts.append(answer_counts.detach())
+        image_paths.extend(prompt_images)
+        for key, value in row_metrics.items():
+            metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+
+    loss = torch.stack(row_losses).mean()
+    metrics: dict[str, float | int | str] = {
+        key: value / max(1, len(row_losses))
+        for key, value in metric_sums.items()
+    }
+    metrics["loss"] = float(loss.detach())
+    metrics["opd_rollout_tokens"] = float(sum(rollout_token_counts)) / max(1, len(rollout_token_counts))
+    metrics["opd_empty_text_rate"] = float(empty_text) / max(1, len(rollout_token_counts))
+    metrics["opd_eos_rate"] = float(eos_hits) / max(1, len(rollout_token_counts))
+    metrics["image"] = image_paths[0] if image_paths else ""
+    metrics["batch_size"] = int(len(rows))
+    metrics["supervision_loss"] = "opd"
+    add_qwen_source_metrics(
+        metrics,
+        rows,
+        torch.cat(row_supervision).to(device=loss.device),
+        torch.cat(row_answer_counts).to(device=loss.device),
+    )
+    return loss, metrics
+
+
 def compute_loss_for_rows(
     args: argparse.Namespace,
     processor: Any,
@@ -489,6 +900,9 @@ def compute_loss_for_rows(
     dtype: torch.dtype,
     num_layers: int,
 ) -> tuple[torch.Tensor, dict[str, float | int | str]]:
+    if args.supervision_loss == "opd":
+        return compute_qwen_opd_loss_for_rows(args, processor, model, adapter, rows, device, num_layers)
+
     inputs, text_ids, answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
         processor,
         rows,
@@ -497,109 +911,19 @@ def compute_loss_for_rows(
         include_answers=True,
     )
     assert text_ids is not None and answer_mask is not None
-    trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
-    with torch.no_grad():
-        teacher = model(**inputs, output_hidden_states=True, return_dict=True, use_cache=False)
-        full_position_ids = qwen_position_ids(model, inputs)
-        text_positions, _, _, text_mask, _, _ = get_qwen_text_image_positions(
-            inputs["input_ids"],
-            inputs["attention_mask"],
-            inputs["mm_token_type_ids"],
-            full_position_ids,
-        )
-        teacher_text_states = {
-            state_idx: gather_batched_positions(teacher.hidden_states[state_idx].detach(), text_positions, text_mask).detach()
-            for state_idx in sorted(trajectory_layers)
-            if state_idx < len(teacher.hidden_states)
-        }
-        teacher_logits = gather_batched_positions(teacher.logits.detach(), text_positions, text_mask)
-
-    student_logits, student_text_mask, student_states = qwen_visual_delta_logits(
+    loss, metrics, per_sample_supervision, answer_counts, _ = compute_qwen_loss_for_prepared_inputs(
+        args,
         model,
         adapter,
         inputs,
-        initial_hidden=teacher.hidden_states[0].detach(),
-        position_ids=full_position_ids,
-        collect_states=True,
-        collect_state_indices=trajectory_layers,
-    )
-    if student_states is None:
-        raise RuntimeError("student states were not collected")
-    if student_text_mask.shape != text_mask.shape:
-        raise RuntimeError("student/teacher text masks differ")
-
-    traj_terms = []
-    for state_idx in sorted(trajectory_layers):
-        if state_idx not in teacher_text_states or state_idx >= len(student_states):
-            continue
-        pred_h = student_states[state_idx]
-        if pred_h.numel() == 0:
-            continue
-        if state_idx == num_layers:
-            pred_h = model.model.language_model.norm(pred_h)
-        traj_terms.append(
-            masked_directional_mse(
-                pred_h,
-                teacher_text_states[state_idx].to(dtype=pred_h.dtype),
-                text_mask,
-                normalization=args.loss_normalization,
-            )
-        )
-    trajectory = torch.stack(traj_terms).mean() if traj_terms else student_logits.new_zeros(())
-    logit_kl, per_sample_kl, answer_counts = masked_topk_kl(
-        student_logits,
-        teacher_logits,
         text_ids,
         answer_mask,
-        args.temperature,
-        args.kl_topk,
-        normalization=args.loss_normalization,
+        num_layers,
     )
-    kv_mse = student_logits.new_zeros(())
-    loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
-
-    mass_mean = student_logits.new_zeros(())
-    if adapter.last_visual_mass is not None:
-        valid = text_mask.to(device=adapter.last_visual_mass.device).bool()
-        mass_mean = adapter.last_visual_mass.float()[valid].mean()
-    sources = [str(row.get("source", "")) for row in rows]
-    ocrvqa_mask = torch.tensor(
-        [source == "ocrvqa" for source in sources],
-        device=student_logits.device,
-        dtype=torch.bool,
-    )
-    pixmo_mask = torch.tensor(
-        [source == "pixmo_clean" for source in sources],
-        device=student_logits.device,
-        dtype=torch.bool,
-    )
-
-    def masked_mean(values: Tensor, valid_mask: Tensor) -> Tensor:
-        valid_mask = valid_mask.to(device=values.device, dtype=torch.bool)
-        if int(valid_mask.sum().item()) == 0:
-            return values.new_zeros(())
-        return values[valid_mask].float().mean()
-
-    answer_total = answer_counts.float().sum().clamp_min(1.0)
-    ocr_answer_tokens = answer_counts.float()[ocrvqa_mask].sum() if int(ocrvqa_mask.sum().item()) else answer_counts.new_zeros(())
-    pixmo_answer_tokens = answer_counts.float()[pixmo_mask].sum() if int(pixmo_mask.sum().item()) else answer_counts.new_zeros(())
-    metrics: dict[str, float | int | str] = {
-        "loss": float(loss.detach()),
-        "logit_kl": float(logit_kl.detach()),
-        "logit_kl_ocrvqa": float(masked_mean(per_sample_kl.detach(), ocrvqa_mask).detach()),
-        "logit_kl_pixmo_clean": float(masked_mean(per_sample_kl.detach(), pixmo_mask).detach()),
-        "trajectory": float(trajectory.detach()),
-        "kv_mse": float(kv_mse.detach()),
-        "visual_mass": float(mass_mean.detach()),
-        "text_tokens": float(text_mask.sum().item()) / max(1, len(rows)),
-        "answer_tokens": float(answer_counts.sum().item()) / max(1, len(rows)),
-        "ocrvqa_frac": float(ocrvqa_mask.float().mean().item()),
-        "pixmo_clean_frac": float(pixmo_mask.float().mean().item()),
-        "ocrvqa_answer_token_frac": float((ocr_answer_tokens / answer_total).item()),
-        "pixmo_clean_answer_token_frac": float((pixmo_answer_tokens / answer_total).item()),
-        "image": image_paths[0],
-        "batch_size": int(len(rows)),
-    }
+    metrics["image"] = image_paths[0]
+    metrics["batch_size"] = int(len(rows))
+    metrics["supervision_loss"] = args.supervision_loss
+    add_qwen_source_metrics(metrics, rows, per_sample_supervision.detach(), answer_counts.detach())
     return loss, metrics
 
 
@@ -997,7 +1321,7 @@ def run_qwen(args: argparse.Namespace) -> None:
         if global_step % args.log_every == 0:
             accum_metrics["lr"] = current_lr
             accum_metrics["sec_per_step"] = time.perf_counter() - step_start
-            reduced = reduce_metric_dict(accum_metrics, device)
+            reduced = finalize_source_loss_metrics(reduce_metric_dict(accum_metrics, device))
             payload: dict[str, float | int | str] = {
                 "step": int(global_step),
                 **reduced,
@@ -1012,6 +1336,7 @@ def run_qwen(args: argparse.Namespace) -> None:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 print(
                     f"step={global_step} loss={float(payload['loss']):.6f} "
+                    f"ce={float(payload['ce_loss']):.6f} "
                     f"logit_kl={float(payload['logit_kl']):.6f} trajectory={float(payload['trajectory']):.6f} "
                     f"kv_mse={float(payload['kv_mse']):.6f} visual_mass={float(payload['visual_mass']):.6f} "
                     f"lr={float(payload['lr']):.3e} global_batch={payload['global_batch']}",

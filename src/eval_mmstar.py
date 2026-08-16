@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(Path(__file__).resolve().parents[1] / "artifacts/torch_compile_cache"))
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "4")
+
 import torch
 
 from src.benchmarks import (
@@ -34,6 +37,7 @@ from src.model import (
     teacher_forward,
     dtype_from_name,
     build_qwen_initial_context,
+    load_or_build_qwen_initial_context,
     load_frozen_qwen3vl,
     load_qwen_visual_delta_checkpoint,
     qwen_position_ids,
@@ -115,6 +119,12 @@ def _structured_answer_ready(metric: str | None, text: str, choices: list[Any] |
     if metric in {"mme", "pope_f1"}:
         return extract_yes_no(text) is not None
     return False
+
+
+def _next_token_logits(logits: torch.Tensor, text_mask: torch.Tensor) -> torch.Tensor:
+    if logits.shape[1] == 1:
+        return logits[0, -1]
+    return logits[0, int(text_mask[0].sum().item()) - 1]
 
 
 @torch.inference_mode()
@@ -322,7 +332,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measure-prefill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compile-adapter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-mode", default="reduce-overhead")
-    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fast-split-text", action="store_true", help="Experimental: reuse split text SDPA for speed; not default because logits drift slightly.")
     parser.add_argument("--fast-injection-prefix", action="store_true", help="Experimental: use lower-right prefix causal bias for native injection; not default because logits drift slightly.")
@@ -330,6 +340,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structured-answer-early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--teacher-cache", action=argparse.BooleanOptionalAction, default=True, help="Cache deterministic Qwen teacher generations across adapter checkpoints.")
     parser.add_argument("--teacher-cache-dir", default=None)
+    parser.add_argument("--require-teacher-cache", action="store_true", help="Fail instead of generating teacher outputs when the teacher cache is missing or stale.")
+    parser.add_argument("--last-logits-only", action=argparse.BooleanOptionalAction, default=True, help="Only compute logits for the next-token position during generation/eval prefill.")
+    parser.add_argument("--input-cache-dir", default=None, help="Optional cache directory for preprocessed Qwen benchmark tensors.")
+    parser.add_argument("--context-cache-dir", default=None, help="Optional cache directory for Qwen initial_hidden/position_ids tensors.")
     args = parser.parse_args()
     args.benchmark = canonical_benchmark_name(args.benchmark)
     return args
@@ -432,6 +446,8 @@ def generate_adapter_qwen(
     prefill_logits: torch.Tensor | None = None,
     prefill_text_mask: torch.Tensor | None = None,
     decode_cache: dict[str, list[torch.Tensor]] | None = None,
+    last_logits_only: bool = True,
+    fast_injection_prefix: bool = False,
     early_stop_metric: str | None = None,
     choices: list[Any] | None = None,
 ) -> tuple[str | None, str]:
@@ -459,6 +475,8 @@ def generate_adapter_qwen(
                 initial_hidden=initial_hidden,
                 position_ids=position_ids,
                 compact_no_padding=True,
+                logits_to_keep=1 if last_logits_only else 0,
+                fast_prefix_mask=fast_injection_prefix,
             )
         else:
             logits = prefill_logits
@@ -467,7 +485,7 @@ def generate_adapter_qwen(
         token_position_ids = position_ids.gather(2, last_pos_idx)
         text = ""
         for _ in range(max_new_tokens):
-            next_token = int(torch.argmax(logits[0, int(text_mask[0].sum().item()) - 1]).item())
+            next_token = int(torch.argmax(_next_token_logits(logits, text_mask)).item())
             generated.append(next_token)
             token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
             text = processor.tokenizer.decode(generated, skip_special_tokens=True)
@@ -510,10 +528,11 @@ def generate_adapter_qwen(
                 position_ids=position_ids,
                 collect_states=False,
                 compact_no_padding=True,
+                logits_to_keep=1 if last_logits_only else 0,
             )
         else:
             logits, text_mask = adapter_logits_fn(inputs, initial_hidden, position_ids)
-        next_token = int(torch.argmax(logits[0, int(text_mask[0].sum().item()) - 1]).item())
+        next_token = int(torch.argmax(_next_token_logits(logits, text_mask)).item())
         generated.append(next_token)
         token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
         full_ids = torch.cat([full_ids, token], dim=1)
@@ -652,7 +671,10 @@ def build_qwen_adapter_logits_fn(
     compile_dynamic: bool,
     fast_split_text: bool,
     fast_injection_prefix: bool,
+    last_logits_only: bool,
 ):
+    logits_to_keep = 1 if last_logits_only else 0
+
     def direct(inputs, initial_hidden=None, position_ids=None):
         logits, text_mask, _ = qwen_visual_delta_logits(
             model,
@@ -664,13 +686,29 @@ def build_qwen_adapter_logits_fn(
             compact_no_padding=True,
             fast_split_text=fast_split_text,
             fast_injection_prefix=fast_injection_prefix,
+            logits_to_keep=logits_to_keep,
         )
         return logits, text_mask
 
     if not compile_adapter:
         return direct
 
-    def cached_forward(inputs, initial_hidden, position_ids):
+    def cached_forward(
+        input_ids,
+        attention_mask,
+        pixel_values,
+        image_grid_thw,
+        mm_token_type_ids,
+        initial_hidden,
+        position_ids,
+    ):
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
         logits, text_mask, _ = qwen_visual_delta_logits(
             model,
             adapter,
@@ -681,6 +719,7 @@ def build_qwen_adapter_logits_fn(
             compact_no_padding=True,
             fast_split_text=fast_split_text,
             fast_injection_prefix=fast_injection_prefix,
+            logits_to_keep=logits_to_keep,
         )
         return logits, text_mask
 
@@ -689,7 +728,15 @@ def build_qwen_adapter_logits_fn(
     def compiled(inputs, initial_hidden=None, position_ids=None):
         if initial_hidden is None or position_ids is None:
             initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-        return compiled_cached(inputs, initial_hidden, position_ids)
+        return compiled_cached(
+            inputs["input_ids"],
+            inputs["attention_mask"],
+            inputs["pixel_values"],
+            inputs["image_grid_thw"],
+            inputs["mm_token_type_ids"],
+            initial_hidden,
+            position_ids,
+        )
 
     return compiled
 
@@ -739,7 +786,22 @@ def _load_teacher_cache(path: Path | None, expected_meta: dict[str, Any]) -> lis
     except Exception as exc:
         print(f"Ignoring unreadable teacher cache {path}: {exc}", flush=True)
         return None
-    if payload.get("meta") != expected_meta:
+    cached_meta = payload.get("meta")
+    output_keys = (
+        "benchmark",
+        "data",
+        "data_root",
+        "model_path",
+        "max_samples",
+        "max_new_tokens",
+        "answer_instruction",
+        "num_shards",
+        "shard_id",
+        "start",
+        "end",
+        "rows",
+    )
+    if not isinstance(cached_meta, dict) or any(cached_meta.get(key) != expected_meta.get(key) for key in output_keys):
         print(f"Ignoring stale teacher cache {path}", flush=True)
         return None
     entries = payload.get("entries")
@@ -856,14 +918,20 @@ def evaluate_qwen_benchmark_shard(
     adapter_logits_fn=None,
     compile_warmup: bool = False,
     use_decode_cache: bool = False,
+    fast_injection_prefix: bool = False,
+    context_cache_dir: str | None = None,
     teacher_cache_path: Path | None = None,
     teacher_cache_meta: dict[str, Any] | None = None,
+    require_teacher_cache: bool = False,
     structured_answer_early_stop: bool = True,
+    last_logits_only: bool = True,
 ) -> dict:
     spec = get_benchmark_spec(benchmark)
     language_config = model.model.language_model.config
     predictions: list[dict[str, Any]] = []
     teacher_cache_entries = _load_teacher_cache(teacher_cache_path, teacher_cache_meta) if teacher_cache_meta else None
+    if require_teacher_cache and teacher_cache_entries is None:
+        raise FileNotFoundError(f"required teacher cache is missing or stale: {teacher_cache_path}")
     teacher_cache_to_write: list[dict[str, Any]] = []
     if compile_warmup and adapter_logits_fn is not None and len(dataset) > 0:
         item = dataset[0]
@@ -895,7 +963,12 @@ def evaluate_qwen_benchmark_shard(
         text_tokens, image_tokens = _qwen_token_counts(attention_mask, mm_token_type_ids)
         cached_teacher = teacher_cache_entries[idx] if teacher_cache_entries is not None else None
         if cached_teacher is None:
-            teacher_prefill_s, _ = _timed_call(lambda: model(**inputs).logits, enabled=measure_prefill)
+            if require_teacher_cache:
+                raise FileNotFoundError(f"required teacher cache entry {idx} is missing: {teacher_cache_path}")
+            teacher_prefill_s, _ = _timed_call(
+                lambda: model(**inputs, logits_to_keep=1 if last_logits_only else 0).logits,
+                enabled=measure_prefill,
+            )
             teacher_total_s, (_, teacher_text) = _timed_call(
                 lambda: generate_teacher_qwen(
                     model,
@@ -921,7 +994,12 @@ def evaluate_qwen_benchmark_shard(
             teacher_total_s = float(cached_teacher.get("teacher_total_s", 0.0))
 
         def adapter_prefill():
-            initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
+            initial_hidden, position_ids = load_or_build_qwen_initial_context(
+                model,
+                inputs,
+                cache_dir=context_cache_dir,
+                dtype=dtype,
+            )
             if use_decode_cache and getattr(adapter, "mode", "") == "native_visual_kv_injection":
                 logits, text_mask, decode_cache = qwen_native_injection_prefill_cache(
                     model,
@@ -930,6 +1008,8 @@ def evaluate_qwen_benchmark_shard(
                     initial_hidden=initial_hidden,
                     position_ids=position_ids,
                     compact_no_padding=True,
+                    logits_to_keep=1 if last_logits_only else 0,
+                    fast_prefix_mask=fast_injection_prefix,
                 )
                 return logits, text_mask, initial_hidden, position_ids, decode_cache
             if adapter_logits_fn is None:
@@ -941,6 +1021,7 @@ def evaluate_qwen_benchmark_shard(
                     position_ids=position_ids,
                     collect_states=False,
                     compact_no_padding=True,
+                    logits_to_keep=1 if last_logits_only else 0,
                 )
             else:
                 logits, text_mask = adapter_logits_fn(dict(inputs), initial_hidden, position_ids)
@@ -964,6 +1045,8 @@ def evaluate_qwen_benchmark_shard(
                     max_new_tokens,
                     adapter_logits_fn=adapter_logits_fn,
                     use_decode_cache=use_decode_cache,
+                    last_logits_only=last_logits_only,
+                    fast_injection_prefix=fast_injection_prefix,
                     early_stop_metric=spec.metric if structured_answer_early_stop else None,
                     choices=item.get("choices"),
                 )
@@ -988,6 +1071,8 @@ def evaluate_qwen_benchmark_shard(
                     prefill_logits=prefill_logits,
                     prefill_text_mask=prefill_text_mask,
                     decode_cache=decode_cache,
+                    last_logits_only=last_logits_only,
+                    fast_injection_prefix=fast_injection_prefix,
                     early_stop_metric=spec.metric if structured_answer_early_stop else None,
                     choices=item.get("choices"),
                 )
@@ -1092,6 +1177,7 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
         compile_dynamic=bool(args.compile_dynamic),
         fast_split_text=bool(args.fast_split_text),
         fast_injection_prefix=bool(args.fast_injection_prefix),
+        last_logits_only=bool(args.last_logits_only),
     )
 
     dataset = QwenBenchmarkDataset(
@@ -1101,6 +1187,7 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
         data_root=args.data_root,
         max_samples=args.max_samples,
         answer_instruction=args.answer_instruction,
+        cache_dir=args.input_cache_dir,
     )
     total = len(dataset)
     per_shard = (total + num_shards - 1) // num_shards
@@ -1124,6 +1211,7 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
             "max_samples": args.max_samples,
             "max_new_tokens": args.max_new_tokens,
             "measure_prefill": bool(args.measure_prefill),
+            "last_logits_only": bool(args.last_logits_only),
             "answer_instruction": args.answer_instruction,
             "num_shards": num_shards,
             "shard_id": shard_id,
@@ -1131,6 +1219,8 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
             "end": end,
             "rows": _teacher_cache_row_keys(dataset.rows),
         }
+    if args.require_teacher_cache and teacher_cache_meta is None:
+        raise ValueError("--require-teacher-cache requires --teacher-cache-dir")
     result = evaluate_qwen_benchmark_shard(
         model,
         processor,
@@ -1145,9 +1235,13 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
         adapter_logits_fn=adapter_logits_fn,
         compile_warmup=bool(args.compile_adapter and args.compile_warmup and not use_decode_cache),
         use_decode_cache=use_decode_cache,
+        fast_injection_prefix=bool(args.fast_injection_prefix),
+        context_cache_dir=args.context_cache_dir,
         teacher_cache_path=teacher_cache_path,
         teacher_cache_meta=teacher_cache_meta,
+        require_teacher_cache=bool(args.require_teacher_cache),
         structured_answer_early_stop=bool(args.structured_answer_early_stop),
+        last_logits_only=bool(args.last_logits_only),
     )
     out_path = Path(args.output_dir) / f"shard_{shard_id}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,9 @@
 """Dataset for VQA training with image + question + answer."""
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import random
 from pathlib import Path
 
@@ -233,11 +235,13 @@ class QwenBenchmarkDataset(Dataset):
         data_root: str | None = None,
         max_samples: int | None = None,
         answer_instruction: str | None = None,
+        cache_dir: str | Path | None = None,
     ):
         self.processor = processor
         self.spec = get_benchmark_spec(benchmark)
         self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
         self.answer_instruction = answer_instruction
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
             self.rows = [json.loads(line) for line in f if line.strip()]
@@ -255,6 +259,17 @@ class QwenBenchmarkDataset(Dataset):
             image_path = self.data_root / image_path
 
         question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
+        cache_path = self._cache_path(row, image_path, question)
+        if cache_path is not None and cache_path.exists():
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            item = cached["item"]
+            item["row"] = row
+            item["answer"] = row.get("answer")
+            item["answers"] = row.get("answers")
+            item["choices"] = row.get("choices")
+            item["index"] = row.get("index", idx)
+            return item
+
         image = Image.open(image_path).convert("RGB")
         messages = [
             {
@@ -270,7 +285,7 @@ class QwenBenchmarkDataset(Dataset):
         if "mm_token_type_ids" not in inputs:
             raise ValueError("Qwen processor did not return mm_token_type_ids; M-RoPE positions would be invalid")
 
-        return {
+        item = {
             "input_ids": inputs["input_ids"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
             "pixel_values": inputs["pixel_values"],
@@ -282,6 +297,29 @@ class QwenBenchmarkDataset(Dataset):
             "row": row,
             "index": row.get("index", idx),
         }
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_name(f"{cache_path.name}.tmp.{os.getpid()}")
+            torch.save({"item": item}, tmp_path)
+            os.replace(tmp_path, cache_path)
+        return item
+
+    def _cache_path(self, row: dict, image_path: Path, question: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        stat = image_path.stat()
+        key = {
+            "benchmark": self.spec.name,
+            "processor": str(getattr(self.processor, "name_or_path", "")),
+            "image": str(image_path),
+            "image_size": int(stat.st_size),
+            "image_mtime_ns": int(stat.st_mtime_ns),
+            "question": question,
+            "answer_instruction": self.answer_instruction,
+            "index": row.get("index"),
+        }
+        digest = hashlib.sha1(json.dumps(key, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        return self.cache_dir / self.spec.name / f"{digest}.pt"
 
 
 class OPDDataset(Dataset):

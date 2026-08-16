@@ -48,6 +48,15 @@ WARMUP_RATIO=${WARMUP_RATIO:-0.0}
 WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-sample}
+SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
+LAMBDA_LOGIT=${LAMBDA_LOGIT:-4.0}
+if [[ "$SUPERVISION_LOSS" == "opd" ]]; then
+  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.0}
+else
+  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
+fi
+LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
+OPD_ROLLOUT_MAX_NEW_TOKENS=${OPD_ROLLOUT_MAX_NEW_TOKENS:-32}
 OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_split}
 VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
 READER_MLP_RATIO=${READER_MLP_RATIO:-4.0}
@@ -89,7 +98,8 @@ echo "pixel_area_cache=$PIXEL_AREA_CACHE"
 echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
-echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "lambda_logit=$LAMBDA_LOGIT lambda_trajectory=$LAMBDA_TRAJECTORY lambda_kv_mse=$LAMBDA_KV_MSE opd_rollout_max_new_tokens=$OPD_ROLLOUT_MAX_NEW_TOKENS"
 echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK reader_mlp_ratio=$READER_MLP_RATIO reader_activation=$READER_ACTIVATION"
 
 CMD=(
@@ -111,8 +121,10 @@ CMD=(
   --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO" \
   --min-lr-ratio "$MIN_LR_RATIO" \
   --weight-decay 0.01 --temperature 2.0 \
-  --lambda-trajectory 0.5 --lambda-logit 4.0 --lambda-kv-mse 0.0 \
+  --lambda-trajectory "$LAMBDA_TRAJECTORY" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE" \
   --loss-normalization "$LOSS_NORMALIZATION" \
+  --supervision-loss "$SUPERVISION_LOSS" \
+  --opd-rollout-max-new-tokens "$OPD_ROLLOUT_MAX_NEW_TOKENS" \
   --output-mode "$OUTPUT_MODE" \
   --visual-adapter-rank "$VISUAL_ADAPTER_RANK" \
   --reader-mlp-ratio "$READER_MLP_RATIO" --reader-activation "$READER_ACTIVATION" \
