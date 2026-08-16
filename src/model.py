@@ -1287,6 +1287,7 @@ def qwen_native_visual_kv_for_layer(
     padding_mask: Tensor | None,
     *,
     repeat_kv: bool = True,
+    position_embeddings: tuple[Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
     attn = layer.self_attn
     normed = layer.input_layernorm(vision_states)
@@ -1294,7 +1295,9 @@ def qwen_native_visual_kv_for_layer(
     hidden_shape = (*input_shape, -1, attn.head_dim)
     key = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
     value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-    _, key = qwen_apply_rotary_pos_emb(key, key, *language_model.rotary_emb(normed, visual_position_ids))
+    if position_embeddings is None:
+        position_embeddings = language_model.rotary_emb(normed, visual_position_ids)
+    _, key = qwen_apply_rotary_pos_emb(key, key, *position_embeddings)
     if repeat_kv:
         key = qwen_repeat_kv(key, int(attn.num_key_value_groups))
         value = qwen_repeat_kv(value, int(attn.num_key_value_groups))
@@ -1421,6 +1424,8 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
     text_padding_mask: Tensor | None = None,
     vision_padding_mask: Tensor | None = None,
     prefix_attention_mask: Tensor | None = None,
+    text_position_embeddings: tuple[Tensor, Tensor] | None = None,
+    visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
 ) -> Tensor:
     attn = layer.self_attn
     normed_text = layer.input_layernorm(hidden_states)
@@ -1429,7 +1434,9 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
     query = attn.q_norm(attn.q_proj(normed_text).view(hidden_shape)).transpose(1, 2)
     text_key = attn.k_norm(attn.k_proj(normed_text).view(hidden_shape)).transpose(1, 2)
     text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
-    query, text_key = qwen_apply_rotary_pos_emb(query, text_key, *language_model.rotary_emb(normed_text, position_ids))
+    if text_position_embeddings is None:
+        text_position_embeddings = language_model.rotary_emb(normed_text, position_ids)
+    query, text_key = qwen_apply_rotary_pos_emb(query, text_key, *text_position_embeddings)
 
     visual_key, visual_value, _ = qwen_native_visual_kv_for_layer(
         language_model,
@@ -1438,6 +1445,7 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
         visual_position_ids,
         vision_padding_mask,
         repeat_kv=False,
+        position_embeddings=visual_position_embeddings,
     )
 
     batch, text_len = hidden_states.shape[:2]
@@ -1507,6 +1515,7 @@ def qwen_visual_delta_logits(
     compact_no_padding: bool = False,
     collect_state_indices: set[int] | None = None,
     logits_to_keep: int = 0,
+    reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
     language_model = model.model.language_model
     if initial_hidden is None or position_ids is None:
@@ -1528,6 +1537,11 @@ def qwen_visual_delta_logits(
     prefix_attention_mask = None
     if adapter.mode == "native_visual_kv_injection":
         prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
+    text_position_embeddings = None
+    visual_position_embeddings = None
+    if reuse_position_embeddings and adapter.mode == "native_visual_kv_injection":
+        text_position_embeddings = language_model.rotary_emb(h, text_position_ids)
+        visual_position_embeddings = language_model.rotary_emb(visual_memory, visual_position_ids)
     states = None
     if collect_states:
         if collect_state_indices is None:
@@ -1553,6 +1567,8 @@ def qwen_visual_delta_logits(
                 text_padding_mask=text_padding_mask,
                 vision_padding_mask=vision_padding_mask,
                 prefix_attention_mask=prefix_attention_mask,
+                text_position_embeddings=text_position_embeddings,
+                visual_position_embeddings=visual_position_embeddings,
             )
             delta = None
         else:
