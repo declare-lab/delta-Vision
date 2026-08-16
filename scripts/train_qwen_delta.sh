@@ -52,8 +52,10 @@ SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
 LAMBDA_LOGIT=${LAMBDA_LOGIT:-4.0}
 if [[ "$SUPERVISION_LOSS" == "opd" ]]; then
   LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.0}
+  KL_TOPK=${KL_TOPK:-128}
 else
   LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
+  KL_TOPK=${KL_TOPK:-1024}
 fi
 LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
 OPD_ROLLOUT_MAX_NEW_TOKENS=${OPD_ROLLOUT_MAX_NEW_TOKENS:-32}
@@ -98,7 +100,7 @@ echo "pixel_area_cache=$PIXEL_AREA_CACHE"
 echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
-echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
 echo "lambda_logit=$LAMBDA_LOGIT lambda_trajectory=$LAMBDA_TRAJECTORY lambda_kv_mse=$LAMBDA_KV_MSE opd_rollout_max_new_tokens=$OPD_ROLLOUT_MAX_NEW_TOKENS"
 echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK reader_mlp_ratio=$READER_MLP_RATIO reader_activation=$READER_ACTIVATION"
 
@@ -121,6 +123,7 @@ CMD=(
   --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO" \
   --min-lr-ratio "$MIN_LR_RATIO" \
   --weight-decay 0.01 --temperature 2.0 \
+  --kl-topk "$KL_TOPK" \
   --lambda-trajectory "$LAMBDA_TRAJECTORY" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE" \
   --loss-normalization "$LOSS_NORMALIZATION" \
   --supervision-loss "$SUPERVISION_LOSS" \

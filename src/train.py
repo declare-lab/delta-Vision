@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-start-lr-ratio", type=float, default=0.0)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--kl-topk", type=int, default=1024)
+    parser.add_argument("--kl-topk", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=2.0)
 
     parser.add_argument("--wandb", action="store_true")
@@ -154,7 +154,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--reader-mlp-ratio", type=float, default=4.0)
     parser.add_argument("--reader-activation", choices=("gelu", "silu", "swiglu", "situ_glu"), default="situ_glu")
-    parser.add_argument("--supervision-loss", choices=("distill", "ce", "opd"), default="distill")
+    parser.add_argument("--supervision-loss", choices=("distill", "opd"), default="distill")
     parser.add_argument("--opd-rollout-max-new-tokens", type=int, default=32)
     parser.add_argument("--lambda-logit", type=float, default=4.0)
     parser.add_argument("--lambda-trajectory", type=float, default=0.5)
@@ -169,7 +169,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--device", default="cuda:0")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.kl_topk is None:
+        args.kl_topk = 128 if args.supervision_loss == "opd" else 1024
+    return args
 
 
 def distributed_is_initialized() -> bool:
@@ -394,48 +397,6 @@ def masked_topk_kl(
         temperature,
         k,
     )
-    if normalization == "sample":
-        has_answer = answer_counts > 0
-        if int(has_answer.sum().item()) == 0:
-            return token_mean, per_sample, answer_counts
-        return per_sample[has_answer].mean(), per_sample, answer_counts
-    return token_mean, per_sample, answer_counts
-
-
-def masked_ce_stats(
-    student_logits: Tensor,
-    target_ids: Tensor,
-    answer_mask: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    batch = student_logits.shape[0]
-    shift_mask = answer_mask[:, 1:].bool()
-    answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
-    valid_count = answer_counts.sum()
-    if int(valid_count.item()) == 0:
-        return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), answer_counts
-    shift_student = student_logits[:, :-1][shift_mask].float()
-    shift_targets = target_ids[:, 1:][shift_mask]
-    ce = F.cross_entropy(shift_student, shift_targets, reduction="none")
-    batch_ids = (
-        torch.arange(batch, device=student_logits.device)
-        .unsqueeze(1)
-        .expand_as(shift_mask)[shift_mask]
-    )
-    per_sample_sum = student_logits.new_zeros((batch,), dtype=torch.float32)
-    per_sample_sum.scatter_add_(0, batch_ids, ce.to(device=student_logits.device, dtype=torch.float32))
-    per_sample = per_sample_sum / answer_counts.clamp_min(1.0)
-    token_mean = ce.sum() / valid_count.float().clamp_min(1.0)
-    return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
-
-
-def masked_ce_loss(
-    student_logits: Tensor,
-    target_ids: Tensor,
-    answer_mask: Tensor,
-    *,
-    normalization: str = "token",
-) -> tuple[Tensor, Tensor, Tensor]:
-    token_mean, per_sample, answer_counts = masked_ce_stats(student_logits, target_ids, answer_mask)
     if normalization == "sample":
         has_answer = answer_counts > 0
         if int(has_answer.sum().item()) == 0:
@@ -699,63 +660,50 @@ def compute_qwen_loss_for_prepared_inputs(
         collect_state_indices=trajectory_layers if need_trajectory else None,
     )
 
-    if loss_mode == "ce":
-        ce_loss, per_sample_supervision, answer_counts = masked_ce_loss(
-            student_logits,
-            text_ids,
-            answer_mask,
-            normalization=args.loss_normalization,
-        )
-        logit_kl = student_logits.new_zeros(())
-        trajectory = student_logits.new_zeros(())
-        kv_mse = student_logits.new_zeros(())
-        loss = ce_loss
-    else:
-        if need_trajectory and student_states is None:
-            raise RuntimeError("student states were not collected")
-        if teacher_logits is None or full_position_ids is None:
-            raise RuntimeError("distillation requires teacher logits and position ids")
-        _, _, _, text_mask, _, _ = get_qwen_text_image_positions(
-            inputs["input_ids"],
-            inputs["attention_mask"],
-            inputs["mm_token_type_ids"],
-            full_position_ids,
-        )
-        if student_text_mask.shape != text_mask.shape:
-            raise RuntimeError("student/teacher text masks differ")
+    if need_trajectory and student_states is None:
+        raise RuntimeError("student states were not collected")
+    if teacher_logits is None or full_position_ids is None:
+        raise RuntimeError("distillation requires teacher logits and position ids")
+    _, _, _, text_mask, _, _ = get_qwen_text_image_positions(
+        inputs["input_ids"],
+        inputs["attention_mask"],
+        inputs["mm_token_type_ids"],
+        full_position_ids,
+    )
+    if student_text_mask.shape != text_mask.shape:
+        raise RuntimeError("student/teacher text masks differ")
 
-        traj_terms = []
-        if need_trajectory:
-            assert student_states is not None
-            for state_idx in sorted(trajectory_layers):
-                if state_idx not in teacher_text_states or state_idx >= len(student_states):
-                    continue
-                pred_h = student_states[state_idx]
-                if pred_h.numel() == 0:
-                    continue
-                if state_idx == num_layers:
-                    pred_h = model.model.language_model.norm(pred_h)
-                traj_terms.append(
-                    masked_directional_mse(
-                        pred_h,
-                        teacher_text_states[state_idx].to(dtype=pred_h.dtype),
-                        text_mask,
-                        normalization=args.loss_normalization,
-                    )
+    traj_terms = []
+    if need_trajectory:
+        assert student_states is not None
+        for state_idx in sorted(trajectory_layers):
+            if state_idx not in teacher_text_states or state_idx >= len(student_states):
+                continue
+            pred_h = student_states[state_idx]
+            if pred_h.numel() == 0:
+                continue
+            if state_idx == num_layers:
+                pred_h = model.model.language_model.norm(pred_h)
+            traj_terms.append(
+                masked_directional_mse(
+                    pred_h,
+                    teacher_text_states[state_idx].to(dtype=pred_h.dtype),
+                    text_mask,
+                    normalization=args.loss_normalization,
                 )
-        trajectory = torch.stack(traj_terms).mean() if traj_terms else student_logits.new_zeros(())
-        logit_kl, per_sample_supervision, answer_counts = masked_topk_kl(
-            student_logits,
-            teacher_logits,
-            text_ids,
-            answer_mask,
-            args.temperature,
-            args.kl_topk,
-            normalization=args.loss_normalization,
-        )
-        ce_loss = student_logits.new_zeros(())
-        kv_mse = student_logits.new_zeros(())
-        loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
+            )
+    trajectory = torch.stack(traj_terms).mean() if traj_terms else student_logits.new_zeros(())
+    logit_kl, per_sample_supervision, answer_counts = masked_topk_kl(
+        student_logits,
+        teacher_logits,
+        text_ids,
+        answer_mask,
+        args.temperature,
+        args.kl_topk,
+        normalization=args.loss_normalization,
+    )
+    kv_mse = student_logits.new_zeros(())
+    loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
 
     mass_mean = student_logits.new_zeros(())
     if adapter.last_visual_mass is not None:
@@ -763,7 +711,6 @@ def compute_qwen_loss_for_prepared_inputs(
         mass_mean = adapter.last_visual_mass.float()[valid].mean()
     metrics = {
         "loss": float(loss.detach()),
-        "ce_loss": float(ce_loss.detach()),
         "logit_kl": float(logit_kl.detach()),
         "trajectory": float(trajectory.detach()),
         "kv_mse": float(kv_mse.detach()),
@@ -1336,7 +1283,6 @@ def run_qwen(args: argparse.Namespace) -> None:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 print(
                     f"step={global_step} loss={float(payload['loss']):.6f} "
-                    f"ce={float(payload['ce_loss']):.6f} "
                     f"logit_kl={float(payload['logit_kl']):.6f} trajectory={float(payload['trajectory']):.6f} "
                     f"kv_mse={float(payload['kv_mse']):.6f} visual_mass={float(payload['visual_mass']):.6f} "
                     f"lr={float(payload['lr']):.3e} global_batch={payload['global_batch']}",
