@@ -47,7 +47,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --help|-h)
       cat <<'EOF'
-Usage: scripts/eval_qwen_delta_mmstar.sh [benchmark] [options]
+Usage: scripts/eval_qwen_benchmark.sh [benchmark] [options]
 
 Options:
   --benchmark NAME       Benchmark name, e.g. mmstar, ocrbench, textvqa.
@@ -156,9 +156,6 @@ echo "benchmark=$BENCHMARK max_samples=$MAX_SAMPLES shards=$NUM_SHARDS"
 echo "attn=$ATTN_IMPL dtype=$DTYPE"
 echo "compile_adapter=${COMPILE_ADAPTER:-1} compile_mode=${COMPILE_MODE:-reduce-overhead} compile_dynamic=${COMPILE_DYNAMIC:-1} compile_warmup=${COMPILE_WARMUP:-1}"
 echo "torchinductor_cache=$TORCHINDUCTOR_CACHE_DIR compile_threads=$TORCHINDUCTOR_COMPILE_THREADS"
-echo "fast_split_text=${FAST_SPLIT_TEXT:-0}"
-echo "fast_injection_prefix=${FAST_INJECTION_PREFIX:-0}"
-echo "adapter_decode_cache=${ADAPTER_DECODE_CACHE:-0}"
 echo "structured_answer_early_stop=${STRUCTURED_ANSWER_EARLY_STOP:-1}"
 echo "teacher_cache=${TEACHER_CACHE:-1} teacher_cache_dir=${TEACHER_CACHE_DIR:-}"
 echo "require_teacher_cache=${REQUIRE_TEACHER_CACHE:-0}"
@@ -184,20 +181,6 @@ fi
 PREFILL_ARGS=()
 if [[ "${MEASURE_PREFILL:-1}" == "0" ]]; then
   PREFILL_ARGS=(--no-measure-prefill)
-fi
-FAST_SPLIT_ARGS=()
-if [[ "${FAST_SPLIT_TEXT:-0}" == "1" ]]; then
-  FAST_SPLIT_ARGS=(--fast-split-text)
-fi
-FAST_INJECTION_ARGS=()
-if [[ "${FAST_INJECTION_PREFIX:-0}" == "1" ]]; then
-  FAST_INJECTION_ARGS=(--fast-injection-prefix)
-fi
-DECODE_CACHE_ARGS=()
-if [[ "${ADAPTER_DECODE_CACHE:-0}" == "1" ]]; then
-  DECODE_CACHE_ARGS=(--adapter-decode-cache)
-else
-  DECODE_CACHE_ARGS=(--no-adapter-decode-cache)
 fi
 EARLY_STOP_ARGS=()
 if [[ "${STRUCTURED_ANSWER_EARLY_STOP:-1}" == "1" ]]; then
@@ -251,7 +234,7 @@ fi
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
   gpu="${DEVICES[$shard]}"
   echo "Launching shard $shard on GPU $gpu"
-  CUDA_VISIBLE_DEVICES="$gpu" "$PY" -m src.eval_mmstar \
+  CUDA_VISIBLE_DEVICES="$gpu" "$PY" -m src.eval_benchmarks \
     --model-kind qwen \
     --benchmark "$BENCHMARK" \
     --data "$DATA" \
@@ -265,9 +248,6 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     "${MAX_SAMPLE_ARGS[@]}" \
     "${ANSWER_ARGS[@]}" \
     "${PREFILL_ARGS[@]}" \
-    "${FAST_SPLIT_ARGS[@]}" \
-    "${FAST_INJECTION_ARGS[@]}" \
-    "${DECODE_CACHE_ARGS[@]}" \
     "${EARLY_STOP_ARGS[@]}" \
     "${COMPILE_ARGS[@]}" \
     "${TEACHER_CACHE_ARGS[@]}" \
@@ -284,7 +264,7 @@ for pid in "${pids[@]}"; do
   wait "$pid"
 done
 
-"$PY" -m src.eval_mmstar \
+"$PY" -m src.eval_benchmarks \
   --model-kind qwen \
   --benchmark "$BENCHMARK" \
   --data "$DATA" \
@@ -297,9 +277,6 @@ done
   "${MAX_SAMPLE_ARGS[@]}" \
   "${ANSWER_ARGS[@]}" \
   "${PREFILL_ARGS[@]}" \
-  "${FAST_SPLIT_ARGS[@]}" \
-  "${FAST_INJECTION_ARGS[@]}" \
-  "${DECODE_CACHE_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \
   "${TEACHER_CACHE_ARGS[@]}" \
   "${LAST_LOGITS_ARGS[@]}" \

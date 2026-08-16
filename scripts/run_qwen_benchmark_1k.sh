@@ -16,7 +16,6 @@ COMPILE_ADAPTER=${COMPILE_ADAPTER:-1}
 COMPILE_MODE=${COMPILE_MODE:-reduce-overhead}
 COMPILE_DYNAMIC=${COMPILE_DYNAMIC:-1}
 COMPILE_WARMUP=${COMPILE_WARMUP:-1}
-ADAPTER_DECODE_CACHE=${ADAPTER_DECODE_CACHE:-0}
 BENCHMARKS=${BENCHMARKS:-all}
 FORCE_EVAL=${FORCE_EVAL:-0}
 
@@ -102,9 +101,7 @@ print(" ".join(parse_benchmark_names(sys.argv[1])))
 PY
 )"
 if [[ -z "${RUNTIME_TAG:-}" ]]; then
-  if [[ "$ADAPTER_DECODE_CACHE" == "1" ]]; then
-    RUNTIME_TAG=decode_cache
-  elif [[ "$COMPILE_ADAPTER" == "1" ]]; then
+  if [[ "$COMPILE_ADAPTER" == "1" ]]; then
     RUNTIME_TAG=compiled_dense
   else
     RUNTIME_TAG=eager_dense
@@ -148,7 +145,6 @@ echo "benchmarks=$BENCHMARKS"
 echo "max_samples=$MAX_SAMPLES"
 echo "num_shards=$NUM_SHARDS cuda=$CUDA_VISIBLE_DEVICES"
 echo "compile_adapter=$COMPILE_ADAPTER compile_mode=$COMPILE_MODE compile_dynamic=$COMPILE_DYNAMIC compile_warmup=$COMPILE_WARMUP"
-echo "adapter_decode_cache=$ADAPTER_DECODE_CACHE"
 echo "runtime_tag=$RUNTIME_TAG out_root=$OUT_ROOT"
 echo "teacher_cache=$TEACHER_CACHE teacher_cache_dir=$TEACHER_CACHE_DIR"
 echo "last_logits_only=$LAST_LOGITS_ONLY input_cache=$INPUT_CACHE input_cache_dir=$INPUT_CACHE_DIR"
@@ -176,7 +172,6 @@ for step in $STEPS; do
     COMPILE_MODE="$COMPILE_MODE" \
     COMPILE_DYNAMIC="$COMPILE_DYNAMIC" \
     COMPILE_WARMUP="$COMPILE_WARMUP" \
-    ADAPTER_DECODE_CACHE="$ADAPTER_DECODE_CACHE" \
     TEACHER_CACHE="$TEACHER_CACHE" \
     TEACHER_CACHE_DIR="$TEACHER_CACHE_DIR" \
     LAST_LOGITS_ONLY="$LAST_LOGITS_ONLY" \
@@ -184,7 +179,7 @@ for step in $STEPS; do
     INPUT_CACHE_DIR="$INPUT_CACHE_DIR" \
     CONTEXT_CACHE="${CONTEXT_CACHE:-0}" \
     CONTEXT_CACHE_DIR="${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}" \
-    bash scripts/eval_qwen_delta_mmstar.sh "$benchmark"
+    bash scripts/eval_qwen_benchmark.sh "$benchmark"
     echo "=== DONE step=$step benchmark=$benchmark $(date) ==="
   done
 done

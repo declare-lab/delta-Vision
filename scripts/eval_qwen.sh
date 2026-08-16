@@ -19,7 +19,7 @@ CUDA_DEVICES_CSV=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-echo "=== Vision KV Inject - Qwen MMStar Generation Evaluation ==="
+echo "=== Vision KV Inject - Qwen Benchmark Generation Evaluation (default: MMStar) ==="
 echo "checkpoint=$CHECKPOINT"
 echo "output=$OUT_DIR"
 echo "shards=$NUM_SHARDS"
@@ -43,7 +43,7 @@ fi
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
   gpu="${DEVICES[$shard]}"
   echo "Launching shard $shard on GPU $gpu"
-  CUDA_VISIBLE_DEVICES="$gpu" $PY -m src.eval_mmstar \
+  CUDA_VISIBLE_DEVICES="$gpu" $PY -m src.eval_benchmarks \
     --model-kind qwen \
     --model-path "$MODEL_PATH" \
     --data "$DATA" \
@@ -64,7 +64,7 @@ for pid in "${pids[@]}"; do
 done
 
 echo "=== Merging results ==="
-$PY -m src.eval_mmstar \
+$PY -m src.eval_benchmarks \
   --model-kind qwen \
   --model-path "$MODEL_PATH" \
   --data "$DATA" \

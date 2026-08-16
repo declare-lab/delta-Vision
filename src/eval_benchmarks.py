@@ -1,4 +1,4 @@
-"""8-GPU sharded MMStar evaluation for vision KV adapter."""
+"""Sharded benchmark evaluation for vision KV adapters."""
 from __future__ import annotations
 
 import argparse
@@ -40,9 +40,6 @@ from src.model import (
     load_or_build_qwen_initial_context,
     load_frozen_qwen3vl,
     load_qwen_visual_delta_checkpoint,
-    qwen_position_ids,
-    qwen_native_injection_decode_logits,
-    qwen_native_injection_prefill_cache,
     qwen_visual_delta_logits,
 )
 from src.data import MMStarDataset, QwenBenchmarkDataset, QwenMMStarDataset
@@ -312,7 +309,7 @@ def evaluate_llava_shard(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Unified MMStar evaluation for LLaVA KV adapters and Qwen3-VL visual-delta adapters.")
+    parser = argparse.ArgumentParser("Unified benchmark evaluation for LLaVA KV adapters and Qwen3-VL visual-delta adapters.")
     parser.add_argument("--model-kind", choices=("llava", "qwen"), default="llava")
     parser.add_argument("--benchmark", default="mmstar", help=f"Benchmark name. Choices: {', '.join(sorted(BENCHMARK_SPECS))}")
     parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
@@ -334,9 +331,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-warmup", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--fast-split-text", action="store_true", help="Experimental: reuse split text SDPA for speed; not default because logits drift slightly.")
-    parser.add_argument("--fast-injection-prefix", action="store_true", help="Experimental: use lower-right prefix causal bias for native injection; not default because logits drift slightly.")
-    parser.add_argument("--adapter-decode-cache", action=argparse.BooleanOptionalAction, default=False, help="Experimental decode cache for native injection; default off because TextVQA smoke found output drift.")
     parser.add_argument("--structured-answer-early-stop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--teacher-cache", action=argparse.BooleanOptionalAction, default=True, help="Cache deterministic Qwen teacher generations across adapter checkpoints.")
     parser.add_argument("--teacher-cache-dir", default=None)
@@ -440,14 +434,11 @@ def generate_adapter_qwen(
     mm_token_type_ids: torch.Tensor,
     max_new_tokens: int,
     adapter_logits_fn=None,
-    use_decode_cache: bool = False,
     initial_hidden: torch.Tensor | None = None,
     position_ids: torch.Tensor | None = None,
     prefill_logits: torch.Tensor | None = None,
     prefill_text_mask: torch.Tensor | None = None,
-    decode_cache: dict[str, list[torch.Tensor]] | None = None,
     last_logits_only: bool = True,
-    fast_injection_prefix: bool = False,
     early_stop_metric: str | None = None,
     choices: list[Any] | None = None,
 ) -> tuple[str | None, str]:
@@ -464,43 +455,6 @@ def generate_adapter_qwen(
         "image_grid_thw": image_grid_thw,
         "mm_token_type_ids": full_mm_ids,
     }
-    if use_decode_cache and getattr(adapter, "mode", "") == "native_visual_kv_injection":
-        if initial_hidden is None or position_ids is None:
-            initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-        if prefill_logits is None or prefill_text_mask is None or decode_cache is None:
-            logits, text_mask, decode_cache = qwen_native_injection_prefill_cache(
-                model,
-                adapter,
-                inputs,
-                initial_hidden=initial_hidden,
-                position_ids=position_ids,
-                compact_no_padding=True,
-                logits_to_keep=1 if last_logits_only else 0,
-                fast_prefix_mask=fast_injection_prefix,
-            )
-        else:
-            logits = prefill_logits
-            text_mask = prefill_text_mask
-        last_pos_idx = attention_mask.long().sum(dim=1).sub(1).view(1, -1, 1).expand(position_ids.shape[0], -1, 1)
-        token_position_ids = position_ids.gather(2, last_pos_idx)
-        text = ""
-        for _ in range(max_new_tokens):
-            next_token = int(torch.argmax(_next_token_logits(logits, text_mask)).item())
-            generated.append(next_token)
-            token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
-            text = processor.tokenizer.decode(generated, skip_special_tokens=True)
-            if next_token in eos_ids or _structured_answer_ready(early_stop_metric, text, choices):
-                break
-            token_position_ids = token_position_ids + 1
-            logits = qwen_native_injection_decode_logits(
-                model,
-                token_embeddings(token).to(device=initial_hidden.device, dtype=initial_hidden.dtype),
-                token_position_ids,
-                decode_cache,
-            )
-            text_mask = torch.ones((1, 1), dtype=torch.bool, device=logits.device)
-        return extract_option_from_text(text), text
-
     if initial_hidden is None or position_ids is None:
         initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
     last_pos_idx = full_mask.long().sum(dim=1).sub(1).view(1, -1, 1).expand(position_ids.shape[0], -1, 1)
@@ -669,8 +623,6 @@ def build_qwen_adapter_logits_fn(
     compile_adapter: bool,
     compile_mode: str,
     compile_dynamic: bool,
-    fast_split_text: bool,
-    fast_injection_prefix: bool,
     last_logits_only: bool,
 ):
     logits_to_keep = 1 if last_logits_only else 0
@@ -684,8 +636,6 @@ def build_qwen_adapter_logits_fn(
             position_ids=position_ids,
             collect_states=False,
             compact_no_padding=True,
-            fast_split_text=fast_split_text,
-            fast_injection_prefix=fast_injection_prefix,
             logits_to_keep=logits_to_keep,
         )
         return logits, text_mask
@@ -717,8 +667,6 @@ def build_qwen_adapter_logits_fn(
             position_ids=position_ids,
             collect_states=False,
             compact_no_padding=True,
-            fast_split_text=fast_split_text,
-            fast_injection_prefix=fast_injection_prefix,
             logits_to_keep=logits_to_keep,
         )
         return logits, text_mask
@@ -917,8 +865,6 @@ def evaluate_qwen_benchmark_shard(
     dtype: torch.dtype,
     adapter_logits_fn=None,
     compile_warmup: bool = False,
-    use_decode_cache: bool = False,
-    fast_injection_prefix: bool = False,
     context_cache_dir: str | None = None,
     teacher_cache_path: Path | None = None,
     teacher_cache_meta: dict[str, Any] | None = None,
@@ -1000,18 +946,6 @@ def evaluate_qwen_benchmark_shard(
                 cache_dir=context_cache_dir,
                 dtype=dtype,
             )
-            if use_decode_cache and getattr(adapter, "mode", "") == "native_visual_kv_injection":
-                logits, text_mask, decode_cache = qwen_native_injection_prefill_cache(
-                    model,
-                    adapter,
-                    dict(inputs),
-                    initial_hidden=initial_hidden,
-                    position_ids=position_ids,
-                    compact_no_padding=True,
-                    logits_to_keep=1 if last_logits_only else 0,
-                    fast_prefix_mask=fast_injection_prefix,
-                )
-                return logits, text_mask, initial_hidden, position_ids, decode_cache
             if adapter_logits_fn is None:
                 logits, text_mask, _ = qwen_visual_delta_logits(
                     model,
@@ -1025,7 +959,7 @@ def evaluate_qwen_benchmark_shard(
                 )
             else:
                 logits, text_mask = adapter_logits_fn(dict(inputs), initial_hidden, position_ids)
-            return logits, text_mask, initial_hidden, position_ids, None
+            return logits, text_mask, initial_hidden, position_ids
 
         adapter_prefill_s, adapter_prefill_payload = _timed_call(
             adapter_prefill,
@@ -1044,15 +978,13 @@ def evaluate_qwen_benchmark_shard(
                     mm_token_type_ids,
                     max_new_tokens,
                     adapter_logits_fn=adapter_logits_fn,
-                    use_decode_cache=use_decode_cache,
                     last_logits_only=last_logits_only,
-                    fast_injection_prefix=fast_injection_prefix,
                     early_stop_metric=spec.metric if structured_answer_early_stop else None,
                     choices=item.get("choices"),
                 )
             )
         else:
-            prefill_logits, prefill_text_mask, initial_hidden, position_ids, decode_cache = adapter_prefill_payload
+            prefill_logits, prefill_text_mask, initial_hidden, position_ids = adapter_prefill_payload
             adapter_continuation_s, (_, adapter_text) = _timed_call(
                 lambda: generate_adapter_qwen(
                     model,
@@ -1065,14 +997,11 @@ def evaluate_qwen_benchmark_shard(
                     mm_token_type_ids,
                     max_new_tokens,
                     adapter_logits_fn=adapter_logits_fn,
-                    use_decode_cache=use_decode_cache,
                     initial_hidden=initial_hidden,
                     position_ids=position_ids,
                     prefill_logits=prefill_logits,
                     prefill_text_mask=prefill_text_mask,
-                    decode_cache=decode_cache,
                     last_logits_only=last_logits_only,
-                    fast_injection_prefix=fast_injection_prefix,
                     early_stop_metric=spec.metric if structured_answer_early_stop else None,
                     choices=item.get("choices"),
                 )
@@ -1168,15 +1097,12 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
     adapter, meta = load_qwen_visual_delta_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
     if meta["missing"] or meta["unexpected"]:
         print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
-    use_decode_cache = bool(args.adapter_decode_cache and getattr(adapter, "mode", "") == "native_visual_kv_injection")
     adapter_logits_fn = build_qwen_adapter_logits_fn(
         model,
         adapter,
-        compile_adapter=bool(args.compile_adapter and not use_decode_cache),
+        compile_adapter=bool(args.compile_adapter),
         compile_mode=args.compile_mode,
         compile_dynamic=bool(args.compile_dynamic),
-        fast_split_text=bool(args.fast_split_text),
-        fast_injection_prefix=bool(args.fast_injection_prefix),
         last_logits_only=bool(args.last_logits_only),
     )
 
@@ -1233,9 +1159,7 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
         args.measure_prefill,
         dtype,
         adapter_logits_fn=adapter_logits_fn,
-        compile_warmup=bool(args.compile_adapter and args.compile_warmup and not use_decode_cache),
-        use_decode_cache=use_decode_cache,
-        fast_injection_prefix=bool(args.fast_injection_prefix),
+        compile_warmup=bool(args.compile_adapter and args.compile_warmup),
         context_cache_dir=args.context_cache_dir,
         teacher_cache_path=teacher_cache_path,
         teacher_cache_meta=teacher_cache_meta,

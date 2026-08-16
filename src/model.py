@@ -18,10 +18,9 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as lla
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb as qwen_apply_rotary_pos_emb, repeat_kv as qwen_repeat_kv
 
 try:
-    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+    from flash_attn import flash_attn_func
 except Exception:
     flash_attn_func = None
-    flash_attn_with_kvcache = None
 
 
 class PerLayerKVAdapter(nn.Module):
@@ -1358,20 +1357,6 @@ def qwen_prefix_causal_attention_heads(
     scaling: float,
     attention_mask: Tensor | None = None,
 ) -> Tensor:
-    if (
-        attention_mask is None
-        and flash_attn_func is not None
-        and query.is_cuda
-        and query.dtype in {torch.float16, torch.bfloat16}
-    ):
-        return flash_attn_func(
-            query.transpose(1, 2).contiguous(),
-            key.transpose(1, 2).contiguous(),
-            value.transpose(1, 2).contiguous(),
-            dropout_p=0.0,
-            softmax_scale=float(scaling),
-            causal=True,
-        ).contiguous()
     return F.scaled_dot_product_attention(
         query,
         key,
@@ -1382,48 +1367,6 @@ def qwen_prefix_causal_attention_heads(
         scale=float(scaling),
         enable_gqa=query.shape[1] != key.shape[1],
     ).transpose(1, 2).contiguous()
-
-
-def qwen_prefix_causal_attention_heads_with_kvcache(
-    query: Tensor,
-    visual_key: Tensor,
-    visual_value: Tensor,
-    text_key: Tensor,
-    text_value: Tensor,
-    *,
-    scaling: float,
-) -> Tensor:
-    if (
-        flash_attn_with_kvcache is None
-        or not query.is_cuda
-        or query.dtype not in {torch.float16, torch.bfloat16}
-        or torch.is_grad_enabled()
-    ):
-        key = torch.cat([visual_key, text_key], dim=2)
-        value = torch.cat([visual_value, text_value], dim=2)
-        return qwen_prefix_causal_attention_heads(query, key, value, scaling=scaling)
-
-    q = query.transpose(1, 2).contiguous()
-    visual_k = visual_key.transpose(1, 2).contiguous()
-    visual_v = visual_value.transpose(1, 2).contiguous()
-    text_k = text_key.transpose(1, 2).contiguous()
-    text_v = text_value.transpose(1, 2).contiguous()
-    batch, visual_len, kv_heads, head_dim = visual_k.shape
-    text_len = text_k.shape[1]
-    k_cache = visual_k.new_empty((batch, visual_len + text_len, kv_heads, head_dim))
-    v_cache = visual_v.new_empty((batch, visual_len + text_len, kv_heads, head_dim))
-    k_cache[:, :visual_len].copy_(visual_k)
-    v_cache[:, :visual_len].copy_(visual_v)
-    return flash_attn_with_kvcache(
-        q,
-        k_cache,
-        v_cache,
-        k=text_k,
-        v=text_v,
-        cache_seqlens=visual_len,
-        softmax_scale=float(scaling),
-        causal=True,
-    ).contiguous()
 
 
 def qwen_lm_head_logits(
@@ -1453,11 +1396,8 @@ def qwen_text_attention_output_with_visual_kv(
     visual_position_ids: Tensor,
     text_padding_mask: Tensor | None = None,
     vision_padding_mask: Tensor | None = None,
-    fast_prefix_mask: bool = False,
-    fast_prefix_kvcache: bool = False,
     prefix_attention_mask: Tensor | None = None,
-    return_kv: bool = False,
-) -> Tensor | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tensor:
     return qwen_text_attention_output_with_visual_kv_for_layer(
         language_model,
         language_model.layers[layer_idx],
@@ -1467,10 +1407,7 @@ def qwen_text_attention_output_with_visual_kv(
         visual_position_ids,
         text_padding_mask=text_padding_mask,
         vision_padding_mask=vision_padding_mask,
-        fast_prefix_mask=fast_prefix_mask,
-        fast_prefix_kvcache=fast_prefix_kvcache,
         prefix_attention_mask=prefix_attention_mask,
-        return_kv=return_kv,
     )
 
 
@@ -1483,11 +1420,8 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
     visual_position_ids: Tensor,
     text_padding_mask: Tensor | None = None,
     vision_padding_mask: Tensor | None = None,
-    fast_prefix_mask: bool = False,
-    fast_prefix_kvcache: bool = False,
     prefix_attention_mask: Tensor | None = None,
-    return_kv: bool = False,
-) -> Tensor | tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tensor:
     attn = layer.self_attn
     normed_text = layer.input_layernorm(hidden_states)
     text_shape = normed_text.shape[:-1]
@@ -1497,14 +1431,6 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
     text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
     query, text_key = qwen_apply_rotary_pos_emb(query, text_key, *language_model.rotary_emb(normed_text, position_ids))
 
-    use_flash_prefix_causal = (
-        fast_prefix_mask
-        and text_padding_mask is None
-        and vision_padding_mask is None
-        and flash_attn_func is not None
-        and query.is_cuda
-        and query.dtype in {torch.float16, torch.bfloat16}
-    )
     visual_key, visual_value, _ = qwen_native_visual_kv_for_layer(
         language_model,
         layer,
@@ -1517,194 +1443,26 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
     batch, text_len = hidden_states.shape[:2]
     visual_len = vision_states.shape[1]
     device = hidden_states.device
-    if use_flash_prefix_causal:
-        if fast_prefix_kvcache:
-            heads = qwen_prefix_causal_attention_heads_with_kvcache(
-                query,
-                visual_key,
-                visual_value,
-                text_key,
-                text_value,
-                scaling=float(attn.scaling),
-            )
-        else:
-            key = torch.cat([visual_key, text_key], dim=2)
-            value = torch.cat([visual_value, text_value], dim=2)
-            heads = qwen_prefix_causal_attention_heads(
-                query,
-                key,
-                value,
-                attention_mask=None,
-                scaling=float(attn.scaling),
-            )
+    if prefix_attention_mask is None:
+        valid_text = torch.ones((batch, text_len), device=device, dtype=torch.bool)
+        if text_padding_mask is not None:
+            valid_text = ~text_padding_mask.to(device=device, dtype=torch.bool)
+        valid_visual = torch.ones((batch, visual_len), device=device, dtype=torch.bool)
+        if vision_padding_mask is not None:
+            valid_visual = ~vision_padding_mask.to(device=device, dtype=torch.bool)
+        attention_mask = qwen_prefix_causal_attention_mask(valid_text, valid_visual, device)
     else:
-        if prefix_attention_mask is None:
-            valid_text = torch.ones((batch, text_len), device=device, dtype=torch.bool)
-            if text_padding_mask is not None:
-                valid_text = ~text_padding_mask.to(device=device, dtype=torch.bool)
-            valid_visual = torch.ones((batch, visual_len), device=device, dtype=torch.bool)
-            if vision_padding_mask is not None:
-                valid_visual = ~vision_padding_mask.to(device=device, dtype=torch.bool)
-            attention_mask = qwen_prefix_causal_attention_mask(valid_text, valid_visual, device)
-        else:
-            attention_mask = prefix_attention_mask
-        key = torch.cat([visual_key, text_key], dim=2)
-        value = torch.cat([visual_value, text_value], dim=2)
-        heads = qwen_prefix_causal_attention_heads(
-            query,
-            key,
-            value,
-            attention_mask=attention_mask,
-            scaling=float(attn.scaling),
-        )
-    output = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
-    if return_kv:
-        return output, text_key.contiguous(), text_value.contiguous(), visual_key, visual_value
-    return output
-
-
-@torch.inference_mode()
-def qwen_native_injection_prefill_cache(
-    model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
-    inputs: dict[str, Tensor],
-    *,
-    initial_hidden: Tensor | None = None,
-    position_ids: Tensor | None = None,
-    compact_no_padding: bool = False,
-    logits_to_keep: int = 0,
-    fast_prefix_mask: bool = False,
-    fast_prefix_kvcache: bool = False,
-) -> tuple[Tensor, Tensor, dict[str, list[Tensor]]]:
-    if adapter.mode != "native_visual_kv_injection":
-        raise ValueError(f"decode cache only supports native_visual_kv_injection, got {adapter.mode}")
-    language_model = model.model.language_model
-    if initial_hidden is None or position_ids is None:
-        initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-    text_pos, image_pos, text_position_ids, text_mask, image_mask, _ = get_qwen_text_image_positions(
-        inputs["input_ids"],
-        inputs["attention_mask"],
-        inputs["mm_token_type_ids"],
-        position_ids,
+        attention_mask = prefix_attention_mask
+    key = torch.cat([visual_key, text_key], dim=2)
+    value = torch.cat([visual_value, text_value], dim=2)
+    heads = qwen_prefix_causal_attention_heads(
+        query,
+        key,
+        value,
+        attention_mask=attention_mask,
+        scaling=float(attn.scaling),
     )
-    visual_position_ids = qwen_visual_position_ids(position_ids, image_pos, image_mask)
-    compact_no_padding = qwen_can_skip_padding_masks(text_mask, image_mask, compact_no_padding)
-    text_padding_mask = None if compact_no_padding else ~text_mask
-    vision_padding_mask = None if compact_no_padding else ~image_mask
-    visual_memory = gather_batched_positions(initial_hidden, image_pos, image_mask).to(
-        dtype=next(adapter.parameters()).dtype
-    )
-    h = gather_batched_positions(initial_hidden, text_pos, text_mask).to(dtype=next(adapter.parameters()).dtype)
-    prefix_attention_mask = None
-    if not fast_prefix_mask:
-        prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
-    text_keys: list[Tensor] = []
-    text_values: list[Tensor] = []
-    visual_keys: list[Tensor] = []
-    visual_values: list[Tensor] = []
-    for layer_idx, layer in enumerate(language_model.layers):
-        vision_states = adapter.visual_memory_from_modules(
-            visual_memory,
-            adapter.visual_adapter_down[layer_idx],
-            adapter.visual_adapter_up[layer_idx],
-        )
-        text_attention, text_key, text_value, visual_key, visual_value = qwen_text_attention_output_with_visual_kv_for_layer(
-            language_model,
-            layer,
-            h,
-            text_position_ids,
-            vision_states,
-            visual_position_ids,
-            text_padding_mask=text_padding_mask,
-            vision_padding_mask=vision_padding_mask,
-            fast_prefix_mask=fast_prefix_mask,
-            fast_prefix_kvcache=fast_prefix_kvcache,
-            prefix_attention_mask=prefix_attention_mask,
-            return_kv=True,
-        )
-        h = run_qwen_layer_from_attention_output_for_layer(layer, h, text_attention, None)
-        text_keys.append(text_key)
-        text_values.append(text_value)
-        visual_keys.append(visual_key)
-        visual_values.append(visual_value)
-    cache = {
-        "text_keys": text_keys,
-        "text_values": text_values,
-        "visual_keys": visual_keys,
-        "visual_values": visual_values,
-    }
-    logits = qwen_lm_head_logits(model, language_model, h, text_mask, logits_to_keep=logits_to_keep)
-    return logits, text_mask, cache
-
-
-@torch.inference_mode()
-def qwen_native_injection_decode_logits(
-    model: torch.nn.Module,
-    token_embeds: Tensor,
-    token_position_ids: Tensor,
-    cache: dict[str, list[Tensor]],
-) -> Tensor:
-    language_model = model.model.language_model
-    h = token_embeds
-    for layer_idx, layer in enumerate(language_model.layers):
-        attn = layer.self_attn
-        residual = h
-        normed = layer.input_layernorm(h)
-        input_shape = normed.shape[:-1]
-        hidden_shape = (*input_shape, -1, attn.head_dim)
-        query = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
-        key = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
-        value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-        query, key = qwen_apply_rotary_pos_emb(query, key, *language_model.rotary_emb(normed, token_position_ids))
-
-        cached_text_key = cache["text_keys"][layer_idx]
-        cached_text_value = cache["text_values"][layer_idx]
-        if cached_text_key.shape[1] == query.shape[1]:
-            key = qwen_repeat_kv(key, int(attn.num_key_value_groups)).contiguous()
-            value = qwen_repeat_kv(value, int(attn.num_key_value_groups)).contiguous()
-        elif cached_text_key.shape[1] == key.shape[1]:
-            key = key.contiguous()
-            value = value.contiguous()
-        else:
-            raise RuntimeError(
-                f"decode cache head mismatch at layer {layer_idx}: "
-                f"cache={cached_text_key.shape[1]} query={query.shape[1]} kv={key.shape[1]}"
-            )
-        text_key = torch.cat([cache["text_keys"][layer_idx], key], dim=2)
-        text_value = torch.cat([cache["text_values"][layer_idx], value], dim=2)
-        full_key = torch.cat([cache["visual_keys"][layer_idx], text_key], dim=2)
-        full_value = torch.cat([cache["visual_values"][layer_idx], text_value], dim=2)
-        if (
-            flash_attn_func is not None
-            and query.is_cuda
-            and query.dtype in {torch.float16, torch.bfloat16}
-        ):
-            heads = flash_attn_func(
-                query.transpose(1, 2).contiguous(),
-                full_key.transpose(1, 2).contiguous(),
-                full_value.transpose(1, 2).contiguous(),
-                dropout_p=0.0,
-                softmax_scale=float(attn.scaling),
-                causal=False,
-            ).contiguous()
-        else:
-            heads = F.scaled_dot_product_attention(
-                query,
-                full_key,
-                full_value,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=float(attn.scaling),
-                enable_gqa=query.shape[1] != full_key.shape[1],
-            ).transpose(1, 2).contiguous()
-        attention_output = attn.o_proj(heads.reshape(*input_shape, -1).contiguous())
-        h = residual + attention_output.to(dtype=residual.dtype)
-        residual = h
-        h = residual + layer.mlp(layer.post_attention_layernorm(h))
-        cache["text_keys"][layer_idx] = text_key
-        cache["text_values"][layer_idx] = text_value
-    return model.lm_head(language_model.norm(h))
+    return attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
 
 
 def run_qwen_layer_from_attention_output(
@@ -1747,9 +1505,6 @@ def qwen_visual_delta_logits(
     position_ids: Tensor | None = None,
     collect_states: bool = False,
     compact_no_padding: bool = False,
-    fast_split_text: bool = False,
-    fast_injection_prefix: bool = False,
-    fast_prefix_kvcache: bool = False,
     collect_state_indices: set[int] | None = None,
     logits_to_keep: int = 0,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
@@ -1771,7 +1526,7 @@ def qwen_visual_delta_logits(
     )
     h = gather_batched_positions(initial_hidden, text_pos, text_mask).to(dtype=next(adapter.parameters()).dtype)
     prefix_attention_mask = None
-    if adapter.mode == "native_visual_kv_injection" and not fast_injection_prefix:
+    if adapter.mode == "native_visual_kv_injection":
         prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
     states = None
     if collect_states:
@@ -1797,38 +1552,25 @@ def qwen_visual_delta_logits(
                 visual_position_ids,
                 text_padding_mask=text_padding_mask,
                 vision_padding_mask=vision_padding_mask,
-                fast_prefix_mask=fast_injection_prefix,
-                fast_prefix_kvcache=fast_prefix_kvcache,
                 prefix_attention_mask=prefix_attention_mask,
             )
             delta = None
         else:
-            if fast_split_text:
-                text_heads, query_heads = qwen_text_attention_heads_for_layer(
-                    language_model,
-                    layer,
-                    h,
-                    text_position_ids,
-                    padding_mask=text_padding_mask,
-                    return_query=True,
-                )
-                text_attention = layer.self_attn.o_proj(merge_heads(text_heads))
-            else:
-                text_attention = qwen_text_attention_output_for_layer(
-                    language_model,
-                    layer,
-                    h,
-                    text_position_ids,
-                    padding_mask=text_padding_mask,
-                )
-                text_heads = qwen_text_attention_heads_for_layer(
-                    language_model,
-                    layer,
-                    h,
-                    text_position_ids,
-                    padding_mask=text_padding_mask,
-                )
-                query_heads = qwen_text_query_heads_for_layer(language_model, layer, h, text_position_ids)
+            text_attention = qwen_text_attention_output_for_layer(
+                language_model,
+                layer,
+                h,
+                text_position_ids,
+                padding_mask=text_padding_mask,
+            )
+            text_heads = qwen_text_attention_heads_for_layer(
+                language_model,
+                layer,
+                h,
+                text_position_ids,
+                padding_mask=text_padding_mask,
+            )
+            query_heads = qwen_text_query_heads_for_layer(language_model, layer, h, text_position_ids)
             visual_key, visual_value, visual_padding = qwen_native_visual_kv_for_layer(
                 language_model,
                 layer,

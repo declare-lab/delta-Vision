@@ -78,11 +78,11 @@ scripts/train_qwen_delta.sh
 The default keeps the reproduced schedule: constant LR and no warmup. For a new non-exact experiment,
 set `LR_SCHEDULER=cosine` and `WARMUP_RATIO=0.2`.
 
-MMStar short-generation eval:
+Qwen benchmark eval, defaulting to MMStar:
 
 ```bash
 RUN_DIR=artifacts/experiments/qwen_topk1024_freezeqkv/qwen_topk1024_freezeqkv_no_layer_repro \
-scripts/eval_qwen_delta_mmstar.sh
+scripts/eval_qwen_benchmark.sh
 ```
 
 Generic Qwen benchmark eval uses the shared benchmark registry. Supported names are:
@@ -91,7 +91,7 @@ Generic Qwen benchmark eval uses the shared benchmark registry. Supported names 
 Run one benchmark:
 
 ```bash
-scripts/eval_qwen_delta_mmstar.sh ocrbench \
+scripts/eval_qwen_benchmark.sh ocrbench \
   --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/RUN_NAME \
   --step 1000 \
   --max-samples 1000
@@ -181,14 +181,11 @@ Best observed checkpoints:
 | OCRBench | 7000 | 0.547 |
 
 Current safe speed defaults:
-- `ADAPTER_DECODE_CACHE=1` for `native_visual_kv_injection`. It reuses the measured adapter prefill
-  logits and KV cache for generation instead of recomputing the full prefix at every decoded token.
-  After the cache update, a 5-benchmark smoke (`mmstar`, `vqav2`, `textvqa`, `vizwiz`, `ocrbench`;
-  10 samples each) matched no-cache generation text and parsed predictions exactly.
-- `FAST_SPLIT_TEXT=0` and `FAST_INJECTION_PREFIX=0`. These fused mask paths reduce prefill time, but direct logits checks showed drift, so they must remain explicit experiments.
-- `COMPILE_ADAPTER=1` in the benchmark wrapper compiles the adapter prefill path only when decode
-  cache is not used. Compiling the full Qwen teacher is opt-in because HF Qwen graph breaks and
-  compilation overhead made it slower in smoke tests.
+- Qwen train/eval/benchmark use the same dense reference adapter forward. The previous decode-cache
+  and fused prefix/split switches were removed after direct logits checks showed drift.
+- `COMPILE_ADAPTER=1` in the benchmark wrapper compiles the adapter prefill path. Compiling the full
+  Qwen teacher is opt-in because HF Qwen graph breaks and compilation overhead made it slower in
+  smoke tests.
 
 ### Prefill Speed
 
@@ -227,7 +224,7 @@ Current safe speed defaults:
 Mix Pixmo-clean with FineVision LLaVA-Instruct-150K:
 
 ```bash
-.venv/bin/python scripts/prepare_mixed_data_v2.py
+.venv/bin/python scripts/data/prepare_mixed_data_v2.py
 ```
 
 Default output:

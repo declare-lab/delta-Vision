@@ -8,7 +8,7 @@ from src.model import (
     extract_vision_kv, load_adapter_checkpoint, load_frozen_llava,
     student_forward_with_visual_kv, teacher_forward, student_forward_mixed,
 )
-from src.eval_mmstar import get_option_token_ids, predict_option
+from src.eval_benchmarks import get_option_token_ids, predict_option
 from src.data import MMStarDataset
 
 
