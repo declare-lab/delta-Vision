@@ -17,11 +17,6 @@ from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as llama_apply_rotary_pos_emb, repeat_kv as llama_repeat_kv
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb as qwen_apply_rotary_pos_emb, repeat_kv as qwen_repeat_kv
 
-try:
-    from flash_attn import flash_attn_func
-except Exception:
-    flash_attn_func = None
-
 
 class PerLayerKVAdapter(nn.Module):
     """Per-LLM-layer adapter that maps vision encoder KV to LLM KV space.
@@ -268,8 +263,40 @@ def load_adapter_checkpoint(
     device: torch.device | str,
     language_model: nn.Module | None = None,
     dtype: torch.dtype = torch.bfloat16,
-) -> tuple[PerLayerKVAdapter, list[int], dict]:
+) -> tuple[nn.Module, list[int], dict]:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    saved_config = ckpt.get("adapter_config", {}) if isinstance(ckpt, dict) else {}
+    output_mode = saved_config.get("output_mode") or ckpt_args.get("output_mode") or "adapter_only"
+    if output_mode == "native_visual_kv_injection":
+        if language_model is None:
+            raise ValueError("language_model is required to load native_visual_kv_injection adapters")
+        state_dict = ckpt["state_dict"]
+        first_down = state_dict.get("visual_adapter_down.0.weight")
+        visual_adapter_rank = int(
+            saved_config.get(
+                "visual_adapter_rank",
+                ckpt_args.get("visual_adapter_rank", first_down.shape[0] if first_down is not None else 128),
+            )
+        )
+        adapter = QwenVisualDeltaAdapter.from_language_model(
+            language_model,
+            mode="native_visual_kv_injection",
+            visual_adapter_rank=visual_adapter_rank,
+        )
+        missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
+        adapter.to(device=device, dtype=dtype)
+        adapter.eval()
+        metadata = {
+            "output_mode": output_mode,
+            "visual_adapter_rank": visual_adapter_rank,
+            "source_layers": saved_config.get("source_layers", [22, 23]),
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+        }
+        adapter.output_mode = output_mode
+        return adapter, list(metadata["source_layers"]), metadata
+
     config, source_layers = infer_adapter_config_from_checkpoint(ckpt, language_model=language_model)
     adapter = PerLayerKVAdapter(**config)
     adapter.load_state_dict(ckpt["state_dict"])
@@ -283,6 +310,8 @@ def load_adapter_checkpoint(
             if key not in config
         },
     }
+    metadata["output_mode"] = output_mode
+    adapter.output_mode = metadata["output_mode"]
     return adapter, source_layers, metadata
 
 
@@ -619,6 +648,118 @@ def student_forward_mixed(
     return logits
 
 
+@torch.no_grad()
+def llava_projected_image_features(
+    model: LlavaForConditionalGeneration,
+    pixel_values: torch.Tensor,
+) -> torch.Tensor:
+    if pixel_values.ndim != 4 or hasattr(model.model, "image_newline"):
+        raise NotImplementedError("native LLaVA visual KV injection only supports fixed-grid LLaVA-style image features")
+    image_outputs = model.model.vision_tower(pixel_values, output_hidden_states=True)
+    image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
+    image_features = image_features[:, 1:]
+    return model.model.multi_modal_projector(image_features)
+
+
+def student_forward_llava_injection(
+    model: LlavaForConditionalGeneration,
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor,
+    adapter: "QwenVisualDeltaAdapter",
+    image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+    visual_memory: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run LLaVA text-only LLM with native projected image states as per-layer KV prefix.
+
+    This mirrors the Qwen visual-delta path: image features are projected to LLM
+    hidden size once, adapted by a per-layer low-rank residual, then converted
+    to K/V by the frozen language layer's native k_proj/v_proj. Image tokens do
+    not pass through the LLM FFN.
+    """
+    if visual_memory is None:
+        visual_memory = llava_projected_image_features(model, pixel_values)
+
+    language_model = _get_language_model(model)
+    valid_mask = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(input_ids[0], dtype=torch.bool)
+    text_mask = (input_ids[0] != image_token_id) & valid_mask
+    image_mask = (input_ids[0] == image_token_id) & valid_mask
+    text_ids = input_ids[:, text_mask]
+    hidden = language_model.embed_tokens(text_ids)
+
+    layers = language_model.layers
+    rotary_emb = language_model.rotary_emb
+    batch, text_len, _ = hidden.shape
+    image_len = visual_memory.shape[1]
+    device = hidden.device
+    dtype = hidden.dtype
+    visual_memory = visual_memory.to(device=device, dtype=dtype)
+
+    text_positions = torch.where(text_mask)[0].to(device)
+    image_positions = torch.where(image_mask)[0].to(device)
+    text_position_ids = text_positions.unsqueeze(0).expand(batch, -1)
+    if image_positions.numel() == image_len:
+        image_position_ids = image_positions.unsqueeze(0).expand(batch, -1)
+    elif image_positions.numel() > 0:
+        start_pos = int(image_positions[0].item())
+        image_position_ids = torch.arange(start_pos, start_pos + image_len, device=device).unsqueeze(0).expand(batch, -1)
+    else:
+        image_position_ids = torch.arange(image_len, device=device).unsqueeze(0).expand(batch, -1)
+
+    img_allowed = text_position_ids.unsqueeze(2) >= image_position_ids.unsqueeze(1)
+    text_allowed = text_position_ids.unsqueeze(2) >= text_position_ids.unsqueeze(1)
+    prefix_mask = torch.cat([img_allowed, text_allowed], dim=-1)
+    attn_mask = torch.zeros((batch, 1, text_len, image_len + text_len), device=device, dtype=dtype)
+    attn_mask.masked_fill_(~prefix_mask.unsqueeze(1), torch.finfo(dtype).min)
+
+    for layer_idx, layer in enumerate(layers):
+        residual = hidden
+        normed = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+
+        query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+        query = _apply_rope(rotary_emb, query, text_position_ids, normed)
+        text_key = _apply_rope(rotary_emb, text_key, text_position_ids, normed)
+
+        vision_states = adapter.visual_memory_from_modules(
+            visual_memory,
+            adapter.visual_adapter_down[layer_idx],
+            adapter.visual_adapter_up[layer_idx],
+        )
+        normed_vision = layer.input_layernorm(vision_states)
+        vision_shape = normed_vision.shape[:-1]
+        vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
+        visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        visual_key = _apply_rope(rotary_emb, visual_key, image_position_ids, normed_vision)
+
+        key = torch.cat([visual_key, text_key], dim=2)
+        value = torch.cat([visual_value, text_value], dim=2)
+        if query.shape[1] != key.shape[1]:
+            key = llama_repeat_kv(key, query.shape[1] // key.shape[1])
+            value = llama_repeat_kv(value, query.shape[1] // value.shape[1])
+        attn_out = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+        )
+        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
+        hidden = residual + attn.o_proj(attn_out)
+        residual = hidden
+        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+
+    hidden = language_model.norm(hidden)
+    return model.lm_head(hidden)
+
+
 def student_forward_optimized(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
@@ -655,7 +796,8 @@ def student_forward_flex(
 
 
 # Qwen3-VL visual-delta adapters.
-QWEN_VISUAL_DELTA_MODES = ("native_visual_kv_injection", "native_visual_kv_split")
+QWEN_VISUAL_DELTA_MODES = ("native_visual_kv_injection",)
+LLAVA_OUTPUT_MODES = ("adapter_only", "native_visual_kv_injection")
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -666,29 +808,43 @@ def dtype_from_name(name: str) -> torch.dtype:
     }[name]
 
 
-def qwen_prompt(processor: Any, question: str) -> str:
+def qwen_prompt(processor: Any, question: str, num_images: int = 1) -> str:
     messages = [
         {
             "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": question.strip()},
-            ],
+            "content": [{"type": "image"} for _ in range(max(1, int(num_images)))]
+            + [{"type": "text", "text": question.strip()}],
         }
     ]
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 
+def resolve_row_image_paths(row: dict[str, Any], image_root: Path | None = None) -> list[Path]:
+    raw_paths = row.get("images")
+    if raw_paths is None:
+        raw_paths = [row["image"]]
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ValueError("row must contain image or non-empty images")
+
+    root = image_root
+    row_root = str(row.get("image_root") or "").strip()
+    if row_root:
+        root = Path(row_root)
+
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        image_path = Path(str(raw_path))
+        if image_path.is_absolute():
+            paths.append(image_path)
+        elif root is not None:
+            paths.append(root / image_path)
+        else:
+            paths.append(image_path)
+    return paths
+
+
 def resolve_row_image_path(row: dict[str, Any], image_root: Path | None = None) -> Path:
-    image_path = Path(str(row["image"]))
-    if image_path.is_absolute():
-        return image_path
-    if "image_root" in row:
-        row_root = str(row.get("image_root") or "").strip()
-        return Path(row_root) / image_path if row_root else image_path
-    if image_root is not None:
-        return image_root / image_path
-    return image_path
+    return resolve_row_image_paths(row, image_root)[0]
 
 
 def load_frozen_qwen3vl(
@@ -762,11 +918,11 @@ def prepare_qwen3vl_batch_inputs(
     answer_token_lens: list[int] = []
     eos = processor.tokenizer.eos_token or ""
     for row in rows:
-        image_path = resolve_row_image_path(row, image_root)
+        row_image_paths = resolve_row_image_paths(row, image_root)
         question = str(row["question"]).strip()
         if answer_instruction:
             question = f"{question}\n{answer_instruction.strip()}"
-        prompt = qwen_prompt(processor, question)
+        prompt = qwen_prompt(processor, question, num_images=len(row_image_paths))
         if include_answers:
             answer = str(row.get("answer", "")).strip()
             suffix = f" {answer}{eos if eos and not answer.endswith(eos) else ''}"
@@ -775,9 +931,10 @@ def prepare_qwen3vl_batch_inputs(
         else:
             texts.append(prompt)
             answer_token_lens.append(0)
-        with Image.open(image_path) as image:
-            images.append(image.convert("RGB").copy())
-        image_paths.append(str(image_path))
+        for image_path in row_image_paths:
+            with Image.open(image_path) as image:
+                images.append(image.convert("RGB").copy())
+            image_paths.append(str(image_path))
 
     old_padding_side = getattr(processor.tokenizer, "padding_side", "right")
     processor.tokenizer.padding_side = "right"
@@ -969,63 +1126,6 @@ def qwen_prefix_causal_attention_mask(text_mask: Tensor, image_mask: Tensor, dev
     return torch.cat([visual_allowed, text_allowed], dim=-1).unsqueeze(1)
 
 
-def split_heads(x: Tensor, num_heads: int) -> Tensor:
-    batch, seq_len, dim = x.shape
-    if dim % num_heads != 0:
-        raise ValueError(f"hidden dim {dim} is not divisible by num_heads={num_heads}")
-    return x.view(batch, seq_len, num_heads, dim // num_heads)
-
-
-def merge_heads(x: Tensor) -> Tensor:
-    if x.ndim != 4:
-        raise ValueError("expected [batch, seq, heads, head_dim]")
-    return x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3])
-
-
-class ReaderMLP(nn.Module):
-    def __init__(self, hidden_size: int, mlp_dim: int, activation: str = "situ_glu") -> None:
-        super().__init__()
-        if activation not in {"gelu", "silu", "swiglu", "situ_glu"}:
-            raise ValueError(f"unsupported reader activation: {activation}")
-        self.activation = activation
-        self.norm = nn.LayerNorm(hidden_size)
-        if activation in {"swiglu", "situ_glu"}:
-            inner_dim = max(hidden_size, int(round(mlp_dim * 2.0 / 3.0)))
-            self.gate_proj = nn.Linear(hidden_size, inner_dim)
-            self.up_proj = nn.Linear(hidden_size, inner_dim)
-            self.down_proj = nn.Linear(inner_dim, hidden_size)
-            self.fc1 = None
-            self.fc2 = None
-        else:
-            self.fc1 = nn.Linear(hidden_size, mlp_dim)
-            self.fc2 = nn.Linear(mlp_dim, hidden_size)
-            self.gate_proj = None
-            self.up_proj = None
-            self.down_proj = None
-
-    @staticmethod
-    def _situ(x: Tensor) -> Tensor:
-        return 100.0 * torch.tanh(F.silu(x) / 100.0)
-
-    @staticmethod
-    def _soft_cap(x: Tensor) -> Tensor:
-        return 100.0 * torch.tanh(x / 100.0)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.norm(x)
-        if self.activation == "gelu":
-            assert self.fc1 is not None and self.fc2 is not None
-            return self.fc2(F.gelu(self.fc1(x)))
-        if self.activation == "silu":
-            assert self.fc1 is not None and self.fc2 is not None
-            return self.fc2(F.silu(self.fc1(x)))
-        assert self.gate_proj is not None and self.up_proj is not None and self.down_proj is not None
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        hidden = self._situ(gate) * self._soft_cap(up) if self.activation == "situ_glu" else F.silu(gate) * up
-        return self.down_proj(hidden)
-
-
 class QwenVisualDeltaAdapter(nn.Module):
     def __init__(
         self,
@@ -1035,10 +1135,7 @@ class QwenVisualDeltaAdapter(nn.Module):
         num_heads: int,
         head_dim: int,
         mode: str,
-        reader_mlp_ratio: float = 4.0,
-        reader_activation: str = "situ_glu",
         visual_adapter_rank: int = 128,
-        gate_init: float = 1.0,
     ) -> None:
         super().__init__()
         if mode not in QWEN_VISUAL_DELTA_MODES:
@@ -1049,24 +1146,13 @@ class QwenVisualDeltaAdapter(nn.Module):
         self.head_dim = int(head_dim)
         self.attn_dim = int(num_heads) * int(head_dim)
         self.mode = mode
-        self.reader_mlp_ratio = float(reader_mlp_ratio)
-        self.reader_activation = reader_activation
         self.visual_adapter_rank = int(visual_adapter_rank)
-        self.reader_norm = nn.LayerNorm(self.attn_dim)
-        self.reader_fusion_proj = nn.Linear(self.attn_dim * 2, self.attn_dim, bias=False)
-        mlp_dim = max(self.attn_dim, int(round(self.attn_dim * float(reader_mlp_ratio))))
-        self.reader_mlp = ReaderMLP(self.attn_dim, mlp_dim, reader_activation) if reader_mlp_ratio > 0 else None
-        self.mass_head = nn.Linear(self.attn_dim, num_heads, bias=True)
         rank = max(1, int(visual_adapter_rank))
         self.visual_adapter_down = nn.ModuleList([nn.Linear(hidden_size, rank, bias=False) for _ in range(num_layers)])
         self.visual_adapter_up = nn.ModuleList([nn.Linear(rank, hidden_size, bias=False) for _ in range(num_layers)])
-        self.gate = nn.Parameter(torch.full((num_layers,), float(gate_init)))
-        self.last_visual_mass: Tensor | None = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.zeros_(self.mass_head.weight)
-        nn.init.constant_(self.mass_head.bias, -2.0)
         for up in self.visual_adapter_up:
             nn.init.zeros_(up.weight)
 
@@ -1076,8 +1162,6 @@ class QwenVisualDeltaAdapter(nn.Module):
         language_model: torch.nn.Module,
         *,
         mode: str,
-        reader_mlp_ratio: float = 4.0,
-        reader_activation: str = "situ_glu",
         visual_adapter_rank: int = 128,
     ) -> "QwenVisualDeltaAdapter":
         cfg = language_model.config
@@ -1087,8 +1171,6 @@ class QwenVisualDeltaAdapter(nn.Module):
             num_heads=int(cfg.num_attention_heads),
             head_dim=int(getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)),
             mode=mode,
-            reader_mlp_ratio=reader_mlp_ratio,
-            reader_activation=reader_activation,
             visual_adapter_rank=visual_adapter_rank,
         )
 
@@ -1108,113 +1190,6 @@ class QwenVisualDeltaAdapter(nn.Module):
         adapted = down(visual_memory)
         adapted = up(F.silu(adapted))
         return visual_memory + adapted.to(dtype=visual_memory.dtype)
-
-    def split_delta(
-        self,
-        *,
-        query_heads: Tensor,
-        visual_heads: Tensor,
-        text_heads: Tensor,
-        output_projection: nn.Module,
-        layer_idx: int,
-    ) -> Tensor:
-        self.last_visual_mass = None
-        visual_merged = merge_heads(visual_heads)
-        query_merged = merge_heads(query_heads.transpose(1, 2).contiguous())
-        reader_input = self.reader_fusion_proj(torch.cat([visual_merged, query_merged], dim=-1))
-        reader_features = self.reader_norm(reader_input)
-        if self.reader_mlp is not None:
-            reader_features = reader_features + self.reader_mlp(reader_features)
-        visual_mass = torch.sigmoid(self.mass_head(reader_features)).to(dtype=visual_heads.dtype).unsqueeze(-1)
-        self.last_visual_mass = visual_mass.squeeze(-1)
-        residual_heads = visual_mass * (visual_heads - text_heads.to(dtype=visual_heads.dtype))
-        residual = output_projection(merge_heads(residual_heads))
-        gate = self.gate[layer_idx].to(device=residual.device, dtype=residual.dtype).view(1, 1, 1)
-        return residual * gate
-
-
-def qwen_text_query_heads(
-    language_model: torch.nn.Module,
-    layer_idx: int,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-) -> Tensor:
-    return qwen_text_query_heads_for_layer(language_model, language_model.layers[layer_idx], hidden_states, position_ids)
-
-
-def qwen_text_query_heads_for_layer(
-    language_model: torch.nn.Module,
-    layer: torch.nn.Module,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-) -> Tensor:
-    attn = layer.self_attn
-    normed = layer.input_layernorm(hidden_states)
-    input_shape = normed.shape[:-1]
-    hidden_shape = (*input_shape, -1, attn.head_dim)
-    query = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
-    query, _ = qwen_apply_rotary_pos_emb(query, query, *language_model.rotary_emb(normed, position_ids))
-    return query.contiguous()
-
-
-def qwen_text_attention_heads(
-    language_model: torch.nn.Module,
-    layer_idx: int,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-    padding_mask: Tensor | None = None,
-    *,
-    return_query: bool = False,
-) -> Tensor | tuple[Tensor, Tensor]:
-    return qwen_text_attention_heads_for_layer(
-        language_model,
-        language_model.layers[layer_idx],
-        hidden_states,
-        position_ids,
-        padding_mask,
-        return_query=return_query,
-    )
-
-
-def qwen_text_attention_heads_for_layer(
-    language_model: torch.nn.Module,
-    layer: torch.nn.Module,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-    padding_mask: Tensor | None = None,
-    *,
-    return_query: bool = False,
-) -> Tensor | tuple[Tensor, Tensor]:
-    attn = layer.self_attn
-    attention_mask = None
-    is_causal = True
-    if padding_mask is not None:
-        valid_mask = ~padding_mask.to(device=hidden_states.device, dtype=torch.bool)
-        seq_len = hidden_states.shape[1]
-        causal = torch.ones((seq_len, seq_len), device=hidden_states.device, dtype=torch.bool).tril()
-        attention_mask = causal.view(1, 1, seq_len, seq_len) & valid_mask.view(valid_mask.shape[0], 1, 1, seq_len)
-        is_causal = False
-    normed = layer.input_layernorm(hidden_states)
-    input_shape = normed.shape[:-1]
-    hidden_shape = (*input_shape, -1, attn.head_dim)
-    query = attn.q_norm(attn.q_proj(normed).view(hidden_shape)).transpose(1, 2)
-    key = attn.k_norm(attn.k_proj(normed).view(hidden_shape)).transpose(1, 2)
-    value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-    query, key = qwen_apply_rotary_pos_emb(query, key, *language_model.rotary_emb(normed, position_ids))
-    out = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=0.0,
-        is_causal=is_causal,
-        scale=float(attn.scaling),
-        enable_gqa=query.shape[1] != key.shape[1],
-    )
-    heads = out.transpose(1, 2).contiguous()
-    if return_query:
-        return heads, query.contiguous()
-    return heads
 
 
 def qwen_text_attention_output(
@@ -1304,52 +1279,6 @@ def qwen_native_visual_kv_for_layer(
     key = key.contiguous()
     value = value.contiguous()
     return key, value, padding_mask
-
-
-def qwen_visual_attention_heads(
-    query_heads: Tensor,
-    visual_key: Tensor,
-    visual_value: Tensor,
-    visual_padding_mask: Tensor | None,
-    *,
-    scaling: float,
-) -> Tensor:
-    if (
-        visual_padding_mask is None
-        and flash_attn_func is not None
-        and query_heads.is_cuda
-        and query_heads.dtype in {torch.float16, torch.bfloat16}
-    ):
-        return flash_attn_func(
-            query_heads.transpose(1, 2).contiguous(),
-            visual_key.transpose(1, 2).contiguous(),
-            visual_value.transpose(1, 2).contiguous(),
-            dropout_p=0.0,
-            softmax_scale=float(scaling),
-            causal=False,
-        ).contiguous()
-    attn_mask = None
-    if visual_padding_mask is not None:
-        attn_mask = torch.zeros(
-            (query_heads.shape[0], 1, 1, visual_key.shape[2]),
-            device=query_heads.device,
-            dtype=query_heads.dtype,
-        )
-        attn_mask = attn_mask.masked_fill(
-            visual_padding_mask[:, None, None, :],
-            torch.finfo(query_heads.dtype).min,
-        )
-    out = F.scaled_dot_product_attention(
-        query_heads,
-        visual_key,
-        visual_value,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=False,
-        scale=float(scaling),
-        enable_gqa=query_heads.shape[1] != visual_key.shape[1],
-    )
-    return out.transpose(1, 2).contiguous()
 
 
 def qwen_prefix_causal_attention_heads(
@@ -1534,12 +1463,10 @@ def qwen_visual_delta_logits(
         dtype=next(adapter.parameters()).dtype
     )
     h = gather_batched_positions(initial_hidden, text_pos, text_mask).to(dtype=next(adapter.parameters()).dtype)
-    prefix_attention_mask = None
-    if adapter.mode == "native_visual_kv_injection":
-        prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
+    prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
     text_position_embeddings = None
     visual_position_embeddings = None
-    if reuse_position_embeddings and adapter.mode == "native_visual_kv_injection":
+    if reuse_position_embeddings:
         text_position_embeddings = language_model.rotary_emb(h, text_position_ids)
         visual_position_embeddings = language_model.rotary_emb(visual_memory, visual_position_ids)
     states = None
@@ -1556,61 +1483,20 @@ def qwen_visual_delta_logits(
             adapter.visual_adapter_down[layer_idx],
             adapter.visual_adapter_up[layer_idx],
         )
-        if adapter.mode == "native_visual_kv_injection":
-            text_attention = qwen_text_attention_output_with_visual_kv_for_layer(
-                language_model,
-                layer,
-                h,
-                text_position_ids,
-                vision_states,
-                visual_position_ids,
-                text_padding_mask=text_padding_mask,
-                vision_padding_mask=vision_padding_mask,
-                prefix_attention_mask=prefix_attention_mask,
-                text_position_embeddings=text_position_embeddings,
-                visual_position_embeddings=visual_position_embeddings,
-            )
-            delta = None
-        else:
-            text_attention = qwen_text_attention_output_for_layer(
-                language_model,
-                layer,
-                h,
-                text_position_ids,
-                padding_mask=text_padding_mask,
-            )
-            text_heads = qwen_text_attention_heads_for_layer(
-                language_model,
-                layer,
-                h,
-                text_position_ids,
-                padding_mask=text_padding_mask,
-            )
-            query_heads = qwen_text_query_heads_for_layer(language_model, layer, h, text_position_ids)
-            visual_key, visual_value, visual_padding = qwen_native_visual_kv_for_layer(
-                language_model,
-                layer,
-                vision_states,
-                visual_position_ids,
-                vision_padding_mask,
-                repeat_kv=False,
-            )
-            visual_heads = qwen_visual_attention_heads(
-                query_heads,
-                visual_key,
-                visual_value,
-                visual_padding,
-                scaling=float(layer.self_attn.scaling),
-            )
-            delta = adapter.split_delta(
-                query_heads=query_heads,
-                visual_heads=visual_heads,
-                text_heads=text_heads,
-                output_projection=layer.self_attn.o_proj,
-                layer_idx=layer_idx,
-            )
-            delta = delta.masked_fill(~text_mask.unsqueeze(-1), 0.0)
-        h = run_qwen_layer_from_attention_output_for_layer(layer, h, text_attention, delta)
+        text_attention = qwen_text_attention_output_with_visual_kv_for_layer(
+            language_model,
+            layer,
+            h,
+            text_position_ids,
+            vision_states,
+            visual_position_ids,
+            text_padding_mask=text_padding_mask,
+            vision_padding_mask=vision_padding_mask,
+            prefix_attention_mask=prefix_attention_mask,
+            text_position_embeddings=text_position_embeddings,
+            visual_position_embeddings=visual_position_embeddings,
+        )
+        h = run_qwen_layer_from_attention_output_for_layer(layer, h, text_attention, None)
         if states is not None:
             state_idx = layer_idx + 1
             if collect_state_indices is None:
@@ -1630,14 +1516,12 @@ def load_qwen_visual_delta_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    mode = str(checkpoint_args.get("output_mode", "native_visual_kv_split"))
+    mode = str(checkpoint_args.get("output_mode", "native_visual_kv_injection"))
     if mode not in QWEN_VISUAL_DELTA_MODES:
         raise ValueError(f"checkpoint output_mode={mode!r} is not a Qwen visual-delta mode")
     adapter = QwenVisualDeltaAdapter.from_language_model(
         language_model,
         mode=mode,
-        reader_mlp_ratio=float(checkpoint_args.get("reader_mlp_ratio", 4.0)),
-        reader_activation=str(checkpoint_args.get("reader_activation", "situ_glu")),
         visual_adapter_rank=int(
             checkpoint_args.get(
                 "visual_adapter_rank",

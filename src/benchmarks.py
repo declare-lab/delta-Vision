@@ -103,6 +103,14 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         default_data="data/benchmarks/ocrbench/test.jsonl",
         answer_instruction="Answer directly with a short phrase.",
     ),
+    "rendered-context-qa": BenchmarkSpec(
+        name="rendered-context-qa",
+        display_name="RenderedContextQA",
+        metric="relaxed_exact",
+        default_data="data/rendered_context_qa_eval_v1/rendered_qa.jsonl",
+        answer_instruction="Answer directly with a short phrase.",
+        max_new_tokens=48,
+    ),
 }
 
 
@@ -122,6 +130,9 @@ def canonical_benchmark_name(name: str) -> str:
         "vqa^text": "textvqa",
         "text-vqa": "textvqa",
         "ocr": "ocrbench",
+        "rendered_context_qa": "rendered-context-qa",
+        "rendered-qa": "rendered-context-qa",
+        "context-qa": "rendered-context-qa",
     }
     key = aliases.get(key, key)
     if key not in BENCHMARK_SPECS:
@@ -455,8 +466,6 @@ def estimate_qwen_prefill_flops(
     visual_kv = 4.0 * layers * image_tokens * hidden * kv_heads * head_dim
     cross_attention = 4.0 * layers * heads * text_tokens * image_tokens * head_dim
     flops += visual_kv + cross_attention
-    if "split" in adapter_mode:
-        flops += llm(text_tokens) * 0.45
     if visual_adapter_rank > 0:
         flops += 4.0 * layers * image_tokens * hidden * visual_adapter_rank
     return flops

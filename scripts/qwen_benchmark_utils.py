@@ -158,11 +158,8 @@ def fmt_delta_ms(reference_s: float, value_s: float | None) -> str:
 
 def count_active_qwen_params(adapter: torch.nn.Module) -> int:
     total = 0
-    mode = getattr(adapter, "mode", "")
     for name, param in adapter.named_parameters():
         active = name.startswith("visual_adapter_")
-        if mode == "native_visual_kv_split":
-            active = active or name == "gate" or name.startswith("reader_") or name.startswith("mass_head")
         if active:
             total += param.numel()
     return total

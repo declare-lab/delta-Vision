@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from src.data import OPDDataset, VQADataset, collate_fn
 from src.model import (
+    LLAVA_OUTPUT_MODES,
     PerLayerKVAdapter,
     QWEN_VISUAL_DELTA_MODES,
     QwenVisualDeltaAdapter,
@@ -34,7 +35,8 @@ from src.model import (
     qwen3vl_text_ids_and_answer_mask,
     qwen_position_ids,
     qwen_visual_delta_logits,
-    resolve_row_image_path,
+    resolve_row_image_paths,
+    student_forward_llava_injection,
     student_forward_with_visual_kv,
     teacher_forward,
 )
@@ -150,16 +152,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concat-source", action="store_true")
     parser.add_argument("--dataset-type", default="vqa", choices=("vqa", "opd"))
 
-    parser.add_argument("--output-mode", choices=QWEN_VISUAL_DELTA_MODES, default="native_visual_kv_split")
+    parser.add_argument("--output-mode", choices=tuple(sorted(set(LLAVA_OUTPUT_MODES + QWEN_VISUAL_DELTA_MODES))), default=None)
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
-    parser.add_argument("--reader-mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--reader-activation", choices=("gelu", "silu", "swiglu", "situ_glu"), default="situ_glu")
-    parser.add_argument("--supervision-loss", choices=("distill", "opd"), default="distill")
+    parser.add_argument("--supervision-loss", choices=("distill", "opd", "ce"), default="distill")
     parser.add_argument("--opd-rollout-max-new-tokens", type=int, default=32)
     parser.add_argument("--lambda-logit", type=float, default=4.0)
-    parser.add_argument("--lambda-trajectory", type=float, default=0.5)
+    parser.add_argument("--lambda-trajectory", type=float, default=1.0)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
-    parser.add_argument("--loss-normalization", choices=("token", "sample"), default="sample")
+    parser.add_argument("--loss-normalization", choices=("token", "sample"), default="token")
     parser.add_argument("--trajectory-layers", default="4,8,12,16,20,24,28,32,36")
     parser.add_argument("--micro-batch-size-per-gpu", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -405,6 +405,44 @@ def masked_topk_kl(
     return token_mean, per_sample, answer_counts
 
 
+def masked_ce_loss(
+    student_logits: Tensor,
+    target_ids: Tensor,
+    answer_mask: Tensor,
+    *,
+    normalization: str = "token",
+) -> tuple[Tensor, Tensor, Tensor]:
+    batch = student_logits.shape[0]
+    shift_mask = answer_mask[:, 1:].bool()
+    answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
+    valid_count = answer_counts.sum()
+    if int(valid_count.item()) == 0:
+        return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), answer_counts
+
+    logits = student_logits[:, :-1][shift_mask].float()
+    targets = target_ids[:, 1:][shift_mask].long()
+    losses = F.cross_entropy(logits, targets, reduction="none")
+    batch_ids = (
+        torch.arange(batch, device=student_logits.device)
+        .unsqueeze(1)
+        .expand_as(shift_mask)[shift_mask]
+    )
+    per_sample_sum = student_logits.new_zeros((batch,), dtype=torch.float32)
+    per_sample_sum.scatter_add_(0, batch_ids, losses.to(device=student_logits.device, dtype=torch.float32))
+    per_sample = per_sample_sum / answer_counts.clamp_min(1.0)
+    token_mean = losses.sum() / valid_count.float().clamp_min(1.0)
+    if normalization == "sample":
+        has_answer = answer_counts > 0
+        if int(has_answer.sum().item()) == 0:
+            return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
+        return (
+            per_sample[has_answer].mean().to(dtype=student_logits.dtype),
+            per_sample.to(dtype=student_logits.dtype),
+            answer_counts,
+        )
+    return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
+
+
 def qwen_eos_token_ids(tokenizer: Any) -> set[int]:
     raw_ids = tokenizer.eos_token_id
     if raw_ids is None:
@@ -511,11 +549,14 @@ def qwen_student_rollout_token_ids(
 
 
 def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
-    path = resolve_row_image_path(row, image_root)
+    paths = resolve_row_image_paths(row, image_root)
+    total = 0
     try:
-        with Image.open(path) as image:
-            width, height = image.size
-        return max(1, int(width) * int(height))
+        for path in paths:
+            with Image.open(path) as image:
+                width, height = image.size
+            total += max(1, int(width) * int(height))
+        return max(1, total)
     except Exception:
         return 0
 
@@ -604,12 +645,6 @@ def trainable_parameters_for_mode(adapter: QwenVisualDeltaAdapter) -> list[nn.Pa
     for name, param in adapter.named_parameters():
         if name.startswith("visual_adapter_"):
             param.requires_grad_(True)
-        if adapter.mode == "native_visual_kv_split" and (
-            name == "gate"
-            or name.startswith("reader_")
-            or name.startswith("mass_head")
-        ):
-            param.requires_grad_(True)
     return [param for param in adapter.parameters() if param.requires_grad]
 
 
@@ -623,6 +658,31 @@ def compute_qwen_loss_for_prepared_inputs(
     num_layers: int,
 ) -> tuple[torch.Tensor, dict[str, float], Tensor, Tensor, Tensor]:
     loss_mode = "distill" if args.supervision_loss == "opd" else str(args.supervision_loss)
+    if loss_mode == "ce":
+        student_logits, student_text_mask, _ = qwen_visual_delta_logits(
+            model,
+            adapter,
+            inputs,
+            collect_states=False,
+        )
+        ce, per_sample_supervision, answer_counts = masked_ce_loss(
+            student_logits,
+            text_ids,
+            answer_mask,
+            normalization=args.loss_normalization,
+        )
+        metrics = {
+            "loss": float(ce.detach()),
+            "ce": float(ce.detach()),
+            "logit_kl": 0.0,
+            "trajectory": 0.0,
+            "kv_mse": 0.0,
+            "visual_mass": 0.0,
+            "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
+            "answer_tokens": float(answer_counts.sum().item()) / max(1, answer_counts.shape[0]),
+        }
+        return ce, metrics, per_sample_supervision, answer_counts, student_text_mask
+
     need_trajectory = loss_mode == "distill" and float(args.lambda_trajectory) != 0.0
     trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
     teacher_text_states: dict[int, Tensor] = {}
@@ -705,16 +765,13 @@ def compute_qwen_loss_for_prepared_inputs(
     kv_mse = student_logits.new_zeros(())
     loss = args.lambda_logit * logit_kl + args.lambda_trajectory * trajectory + args.lambda_kv_mse * kv_mse
 
-    mass_mean = student_logits.new_zeros(())
-    if adapter.last_visual_mass is not None:
-        valid = student_text_mask.to(device=adapter.last_visual_mass.device).bool()
-        mass_mean = adapter.last_visual_mass.float()[valid].mean()
     metrics = {
         "loss": float(loss.detach()),
+        "ce": 0.0,
         "logit_kl": float(logit_kl.detach()),
         "trajectory": float(trajectory.detach()),
         "kv_mse": float(kv_mse.detach()),
-        "visual_mass": float(mass_mean.detach()),
+        "visual_mass": 0.0,
         "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
         "answer_tokens": float(answer_counts.sum().item()) / max(1, answer_counts.shape[0]),
     }
@@ -902,30 +959,47 @@ def run_llava(args: argparse.Namespace) -> None:
     head_dim = language_model.config.hidden_size // language_model.config.num_attention_heads
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
-    adapter_config = {
-        "num_llm_layers": num_llm_layers,
-        "num_source_layers": len(source_layers),
-        "source_dim": source_dim,
-        "num_heads": num_heads,
-        "head_dim": head_dim,
-        "bottleneck_dim": args.bottleneck_dim,
-        "concat_source": args.concat_source,
-        "use_activation": False,
-        "source_layers": source_layers,
-    }
-    adapter = PerLayerKVAdapter(
-        num_llm_layers=num_llm_layers,
-        num_source_layers=len(source_layers),
-        source_dim=source_dim,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        bottleneck_dim=args.bottleneck_dim,
-        concat_source=args.concat_source,
-    )
+    if args.output_mode == "native_visual_kv_injection":
+        adapter_config = {
+            "adapter_type": "native_visual_kv_injection",
+            "hidden_size": int(language_model.config.hidden_size),
+            "num_llm_layers": num_llm_layers,
+            "num_heads": int(language_model.config.num_attention_heads),
+            "head_dim": head_dim,
+            "visual_adapter_rank": args.visual_adapter_rank,
+            "output_mode": args.output_mode,
+        }
+        adapter = QwenVisualDeltaAdapter.from_language_model(
+            language_model,
+            mode="native_visual_kv_injection",
+            visual_adapter_rank=args.visual_adapter_rank,
+        )
+    else:
+        adapter_config = {
+            "num_llm_layers": num_llm_layers,
+            "num_source_layers": len(source_layers),
+            "source_dim": source_dim,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "bottleneck_dim": args.bottleneck_dim,
+            "concat_source": args.concat_source,
+            "use_activation": False,
+            "source_layers": source_layers,
+            "output_mode": args.output_mode,
+        }
+        adapter = PerLayerKVAdapter(
+            num_llm_layers=num_llm_layers,
+            num_source_layers=len(source_layers),
+            source_dim=source_dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            bottleneck_dim=args.bottleneck_dim,
+            concat_source=args.concat_source,
+        )
 
     trainable_params = sum(p.numel() for p in adapter.parameters())
     if is_main:
-        print(f"Adapter trainable params: {trainable_params / 1e6:.2f}M")
+        print(f"Adapter trainable params: {trainable_params / 1e6:.2f}M output_mode={args.output_mode}")
 
     wandb_run = None
     if is_main and args.wandb:
@@ -944,9 +1018,9 @@ def run_llava(args: argparse.Namespace) -> None:
 
     if args.init_checkpoint:
         ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        adapter.load_state_dict(ckpt["state_dict"])
+        missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=args.output_mode != "native_visual_kv_injection")
         if is_main:
-            print(f"Loaded init checkpoint: {args.init_checkpoint}")
+            print(f"Loaded init checkpoint: {args.init_checkpoint} missing={list(missing)} unexpected={list(unexpected)}")
 
     optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     with open(args.deepspeed_config, "r", encoding="utf-8") as f:
@@ -989,6 +1063,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     metrics_path = Path(args.output_dir) / "train_metrics.jsonl"
     step = 0
+    use_native_visual_kv = args.output_mode == "native_visual_kv_injection"
 
     for epoch in range(100):
         sampler.set_epoch(epoch)
@@ -1006,12 +1081,15 @@ def run_llava(args: argparse.Namespace) -> None:
                 image_sizes = batch.get("image_sizes")
                 if isinstance(pixel_values, list):
                     # Variable crops: process per-sample
-                    source_k_list, source_v_list, teacher_logits_list = [], [], []
+                    source_k_list = [] if not use_native_visual_kv else None
+                    source_v_list = [] if not use_native_visual_kv else None
+                    teacher_logits_list = []
                     for i in range(B):
                         pv_i = pixel_values[i].unsqueeze(0).to(device)
-                        sk, sv = extract_vision_kv(model, pv_i, source_layer_indices=source_layers)
-                        source_k_list.append(sk)
-                        source_v_list.append(sv)
+                        if not use_native_visual_kv:
+                            sk, sv = extract_vision_kv(model, pv_i, source_layer_indices=source_layers)
+                            source_k_list.append(sk)
+                            source_v_list.append(sv)
                         isz = image_sizes[i:i+1].to(device) if image_sizes is not None and torch.is_tensor(image_sizes) else None
                         tl = teacher_forward(
                             model,
@@ -1025,7 +1103,10 @@ def run_llava(args: argparse.Namespace) -> None:
                 else:
                     if image_sizes is not None and torch.is_tensor(image_sizes):
                         image_sizes = image_sizes.to(device)
-                    source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
+                    if use_native_visual_kv:
+                        source_k = source_v = None
+                    else:
+                        source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
                     teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
                     source_k_list = source_v_list = teacher_logits_list = None
 
@@ -1033,33 +1114,46 @@ def run_llava(args: argparse.Namespace) -> None:
 
             for i in range(B):
                 single_ids = input_ids[i:i+1]
-                if source_k_list is not None:
-                    single_sk = source_k_list[i]
-                    single_sv = source_v_list[i]
+                if isinstance(pixel_values, list):
+                    single_pixel_values = pixel_values[i].unsqueeze(0).to(device)
                 else:
-                    single_sk = source_k[i:i+1]
-                    single_sv = source_v[i:i+1]
+                    single_pixel_values = pixel_values[i:i+1]
 
-                student_logits = student_forward_with_visual_kv(
-                    model,
-                    single_ids,
-                    engine.module,
-                    single_sk,
-                    single_sv,
-                    image_token_id,
-                    attention_mask=attention_mask[i:i+1],
-                )
+                if use_native_visual_kv:
+                    student_logits = student_forward_llava_injection(
+                        model,
+                        single_ids,
+                        single_pixel_values,
+                        engine.module,
+                        image_token_id,
+                        attention_mask=attention_mask[i:i+1],
+                    )
+                else:
+                    if source_k_list is not None:
+                        single_sk = source_k_list[i]
+                        single_sv = source_v_list[i]
+                    else:
+                        single_sk = source_k[i:i+1]
+                        single_sv = source_v[i:i+1]
+                    student_logits = student_forward_with_visual_kv(
+                        model,
+                        single_ids,
+                        engine.module,
+                        single_sk,
+                        single_sv,
+                        image_token_id,
+                        attention_mask=attention_mask[i:i+1],
+                    )
 
                 # prompt_len is text-only (image tokens excluded)
                 text_prompt_len = int(prompt_lens[i].item())
                 num_text = student_logits.shape[1]
 
-                # Student: text-only, answer starts at text_prompt_len-1 (causal: predict next)
-                s_start = max(0, text_prompt_len - 1)
-                # Exclude pad tokens from answer range
                 n_image_tokens = (single_ids[0] == image_token_id).sum().item()
+                # Both LLaVA adapter modes return text-only logits, so image placeholders are excluded.
+                s_start = max(0, text_prompt_len - 1)
                 actual_len = int(attention_mask[i].sum().item()) - n_image_tokens
-                s_end = min(s_start + args.max_answer_tokens, actual_len)
+                s_end = min(s_start + args.max_answer_tokens, actual_len, student_logits.shape[1])
                 s_answer = student_logits[0, s_start:s_end]
 
                 # Teacher: full sequence with image tokens expanded
@@ -1170,8 +1264,6 @@ def run_qwen(args: argparse.Namespace) -> None:
     adapter = QwenVisualDeltaAdapter.from_language_model(
         language_model,
         mode=args.output_mode,
-        reader_mlp_ratio=args.reader_mlp_ratio,
-        reader_activation=args.reader_activation,
         visual_adapter_rank=args.visual_adapter_rank,
     ).to(device=device, dtype=dtype)
     if args.init_checkpoint:
@@ -1283,6 +1375,7 @@ def run_qwen(args: argparse.Namespace) -> None:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 print(
                     f"step={global_step} loss={float(payload['loss']):.6f} "
+                    f"ce={float(payload.get('ce', 0.0)):.6f} "
                     f"logit_kl={float(payload['logit_kl']):.6f} trajectory={float(payload['trajectory']):.6f} "
                     f"kv_mse={float(payload['kv_mse']):.6f} visual_mass={float(payload['visual_mass']):.6f} "
                     f"lr={float(payload['lr']):.3e} global_batch={payload['global_batch']}",
@@ -1314,6 +1407,10 @@ def run_qwen(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     if args.model_kind == "qwen":
+        if args.output_mode is None:
+            args.output_mode = "native_visual_kv_injection"
+        if args.output_mode not in QWEN_VISUAL_DELTA_MODES:
+            raise ValueError(f"Qwen only supports output_mode in {QWEN_VISUAL_DELTA_MODES}, got {args.output_mode!r}")
         if args.lr_scheduler is None:
             args.lr_scheduler = "constant"
         if args.warmup_ratio is None:
@@ -1324,6 +1421,10 @@ def main() -> None:
         args.lr_scheduler = "cosine"
     if args.warmup_ratio is None:
         args.warmup_ratio = 0.2
+    if args.output_mode is None:
+        args.output_mode = "adapter_only"
+    if args.output_mode not in LLAVA_OUTPUT_MODES:
+        raise ValueError(f"LLaVA only supports output_mode in {LLAVA_OUTPUT_MODES}, got {args.output_mode!r}")
     if not args.init_checkpoint:
         args.init_checkpoint = None
     run_llava(args)

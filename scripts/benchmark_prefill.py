@@ -187,6 +187,8 @@ def run_llava(args: argparse.Namespace) -> None:
         extract_vision_kv,
         load_adapter_checkpoint,
         load_frozen_llava,
+        llava_projected_image_features,
+        student_forward_llava_injection,
         student_forward_with_visual_kv,
     )
 
@@ -209,39 +211,77 @@ def run_llava(args: argparse.Namespace) -> None:
     checkpoint_label_value = "random"
     if checkpoint_specs:
         checkpoint_label_value, checkpoint = checkpoint_specs[0]
-        adapter, _, _ = load_adapter_checkpoint(checkpoint, device, language_model=model.model.language_model)
+        adapter, _, metadata = load_adapter_checkpoint(checkpoint, device, language_model=model.model.language_model, dtype=dtype)
     else:
         raise ValueError("LLaVA benchmark requires --checkpoint")
+    output_mode = args.output_mode or str(metadata.get("output_mode") or "adapter_only")
+    if output_mode not in ("adapter_only", "native_visual_kv_injection"):
+        raise ValueError(f"LLaVA benchmark only supports adapter_only/native_visual_kv_injection, got {output_mode!r}")
 
+    attention_mask = inputs.get("attention_mask", None)
     with torch.inference_mode():
-        source_k, source_v = extract_vision_kv(model, inputs.pixel_values, [22, 23])
+        if output_mode == "native_visual_kv_injection":
+            visual_memory = llava_projected_image_features(model, inputs.pixel_values)
+            source_k = source_v = None
+        else:
+            source_k, source_v = extract_vision_kv(model, inputs.pixel_values, [22, 23])
+            visual_memory = None
 
-    teacher_fn = maybe_compile(
-        lambda: model(input_ids=inputs.input_ids, pixel_values=inputs.pixel_values).logits,
-        args,
-        enabled=bool(args.compile_teacher),
-    )
-    e2e_fn = maybe_compile(
-        lambda: student_forward_with_visual_kv(
+    def adapter_forward_with_extraction() -> torch.Tensor:
+        if output_mode == "native_visual_kv_injection":
+            return student_forward_llava_injection(
+                model,
+                inputs.input_ids,
+                inputs.pixel_values,
+                adapter,
+                image_token_id,
+                attention_mask=attention_mask,
+            )
+        next_source_k, next_source_v = extract_vision_kv(model, inputs.pixel_values, [22, 23])
+        return student_forward_with_visual_kv(
             model,
             inputs.input_ids,
             adapter,
-            *extract_vision_kv(model, inputs.pixel_values, [22, 23]),
+            next_source_k,
+            next_source_v,
             image_token_id,
-        ),
+            attention_mask=attention_mask,
+        )
+
+    def adapter_forward_cached() -> torch.Tensor:
+        if output_mode == "native_visual_kv_injection":
+            return student_forward_llava_injection(
+                model,
+                inputs.input_ids,
+                inputs.pixel_values,
+                adapter,
+                image_token_id,
+                attention_mask=attention_mask,
+                visual_memory=visual_memory,
+            )
+        assert source_k is not None and source_v is not None
+        return student_forward_with_visual_kv(
+            model,
+            inputs.input_ids,
+            adapter,
+            source_k,
+            source_v,
+            image_token_id,
+            attention_mask=attention_mask,
+        )
+
+    teacher_fn = maybe_compile(
+        lambda: model(input_ids=inputs.input_ids, pixel_values=inputs.pixel_values, attention_mask=attention_mask).logits,
         args,
-        enabled=bool(args.compile),
+        enabled=bool(args.compile_teacher),
     )
-    cached_fn = maybe_compile(
-        lambda: student_forward_with_visual_kv(model, inputs.input_ids, adapter, source_k, source_v, image_token_id),
-        args,
-        enabled=bool(args.compile),
-    )
+    e2e_fn = maybe_compile(adapter_forward_with_extraction, args, enabled=bool(args.compile))
+    cached_fn = maybe_compile(adapter_forward_cached, args, enabled=bool(args.compile))
     teacher_s = benchmark(teacher_fn, warmup=args.warmup, n_runs=args.n_runs)
     e2e_s = benchmark(e2e_fn, warmup=args.warmup, n_runs=args.n_runs)
     cached_s = benchmark(cached_fn, warmup=args.warmup, n_runs=args.n_runs)
 
-    n_vis = int(source_k.shape[2])
+    n_vis = int(visual_memory.shape[1]) if visual_memory is not None else int(source_k.shape[2])
     n_text = int((inputs.input_ids[0] != image_token_id).sum().item())
     rows = [
         {
@@ -256,6 +296,7 @@ def run_llava(args: argparse.Namespace) -> None:
         {
             "kind": "adapter",
             "name": checkpoint_label_value,
+            "mode": output_mode,
             "e2e_s": e2e_s,
             "e2e_ms": e2e_s * 1000.0,
             "e2e_speedup_vs_teacher": teacher_s / e2e_s,
@@ -266,7 +307,7 @@ def run_llava(args: argparse.Namespace) -> None:
     ]
     print()
     print(f"=== LLaVA Prefill Benchmark ({args.n_runs} runs) ===")
-    print(f"visual_tokens={n_vis} text_tokens={n_text}")
+    print(f"visual_tokens={n_vis} text_tokens={n_text} output_mode={output_mode}")
     print(f"base_teacher_full={fmt_ms(teacher_s)} ms")
     print(f"{checkpoint_label_value} e2e={fmt_ms(e2e_s)} ms ({fmt_speedup(teacher_s, e2e_s)})")
     print(f"{checkpoint_label_value} cached={fmt_ms(cached_s)} ms ({fmt_speedup(teacher_s, cached_s)})")
@@ -299,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
+    parser.add_argument("--output-mode", choices=("adapter_only", "native_visual_kv_injection"), default=None)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,

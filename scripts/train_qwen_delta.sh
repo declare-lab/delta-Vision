@@ -12,6 +12,7 @@ RUN_NAME=${RUN_NAME:-qwen_visual_delta_$(date +%Y%m%d_%H%M%S)}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/qwen_topk1024_freezeqkv/$RUN_NAME/checkpoints}
 LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
 METRICS_JSONL=${METRICS_JSONL:-$OUTPUT_DIR/train_metrics.jsonl}
+INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
 
 MODEL_PATH=${MODEL_PATH:-models/Qwen3-VL-4B-Instruct}
 DATA=${DATA:-artifacts/data_quality/pixmo_ama_full_valid.clean.jsonl}
@@ -47,22 +48,20 @@ LR_SCHEDULER=${LR_SCHEDULER:-constant}
 WARMUP_RATIO=${WARMUP_RATIO:-0.0}
 WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
-LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-sample}
+LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-token}
 SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
 LAMBDA_LOGIT=${LAMBDA_LOGIT:-4.0}
 if [[ "$SUPERVISION_LOSS" == "opd" ]]; then
-  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.0}
+  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-1.0}
   KL_TOPK=${KL_TOPK:-1024}
 else
-  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
+  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-1.0}
   KL_TOPK=${KL_TOPK:-1024}
 fi
 LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
 OPD_ROLLOUT_MAX_NEW_TOKENS=${OPD_ROLLOUT_MAX_NEW_TOKENS:-32}
-OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_split}
+OUTPUT_MODE=${OUTPUT_MODE:-native_visual_kv_injection}
 VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
-READER_MLP_RATIO=${READER_MLP_RATIO:-4.0}
-READER_ACTIVATION=${READER_ACTIVATION:-situ_glu}
 
 export CUDA_VISIBLE_DEVICES
 if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
@@ -96,13 +95,14 @@ echo "data_root=$DATA_ROOT"
 echo "run_name=$RUN_NAME"
 echo "output_dir=$OUTPUT_DIR"
 echo "metrics=$METRICS_JSONL"
+echo "init_checkpoint=${INIT_CHECKPOINT:-none}"
 echo "pixel_area_cache=$PIXEL_AREA_CACHE"
 echo "log=$LOG_FILE"
 echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
 echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
 echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
 echo "lambda_logit=$LAMBDA_LOGIT lambda_trajectory=$LAMBDA_TRAJECTORY lambda_kv_mse=$LAMBDA_KV_MSE opd_rollout_max_new_tokens=$OPD_ROLLOUT_MAX_NEW_TOKENS"
-echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK reader_mlp_ratio=$READER_MLP_RATIO reader_activation=$READER_ACTIVATION"
+echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
 
 CMD=(
   "$PY" -m torch.distributed.run
@@ -115,6 +115,7 @@ CMD=(
   --model-path "$MODEL_PATH" \
   --output-dir "$OUTPUT_DIR" \
   --metrics-jsonl "$METRICS_JSONL" \
+  --init-checkpoint "$INIT_CHECKPOINT" \
   --max-steps "$MAX_STEPS" --save-every "$SAVE_EVERY" \
   --required-world-size "$REQUIRED_WORLD_SIZE" \
   --micro-batch-size-per-gpu "$MICRO_BATCH_SIZE_PER_GPU" --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS" \
@@ -130,7 +131,6 @@ CMD=(
   --opd-rollout-max-new-tokens "$OPD_ROLLOUT_MAX_NEW_TOKENS" \
   --output-mode "$OUTPUT_MODE" \
   --visual-adapter-rank "$VISUAL_ADAPTER_RANK" \
-  --reader-mlp-ratio "$READER_MLP_RATIO" --reader-activation "$READER_ACTIVATION" \
   --batch-sampling pixel_bucket \
   --pixel-bucket-size 512 \
   --pixel-area-cache "$PIXEL_AREA_CACHE" \

@@ -254,12 +254,10 @@ class QwenBenchmarkDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
-        image_path = Path(str(row["image"]))
-        if not image_path.is_absolute():
-            image_path = self.data_root / image_path
+        image_paths = self._image_paths(row)
 
         question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
-        cache_path = self._cache_path(row, image_path, question)
+        cache_path = self._cache_path(row, image_paths, question)
         if cache_path is not None and cache_path.exists():
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
             item = cached["item"]
@@ -270,18 +268,18 @@ class QwenBenchmarkDataset(Dataset):
             item["index"] = row.get("index", idx)
             return item
 
-        image = Image.open(image_path).convert("RGB")
+        images = [Image.open(path).convert("RGB") for path in image_paths]
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": question},
-                ],
+                "content": [{"type": "image", "image": image} for image in images]
+                + [{"type": "text", "text": question}],
             }
         ]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=[text], images=[image], return_tensors="pt", padding=True)
+        inputs = self.processor(text=[text], images=images, return_tensors="pt", padding=True)
+        for image in images:
+            image.close()
         if "mm_token_type_ids" not in inputs:
             raise ValueError("Qwen processor did not return mm_token_type_ids; M-RoPE positions would be invalid")
 
@@ -304,16 +302,41 @@ class QwenBenchmarkDataset(Dataset):
             os.replace(tmp_path, cache_path)
         return item
 
-    def _cache_path(self, row: dict, image_path: Path, question: str) -> Path | None:
+    def _image_paths(self, row: dict) -> list[Path]:
+        raw_paths = row.get("images")
+        if raw_paths is None:
+            raw_paths = [row["image"]]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise ValueError("Qwen benchmark row must contain image or non-empty images")
+        root = self.data_root
+        row_root = str(row.get("image_root") or "").strip()
+        if row_root:
+            root = Path(row_root)
+        image_paths = []
+        for raw_path in raw_paths:
+            image_path = Path(str(raw_path))
+            if not image_path.is_absolute():
+                image_path = root / image_path
+            image_paths.append(image_path)
+        return image_paths
+
+    def _cache_path(self, row: dict, image_paths: list[Path], question: str) -> Path | None:
         if self.cache_dir is None:
             return None
-        stat = image_path.stat()
+        image_stats = []
+        for image_path in image_paths:
+            stat = image_path.stat()
+            image_stats.append(
+                {
+                    "image": str(image_path),
+                    "image_size": int(stat.st_size),
+                    "image_mtime_ns": int(stat.st_mtime_ns),
+                }
+            )
         key = {
             "benchmark": self.spec.name,
             "processor": str(getattr(self.processor, "name_or_path", "")),
-            "image": str(image_path),
-            "image_size": int(stat.st_size),
-            "image_mtime_ns": int(stat.st_mtime_ns),
+            "images": image_stats,
             "question": question,
             "answer_instruction": self.answer_instruction,
             "index": row.get("index"),

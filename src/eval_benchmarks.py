@@ -33,6 +33,7 @@ from src.model import (
     load_frozen_llava,
     load_adapter_checkpoint,
     PerLayerKVAdapter,
+    student_forward_llava_injection,
     student_forward_with_visual_kv,
     teacher_forward,
     dtype_from_name,
@@ -162,12 +163,14 @@ def generate_teacher_llava(
 def generate_adapter_llava(
     model,
     processor,
-    adapter: PerLayerKVAdapter,
+    adapter: torch.nn.Module,
     input_ids: torch.Tensor,
-    source_k: torch.Tensor,
-    source_v: torch.Tensor,
+    pixel_values: torch.Tensor,
+    source_k: torch.Tensor | None,
+    source_v: torch.Tensor | None,
     image_token_id: int,
     attention_mask: torch.Tensor,
+    output_mode: str = "adapter_only",
     max_new_tokens: int = 8,
 ) -> tuple[str | None, str]:
     full_ids = input_ids.clone()
@@ -176,16 +179,29 @@ def generate_adapter_llava(
     eos_ids = _eos_token_ids(processor.tokenizer)
 
     for _ in range(max_new_tokens):
-        logits = student_forward_with_visual_kv(
-            model,
-            full_ids,
-            adapter,
-            source_k,
-            source_v,
-            image_token_id,
-            attention_mask=full_mask,
-        )
-        next_token = int(torch.argmax(logits[0, -1]).item())
+        if output_mode == "native_visual_kv_injection":
+            logits = student_forward_llava_injection(
+                model,
+                full_ids,
+                pixel_values,
+                adapter,
+                image_token_id,
+                attention_mask=full_mask,
+            )
+            next_logits = logits[0, -1]
+        else:
+            assert source_k is not None and source_v is not None
+            logits = student_forward_with_visual_kv(
+                model,
+                full_ids,
+                adapter,
+                source_k,
+                source_v,
+                image_token_id,
+                attention_mask=full_mask,
+            )
+            next_logits = logits[0, -1]
+        next_token = int(torch.argmax(next_logits).item())
         generated.append(next_token)
         token_tensor = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
         full_ids = torch.cat([full_ids, token_tensor], dim=1)
@@ -197,22 +213,22 @@ def generate_adapter_llava(
     return extract_option_from_text(text), text
 
 
-def load_adapter(checkpoint_path: str, model, device: torch.device) -> tuple[PerLayerKVAdapter, list[int]]:
+def load_adapter(checkpoint_path: str, model, device: torch.device) -> tuple[torch.nn.Module, list[int], str]:
     """Load trained adapter from checkpoint."""
-    adapter, source_layers, _ = load_adapter_checkpoint(
+    adapter, source_layers, metadata = load_adapter_checkpoint(
         checkpoint_path,
         device=device,
         language_model=model.model.language_model,
         dtype=torch.bfloat16,
     )
-    return adapter, source_layers
+    return adapter, source_layers, str(metadata.get("output_mode") or "adapter_only")
 
 
 @torch.inference_mode()
 def evaluate_llava_shard(
     model,
     processor,
-    adapter: PerLayerKVAdapter,
+    adapter: torch.nn.Module,
     dataset: MMStarDataset,
     device: torch.device,
     image_token_id: int,
@@ -220,6 +236,7 @@ def evaluate_llava_shard(
     log_every: int = 25,
     max_new_tokens: int = 8,
     eval_mode: str = "generate",
+    output_mode: str = "adapter_only",
 ) -> dict:
     """Evaluate adapter on a shard of MMStar."""
     option_ids = get_option_token_ids(processor.tokenizer)
@@ -245,16 +262,31 @@ def evaluate_llava_shard(
             image_sizes = image_sizes.unsqueeze(0).to(device) if torch.is_tensor(image_sizes) else image_sizes
         gold = item["gold"]
 
-        source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
+        if output_mode == "native_visual_kv_injection":
+            source_k = source_v = None
+        else:
+            source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
         if eval_mode == "logits":
             teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
             full_last_idx = int(attention_mask[0].sum().item()) - 1
             teacher_last = teacher_logits[0, full_last_idx]
 
-            student_logits = student_forward_with_visual_kv(
-                model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
-            )
-            student_last = student_logits[0, -1]
+            if output_mode == "native_visual_kv_injection":
+                student_logits = student_forward_llava_injection(
+                    model,
+                    input_ids,
+                    pixel_values,
+                    adapter,
+                    image_token_id,
+                    attention_mask=attention_mask,
+                )
+                student_last = student_logits[0, -1]
+            else:
+                assert source_k is not None and source_v is not None
+                student_logits = student_forward_with_visual_kv(
+                    model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
+                )
+                student_last = student_logits[0, -1]
 
             teacher_pred = predict_option(teacher_last, option_ids)
             adapter_pred = predict_option(student_last, option_ids)
@@ -275,10 +307,12 @@ def evaluate_llava_shard(
                 processor,
                 adapter,
                 input_ids,
+                pixel_values,
                 source_k,
                 source_v,
                 image_token_id,
                 attention_mask,
+                output_mode=output_mode,
                 max_new_tokens=max_new_tokens,
             )
         else:
@@ -305,7 +339,7 @@ def evaluate_llava_shard(
             acc = stats["adapter_correct"] / stats["scored"]
             print(f"[{idx+1}/{len(dataset)}] adapter_acc={acc:.4f}", flush=True)
 
-    return {"stats": stats, "predictions": predictions}
+    return {"stats": stats, "predictions": predictions, "output_mode": output_mode}
 
 
 def parse_args() -> argparse.Namespace:
@@ -323,6 +357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--eval-mode", choices=("generate", "logits"), default="generate")
+    parser.add_argument("--output-mode", choices=("adapter_only", "native_visual_kv_injection"), default=None)
     parser.add_argument("--answer-instruction", default=None)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
@@ -347,7 +382,8 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
     """Run evaluation on a single shard (one GPU)."""
     device = torch.device("cuda:0")
     processor, model = load_frozen_llava(args.model_path, dtype=torch.bfloat16, device="cuda:0")
-    adapter, source_layers = load_adapter(args.checkpoint, model, device)
+    adapter, source_layers, checkpoint_mode = load_adapter(args.checkpoint, model, device)
+    output_mode = args.output_mode or checkpoint_mode
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
 
     full_dataset = MMStarDataset(
@@ -363,7 +399,7 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
     end = min(start + per_shard, total)
 
     full_dataset.rows = full_dataset.rows[start:end]
-    print(f"Shard {shard_id}: samples [{start}, {end}) = {len(full_dataset)} items", flush=True)
+    print(f"Shard {shard_id}: samples [{start}, {end}) = {len(full_dataset)} items; output_mode={output_mode}", flush=True)
 
     result = evaluate_llava_shard(
         model,
@@ -376,6 +412,7 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
         args.log_every,
         args.max_new_tokens,
         args.eval_mode,
+        output_mode,
     )
 
     out_path = Path(args.output_dir) / f"shard_{shard_id}.json"
@@ -719,6 +756,7 @@ def _teacher_cache_row_keys(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             "index": row.get("index", idx),
             "image": row.get("image"),
+            "images": row.get("images"),
             "question": row.get("question"),
             "answer": row.get("answer"),
         }
