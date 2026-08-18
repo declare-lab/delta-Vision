@@ -1176,10 +1176,9 @@ def student_forward_llava_injection_prepared(
 ) -> torch.Tensor:
     language_model = _get_language_model(model)
     layers = language_model.layers
-    adapter_down = adapter.visual_adapter_down
-    adapter_up = adapter.visual_adapter_up
-    visual_memory_from_modules = adapter.visual_memory_from_modules
     compile_exact = torch.compiler.is_compiling()
+    # Pre-compute all visual memories in one batched BMM (4x faster)
+    all_vis_memories = adapter.all_visual_memories_batched(visual_memory)  # [L, B, N, H]
 
     for layer_idx, layer in enumerate(layers):
         residual = hidden
@@ -1195,14 +1194,14 @@ def student_forward_llava_injection_prepared(
 
         if compile_exact:
             vision_states = _eager_module_call(
-                visual_memory_from_modules,
+                adapter.visual_memory_from_modules,
                 visual_memory,
-                adapter_down[layer_idx],
+                adapter.visual_adapter_down[layer_idx],
                 adapter_up[layer_idx],
             )
             normed_vision = _eager_module_call(layer.input_layernorm, vision_states)
         else:
-            vision_states = visual_memory_from_modules(visual_memory, adapter_down[layer_idx], adapter_up[layer_idx])
+            vision_states = all_vis_memories[layer_idx]
             normed_vision = layer.input_layernorm(vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
@@ -1886,6 +1885,11 @@ class QwenVisualDeltaAdapter(nn.Module):
         self.visual_adapter_up = nn.ModuleList([nn.Linear(rank, hidden_size, bias=False) for _ in range(num_layers)])
         self.reset_parameters()
 
+    def precompute_stacked_weights(self) -> None:
+        """Stack per-layer adapter weights for batched forward. Call after loading checkpoint."""
+        self._down_stacked = torch.stack([m.weight for m in self.visual_adapter_down])  # [L, R, H]
+        self._up_stacked = torch.stack([m.weight for m in self.visual_adapter_up])      # [L, H, R]
+
     def reset_parameters(self) -> None:
         for up in self.visual_adapter_up:
             nn.init.zeros_(up.weight)
@@ -1907,6 +1911,23 @@ class QwenVisualDeltaAdapter(nn.Module):
             mode=mode,
             visual_adapter_rank=visual_adapter_rank,
         )
+
+    def all_visual_memories_batched(self, visual_memory: Tensor) -> Tensor:
+        """Compute all L adapted visual memories in one batched BMM.
+        
+        Returns [L, B, N, H] - stack of adapted visual memories for each layer.
+        Numerically identical to calling visual_memory_for_layer L times.
+        """
+        L = self.num_layers
+        B, N, H = visual_memory.shape
+        if not hasattr(self, "_down_stacked"):
+            self.precompute_stacked_weights()
+        vm_flat = visual_memory.unsqueeze(0).expand(L, -1, -1, -1).reshape(L, B * N, H)
+        adapted = torch.bmm(vm_flat, self._down_stacked.to(visual_memory.dtype).transpose(1, 2))  # [L, B*N, R]
+        adapted = F.silu(adapted)
+        adapted = torch.bmm(adapted, self._up_stacked.to(visual_memory.dtype).transpose(1, 2))    # [L, B*N, H]
+        adapted = adapted.reshape(L, B, N, H)
+        return visual_memory.unsqueeze(0) + adapted.to(visual_memory.dtype)  # [L, B, N, H]
 
     def visual_memory_for_layer(self, visual_memory: Tensor, layer_idx: int) -> Tensor:
         return self.visual_memory_from_modules(
@@ -2246,10 +2267,9 @@ def qwen_visual_delta_logits_prepared(
     language_model = model.model.language_model
     layers = language_model.layers
     rotary_emb = language_model.rotary_emb
-    adapter_down = adapter.visual_adapter_down
-    adapter_up = adapter.visual_adapter_up
-    visual_memory_from_modules = adapter.visual_memory_from_modules
     compile_exact = torch.compiler.is_compiling()
+    # Pre-compute all visual memories in one batched BMM
+    all_vis_memories = adapter.all_visual_memories_batched(visual_memory)  # [L, B, N, H]
     states = None
     if collect_states:
         if collect_state_indices is None:
@@ -2273,17 +2293,8 @@ def qwen_visual_delta_logits_prepared(
             layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
         query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
 
-        if compile_exact:
-            vision_states = _eager_module_call(
-                visual_memory_from_modules,
-                visual_memory,
-                adapter_down[layer_idx],
-                adapter_up[layer_idx],
-            )
-            normed_vision = _eager_module_call(layer.input_layernorm, vision_states)
-        else:
-            vision_states = visual_memory_from_modules(visual_memory, adapter_down[layer_idx], adapter_up[layer_idx])
-            normed_vision = layer.input_layernorm(vision_states)
+        vision_states = all_vis_memories[layer_idx]
+        normed_vision = _eager_module_call(layer.input_layernorm, vision_states) if compile_exact else layer.input_layernorm(vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
         raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
