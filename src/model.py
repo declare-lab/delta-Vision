@@ -13,9 +13,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import AutoProcessor, AutoModelForImageTextToText, LlavaForConditionalGeneration, Qwen3VLForConditionalGeneration
+from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as llama_apply_rotary_pos_emb, repeat_kv as llama_repeat_kv
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb as qwen_apply_rotary_pos_emb, repeat_kv as qwen_repeat_kv
+from transformers.vision_utils import (
+    get_vision_attention_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 
 class PerLayerKVAdapter(nn.Module):
@@ -131,6 +137,45 @@ class PerLayerKVAdapter(nn.Module):
             key: [B, N_vis, num_heads, head_dim]
             value: [B, N_vis, num_heads, head_dim]
         """
+        return self.forward_layer_from_modules(
+            source_k,
+            source_v,
+            source_mix=self.source_mix[layer_idx],
+            gate_logit=self.gates[layer_idx],
+            k_proj=None if self.k_projs is None else self.k_projs[layer_idx],
+            v_proj=None if self.v_projs is None else self.v_projs[layer_idx],
+            k_down=None if self.k_down is None else self.k_down[layer_idx],
+            k_up=None if self.k_up is None else self.k_up[layer_idx],
+            v_down=None if self.v_down is None else self.v_down[layer_idx],
+            v_up=None if self.v_up is None else self.v_up[layer_idx],
+            k_gate=None if getattr(self, "k_gate", None) is None else self.k_gate[layer_idx],
+            k_up_mlp=None if getattr(self, "k_up_mlp", None) is None else self.k_up_mlp[layer_idx],
+            k_down_mlp=None if getattr(self, "k_down_mlp", None) is None else self.k_down_mlp[layer_idx],
+            v_gate=None if getattr(self, "v_gate", None) is None else self.v_gate[layer_idx],
+            v_up_mlp=None if getattr(self, "v_up_mlp", None) is None else self.v_up_mlp[layer_idx],
+            v_down_mlp=None if getattr(self, "v_down_mlp", None) is None else self.v_down_mlp[layer_idx],
+        )
+
+    def forward_layer_from_modules(
+        self,
+        source_k: torch.Tensor,
+        source_v: torch.Tensor,
+        *,
+        source_mix: torch.Tensor,
+        gate_logit: torch.Tensor,
+        k_proj: nn.Module | None,
+        v_proj: nn.Module | None,
+        k_down: nn.Module | None,
+        k_up: nn.Module | None,
+        v_down: nn.Module | None,
+        v_up: nn.Module | None,
+        k_gate: nn.Module | None,
+        k_up_mlp: nn.Module | None,
+        k_down_mlp: nn.Module | None,
+        v_gate: nn.Module | None,
+        v_up_mlp: nn.Module | None,
+        v_down_mlp: nn.Module | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.concat_source:
             # Concat mode: [B, num_source, N_vis, D] -> [B, N_vis, num_source*D]
             B, S, N, D = source_k.shape
@@ -138,27 +183,33 @@ class PerLayerKVAdapter(nn.Module):
             mixed_v = source_v.permute(0, 2, 1, 3).reshape(B, N, S * D)
         else:
             # Weighted sum mode
-            weights = F.softmax(self.source_mix[layer_idx].float(), dim=-1)
+            weights = F.softmax(source_mix.float(), dim=-1)
             weights = weights.to(source_k.dtype)
             mixed_k = torch.einsum("s,bsnd->bnd", weights, source_k)
             mixed_v = torch.einsum("s,bsnd->bnd", weights, source_v)
 
         B, N, _ = mixed_k.shape
-        gate = torch.sigmoid(self.gates[layer_idx])
+        gate = torch.sigmoid(gate_logit)
 
-        if self.k_projs is not None:
-            key = self.k_projs[layer_idx](mixed_k)
-            value = self.v_projs[layer_idx](mixed_v)
+        if k_proj is not None:
+            if v_proj is None:
+                raise RuntimeError("v_proj is required when k_proj is set")
+            key = k_proj(mixed_k)
+            value = v_proj(mixed_v)
             if self.use_activation:
                 key = F.silu(key)
                 value = F.silu(value)
-        elif self.expansion_dim > 0:
+        elif k_down_mlp is not None:
             # SwiGLU: silu(gate(x)) * up(x), then down proj
-            key = self.k_down_mlp[layer_idx](F.silu(self.k_gate[layer_idx](mixed_k)) * self.k_up_mlp[layer_idx](mixed_k))
-            value = self.v_down_mlp[layer_idx](F.silu(self.v_gate[layer_idx](mixed_v)) * self.v_up_mlp[layer_idx](mixed_v))
+            if k_gate is None or k_up_mlp is None or v_gate is None or v_up_mlp is None or v_down_mlp is None:
+                raise RuntimeError("SwiGLU adapter modules are incomplete")
+            key = k_down_mlp(F.silu(k_gate(mixed_k)) * k_up_mlp(mixed_k))
+            value = v_down_mlp(F.silu(v_gate(mixed_v)) * v_up_mlp(mixed_v))
         else:
-            key = self.k_up[layer_idx](F.silu(self.k_down[layer_idx](mixed_k)))
-            value = self.v_up[layer_idx](F.silu(self.v_down[layer_idx](mixed_v)))
+            if k_down is None or k_up is None or v_down is None or v_up is None:
+                raise RuntimeError("bottleneck adapter modules are incomplete")
+            key = k_up(F.silu(k_down(mixed_k)))
+            value = v_up(F.silu(v_down(mixed_v)))
 
         key = key.view(B, N, self.num_heads, self.head_dim) * gate
         value = value.view(B, N, self.num_heads, self.head_dim) * gate
@@ -403,6 +454,472 @@ def _apply_rope(
     return rotated
 
 
+@torch.compiler.disable
+def _eager_llama_apply_rope_pair_from_embeddings(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return llama_apply_rotary_pos_emb(query, key, *position_embeddings)
+
+
+def _rotate_half(x: Tensor) -> Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+@torch.compiler.disable
+def _eager_apply_rope_one_from_embeddings(
+    states: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+) -> Tensor:
+    cos, sin = position_embeddings
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rotated = states * cos
+    rotated.add_(_rotate_half(states) * sin)
+    return rotated
+
+
+def _apply_rope_one_from_embeddings(
+    states: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+) -> Tensor:
+    if torch.compiler.is_compiling():
+        return _eager_apply_rope_one_from_embeddings(states, position_embeddings)
+    cos, sin = position_embeddings
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rotated = states * cos
+    rotated.add_(_rotate_half(states) * sin)
+    return rotated
+
+
+def _apply_rope_pair_from_embeddings(
+    query: Tensor,
+    key: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+) -> tuple[Tensor, Tensor]:
+    if torch.compiler.is_compiling():
+        return _eager_llama_apply_rope_pair_from_embeddings(query, key, position_embeddings)
+    return llama_apply_rotary_pos_emb(query, key, *position_embeddings)
+
+
+@torch.compiler.disable
+def _eager_qwen_apply_rotary_pos_emb(
+    query: Tensor,
+    key: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> tuple[Tensor, Tensor]:
+    return qwen_apply_rotary_pos_emb(query, key, cos, sin)
+
+
+def _compile_exact_qwen_apply_rotary_pos_emb(
+    query: Tensor,
+    key: Tensor,
+    position_embeddings: tuple[Tensor, Tensor],
+) -> tuple[Tensor, Tensor]:
+    if torch.compiler.is_compiling():
+        return _eager_qwen_apply_rotary_pos_emb(query, key, *position_embeddings)
+    return qwen_apply_rotary_pos_emb(query, key, *position_embeddings)
+
+
+@torch.compiler.disable
+def _eager_module_call(module: Any, *args: Any, **kwargs: Any) -> Any:
+    return module(*args, **kwargs)
+
+
+def _compile_exact_module_call(module: Any, *args: Any, **kwargs: Any) -> Any:
+    if torch.compiler.is_compiling():
+        return _eager_module_call(module, *args, **kwargs)
+    return module(*args, **kwargs)
+
+
+@torch.compiler.disable
+def _eager_prefix_causal_attention_heads(
+    query: Tensor,
+    visual_key: Tensor,
+    visual_value: Tensor,
+    text_key: Tensor,
+    text_value: Tensor,
+    *,
+    scaling: float | None,
+    attention_mask: Tensor,
+) -> Tensor:
+    key = torch.cat([visual_key, text_key], dim=2)
+    value = torch.cat([visual_value, text_value], dim=2)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scaling,
+        enable_gqa=query.shape[1] != key.shape[1],
+    ).transpose(1, 2).contiguous()
+
+
+def _prefix_causal_attention_heads(
+    query: Tensor,
+    visual_key: Tensor,
+    visual_value: Tensor,
+    text_key: Tensor,
+    text_value: Tensor,
+    *,
+    scaling: float | None,
+    attention_mask: Tensor,
+) -> Tensor:
+    if torch.compiler.is_compiling():
+        return _eager_prefix_causal_attention_heads(
+            query,
+            visual_key,
+            visual_value,
+            text_key,
+            text_value,
+            scaling=scaling,
+            attention_mask=attention_mask,
+        )
+    key = torch.cat([visual_key, text_key], dim=2)
+    value = torch.cat([visual_value, text_value], dim=2)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scaling,
+        enable_gqa=query.shape[1] != key.shape[1],
+    ).transpose(1, 2).contiguous()
+
+
+def _hf_sdpa_prefix_causal_attention_heads(
+    module: nn.Module,
+    query: Tensor,
+    visual_key: Tensor,
+    visual_value: Tensor,
+    text_key: Tensor,
+    text_value: Tensor,
+    *,
+    scaling: float | None,
+    attention_mask: Tensor,
+) -> Tensor:
+    key = torch.cat([visual_key, text_key], dim=2)
+    value = torch.cat([visual_value, text_value], dim=2)
+    attn_output, _ = hf_sdpa_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        dropout=0.0,
+        scaling=scaling,
+        is_causal=False,
+    )
+    return attn_output.contiguous()
+
+
+def prepare_llava_adapter_only_inputs(
+    model: LlavaForConditionalGeneration,
+    input_ids: torch.Tensor,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    valid_mask = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(input_ids[0], dtype=torch.bool)
+    text_mask = (input_ids[0] != image_token_id) & valid_mask
+    image_mask = (input_ids[0] == image_token_id) & valid_mask
+    text_ids = input_ids[:, text_mask]
+
+    language_model = _get_language_model(model)
+    text_embeds = language_model.embed_tokens(text_ids)
+
+    layers = language_model.layers
+    norm = language_model.norm
+    rotary_emb = language_model.rotary_emb
+
+    B, T, _ = text_embeds.shape
+    N_vis = source_k.shape[2]
+    device = text_embeds.device
+    dtype = text_embeds.dtype
+    source_k = source_k.to(device=device, dtype=dtype)
+    source_v = source_v.to(device=device, dtype=dtype)
+
+    text_positions = torch.where(text_mask)[0].to(device)
+    image_positions = torch.where(image_mask)[0].to(device)
+    text_position_ids = text_positions.unsqueeze(0).expand(B, -1)
+    if image_positions.numel() == N_vis:
+        image_position_ids = image_positions.unsqueeze(0).expand(B, -1)
+    elif image_positions.numel() > 0:
+        start_pos = int(image_positions[0].item())
+        image_position_ids = torch.arange(start_pos, start_pos + N_vis, device=device).unsqueeze(0).expand(B, -1)
+    else:
+        image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0).expand(B, -1)
+
+    text_position_embeddings = rotary_emb(text_embeds, text_position_ids)
+    image_position_embeddings = rotary_emb(text_embeds, image_position_ids)
+    attn_mask = _llava_prefix_attention_mask(text_position_ids, image_position_ids, dtype=dtype)
+    return {
+        "hidden": text_embeds,
+        "source_k": source_k,
+        "source_v": source_v,
+        "text_position_ids": text_position_ids,
+        "image_position_ids": image_position_ids,
+        "text_position_embeddings": text_position_embeddings,
+        "image_position_embeddings": image_position_embeddings,
+        "attn_mask": attn_mask,
+    }
+
+
+def student_forward_with_visual_kv_prepared(
+    model: LlavaForConditionalGeneration,
+    adapter: PerLayerKVAdapter,
+    *,
+    hidden: torch.Tensor,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    text_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    image_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attn_mask: torch.Tensor,
+    text_position_ids: torch.Tensor | None = None,
+    image_position_ids: torch.Tensor | None = None,
+    use_hf_attention: bool = False,
+) -> torch.Tensor:
+    language_model = _get_language_model(model)
+    layers = language_model.layers
+    norm = language_model.norm
+    adapter_forward_layer = adapter.forward_layer_from_modules
+    compile_exact = torch.compiler.is_compiling()
+
+    for layer_idx, layer in enumerate(layers):
+        residual = hidden
+        normed = _eager_module_call(layer.input_layernorm, hidden) if compile_exact else layer.input_layernorm(hidden)
+        attn = layer.self_attn
+
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+
+        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+
+        q, text_k = _apply_rope_pair_from_embeddings(q, text_k, text_position_embeddings)
+
+        vis_k, vis_v = adapter_forward_layer(
+            source_k,
+            source_v,
+            source_mix=adapter.source_mix[layer_idx],
+            gate_logit=adapter.gates[layer_idx],
+            k_proj=None if adapter.k_projs is None else adapter.k_projs[layer_idx],
+            v_proj=None if adapter.v_projs is None else adapter.v_projs[layer_idx],
+            k_down=None if adapter.k_down is None else adapter.k_down[layer_idx],
+            k_up=None if adapter.k_up is None else adapter.k_up[layer_idx],
+            v_down=None if adapter.v_down is None else adapter.v_down[layer_idx],
+            v_up=None if adapter.v_up is None else adapter.v_up[layer_idx],
+            k_gate=None if getattr(adapter, "k_gate", None) is None else adapter.k_gate[layer_idx],
+            k_up_mlp=None if getattr(adapter, "k_up_mlp", None) is None else adapter.k_up_mlp[layer_idx],
+            k_down_mlp=None if getattr(adapter, "k_down_mlp", None) is None else adapter.k_down_mlp[layer_idx],
+            v_gate=None if getattr(adapter, "v_gate", None) is None else adapter.v_gate[layer_idx],
+            v_up_mlp=None if getattr(adapter, "v_up_mlp", None) is None else adapter.v_up_mlp[layer_idx],
+            v_down_mlp=None if getattr(adapter, "v_down_mlp", None) is None else adapter.v_down_mlp[layer_idx],
+        )
+        vis_k = vis_k.transpose(1, 2)
+        vis_v = vis_v.transpose(1, 2)
+        vis_k = _apply_rope_one_from_embeddings(vis_k, image_position_embeddings)
+
+        attn_out = (
+            _hf_sdpa_prefix_causal_attention_heads(
+                attn,
+                q,
+                vis_k,
+                vis_v,
+                text_k,
+                text_v,
+                attention_mask=attn_mask,
+                scaling=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+            )
+            if use_hf_attention
+            else _prefix_causal_attention_heads(
+                q,
+                vis_k,
+                vis_v,
+                text_k,
+                text_v,
+                attention_mask=attn_mask,
+                scaling=None,
+            )
+        )
+        attn_out = attn.o_proj(attn_out.reshape(*input_shape, -1))
+
+        hidden = residual + attn_out
+        residual = hidden
+        post_normed = _eager_module_call(layer.post_attention_layernorm, hidden) if compile_exact else layer.post_attention_layernorm(hidden)
+        hidden = residual + (_eager_module_call(layer.mlp, post_normed) if compile_exact else layer.mlp(post_normed))
+
+    hidden = _eager_module_call(norm, hidden) if compile_exact else norm(hidden)
+    logits = model.lm_head(hidden)
+    return logits
+
+
+def student_forward_with_visual_kv_prepared_hf_attention(
+    model: LlavaForConditionalGeneration,
+    adapter: PerLayerKVAdapter,
+    **prepared: Any,
+) -> torch.Tensor:
+    return student_forward_with_visual_kv_prepared(model, adapter, **prepared, use_hf_attention=True)
+
+
+def _llava_prefix_attention_mask(
+    text_position_ids: torch.Tensor,
+    image_position_ids: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    img_allowed = text_position_ids.unsqueeze(2) >= image_position_ids.unsqueeze(1)
+    text_allowed = text_position_ids.unsqueeze(2) >= text_position_ids.unsqueeze(1)
+    prefix_mask = torch.cat([img_allowed, text_allowed], dim=-1)
+    return prefix_mask.unsqueeze(1).contiguous()
+
+
+def llava_adapter_only_prefill_cache_prepared(
+    model: LlavaForConditionalGeneration,
+    adapter: PerLayerKVAdapter,
+    *,
+    hidden: torch.Tensor,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    text_position_ids: torch.Tensor,
+    image_position_ids: torch.Tensor,
+    text_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    image_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attn_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    language_model = _get_language_model(model)
+    layers = language_model.layers
+    layer_caches: list[dict[str, torch.Tensor]] = []
+    layer_inputs: list[torch.Tensor] = []
+    layer_after_attention: list[torch.Tensor] = []
+
+    for layer_idx, layer in enumerate(layers):
+        layer_inputs.append(hidden)
+        residual = hidden
+        normed = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+        query, text_key = _apply_rope_pair_from_embeddings(query, text_key, text_position_embeddings)
+
+        visual_key, visual_value = adapter.forward_layer(source_k, source_v, layer_idx)
+        visual_key = visual_key.transpose(1, 2)
+        visual_value = visual_value.transpose(1, 2)
+        visual_key = _apply_rope_one_from_embeddings(visual_key, image_position_embeddings)
+        heads = _prefix_causal_attention_heads(
+            query,
+            visual_key,
+            visual_value,
+            text_key,
+            text_value,
+            attention_mask=attn_mask,
+            scaling=None,
+        )
+        layer_caches.append({"visual_key": visual_key.contiguous(), "visual_value": visual_value.contiguous()})
+        attention_output = attn.o_proj(heads.reshape(*input_shape, -1).contiguous())
+        hidden = residual + attention_output
+        layer_after_attention.append(hidden)
+        residual = hidden
+        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+
+    logits = model.lm_head(language_model.norm(hidden))
+    cache = {
+        "layers": layer_caches,
+        "layer_inputs": layer_inputs,
+        "layer_after_attention": layer_after_attention,
+        "text_position_ids": text_position_ids.clone(),
+        "image_position_ids": image_position_ids.clone(),
+        "next_position_ids": text_position_ids[:, -1:].clone() + 1,
+        "mode": "adapter_only",
+    }
+    return logits, cache
+
+
+def llava_adapter_only_prefill_cache(
+    model: LlavaForConditionalGeneration,
+    adapter: PerLayerKVAdapter,
+    input_ids: torch.Tensor,
+    source_k: torch.Tensor,
+    source_v: torch.Tensor,
+    image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    prepared = prepare_llava_adapter_only_inputs(
+        model,
+        input_ids,
+        source_k,
+        source_v,
+        image_token_id,
+        attention_mask=attention_mask,
+    )
+    return llava_adapter_only_prefill_cache_prepared(model, adapter, **prepared)
+
+
+def llava_adapter_only_decode_step_shape_exact(
+    model: LlavaForConditionalGeneration,
+    adapter: PerLayerKVAdapter,
+    token_ids: torch.Tensor,
+    cache: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    language_model = _get_language_model(model)
+    h = language_model.embed_tokens(token_ids)
+    next_position_ids = cache["next_position_ids"]
+    full_text_position_ids = torch.cat([cache["text_position_ids"], next_position_ids], dim=1)
+    attention_mask = _llava_prefix_attention_mask(
+        full_text_position_ids,
+        cache["image_position_ids"],
+        dtype=h.dtype,
+    )
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        full_layer_input = torch.cat([cache["layer_inputs"][layer_idx], h], dim=1)
+        residual = full_layer_input
+        normed = layer.input_layernorm(full_layer_input)
+        attn = layer.self_attn
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+        position_embeddings = language_model.rotary_emb(normed, full_text_position_ids)
+        query, text_key = _apply_rope_pair_from_embeddings(query, text_key, position_embeddings)
+        layer_cache = cache["layers"][layer_idx]
+        heads = _prefix_causal_attention_heads(
+            query,
+            layer_cache["visual_key"],
+            layer_cache["visual_value"],
+            text_key,
+            text_value,
+            attention_mask=attention_mask,
+            scaling=None,
+        )
+        full_attention = attn.o_proj(heads.reshape(*input_shape, -1).contiguous())
+        full_after_attention = residual + full_attention
+        full_output = full_after_attention + layer.mlp(layer.post_attention_layernorm(full_after_attention))
+        h = full_output[:, -1:]
+        cache["layer_inputs"][layer_idx] = full_layer_input
+        cache["layer_after_attention"][layer_idx] = full_after_attention
+
+    cache["text_position_ids"] = full_text_position_ids
+    cache["next_position_ids"] = next_position_ids + 1
+    logits = model.lm_head(language_model.norm(h))
+    return logits, cache
+
+
 def student_forward_with_visual_kv(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
@@ -420,91 +937,15 @@ def student_forward_with_visual_kv(
     Returns:
         logits: [B, text_seq_len, vocab_size]
     """
-    valid_mask = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(input_ids[0], dtype=torch.bool)
-    text_mask = (input_ids[0] != image_token_id) & valid_mask
-    image_mask = (input_ids[0] == image_token_id) & valid_mask
-    text_ids = input_ids[:, text_mask]
-
-    language_model = _get_language_model(model)
-    text_embeds = language_model.embed_tokens(text_ids)
-
-    layers = language_model.layers
-    norm = language_model.norm
-    rotary_emb = language_model.rotary_emb
-
-    B, T, _ = text_embeds.shape
-    N_vis = source_k.shape[2]
-    device = text_embeds.device
-    dtype = text_embeds.dtype
-
-    text_positions = torch.where(text_mask)[0].to(device)
-    image_positions = torch.where(image_mask)[0].to(device)
-    text_position_ids = text_positions.unsqueeze(0).expand(B, -1)
-    if image_positions.numel() == N_vis:
-        image_position_ids = image_positions.unsqueeze(0).expand(B, -1)
-    elif image_positions.numel() > 0:
-        start_pos = int(image_positions[0].item())
-        image_position_ids = torch.arange(start_pos, start_pos + N_vis, device=device).unsqueeze(0).expand(B, -1)
-    else:
-        image_position_ids = torch.arange(N_vis, device=device).unsqueeze(0).expand(B, -1)
-
-    hidden = text_embeds
-
-    for layer_idx, layer in enumerate(layers):
-        residual = hidden
-        normed = layer.input_layernorm(hidden)
-        attn = layer.self_attn
-
-        input_shape = normed.shape[:-1]
-        hidden_shape = (*input_shape, -1, attn.head_dim)
-
-        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
-        text_v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-
-        q = _apply_rope(rotary_emb, q, text_position_ids, normed)
-        text_k = _apply_rope(rotary_emb, text_k, text_position_ids, normed)
-
-        vis_k, vis_v = adapter.forward_layer(source_k.to(dtype=dtype), source_v.to(dtype=dtype), layer_idx)
-        vis_k = vis_k.transpose(1, 2)
-        vis_v = vis_v.transpose(1, 2)
-        vis_k = _apply_rope(rotary_emb, vis_k, image_position_ids, normed)
-
-        k = torch.cat([vis_k, text_k], dim=2)
-        v = torch.cat([vis_v, text_v], dim=2)
-
-        # GQA: repeat KV heads to match Q heads
-        num_q_heads = q.shape[1]
-        num_kv_heads = k.shape[1]
-        if num_q_heads != num_kv_heads:
-            k = llama_repeat_kv(k, num_q_heads // num_kv_heads)
-            v = llama_repeat_kv(v, num_q_heads // num_kv_heads)
-
-        # Build a position-based causal mask in the original prompt order.
-        text_pos = text_position_ids[0]
-        img_pos = image_position_ids[0]
-        img_allowed = text_pos.unsqueeze(1) >= img_pos.unsqueeze(0)
-        text_allowed = text_pos.unsqueeze(1) >= text_pos.unsqueeze(0)
-        causal_mask = torch.cat([img_allowed, text_allowed], dim=1)
-        attn_mask = torch.zeros(1, 1, T, N_vis + T, device=device, dtype=dtype)
-        attn_mask.masked_fill_(~causal_mask.unsqueeze(0).unsqueeze(0), torch.finfo(dtype).min)
-
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        attn_out = attn.o_proj(attn_out)
-
-        hidden = residual + attn_out
-        residual = hidden
-        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
-
-    hidden = norm(hidden)
-    logits = model.lm_head(hidden)
-    return logits
+    prepared = prepare_llava_adapter_only_inputs(
+        model,
+        input_ids,
+        source_k,
+        source_v,
+        image_token_id,
+        attention_mask=attention_mask,
+    )
+    return student_forward_with_visual_kv_prepared(model, adapter, **prepared)
 
 
 @torch.no_grad()
@@ -527,14 +968,21 @@ def load_frozen_llava(
     model_path: str,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    attn_implementation: str = "eager",
 ) -> tuple:
     """Load LLaVA model with all parameters frozen."""
     processor = AutoProcessor.from_pretrained(model_path)
+    if attn_implementation == "auto":
+        attn_implementation = "eager"
+    kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+    }
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
     model = AutoModelForImageTextToText.from_pretrained(
         model_path,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        attn_implementation="eager",
+        **kwargs,
     ).to(device)
     model.eval()
     for p in model.parameters():
@@ -599,7 +1047,7 @@ def student_forward_mixed(
 
     for layer_idx, layer in enumerate(layers):
         residual = hidden
-        normed = layer.input_layernorm(hidden)
+        normed = _compile_exact_module_call(layer.input_layernorm, hidden)
         attn = layer.self_attn
 
         input_shape = normed.shape[:-1]
@@ -641,9 +1089,10 @@ def student_forward_mixed(
 
         hidden = residual + attn_out
         residual = hidden
-        hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
+        post_normed = _compile_exact_module_call(layer.post_attention_layernorm, hidden)
+        hidden = residual + _compile_exact_module_call(layer.mlp, post_normed)
 
-    hidden = norm(hidden)
+    hidden = _compile_exact_module_call(norm, hidden)
     logits = model.lm_head(hidden)
     return logits
 
@@ -661,22 +1110,14 @@ def llava_projected_image_features(
     return model.model.multi_modal_projector(image_features)
 
 
-def student_forward_llava_injection(
+def prepare_llava_injection_inputs(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
-    adapter: "QwenVisualDeltaAdapter",
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run LLaVA text-only LLM with native projected image states as per-layer KV prefix.
-
-    This mirrors the Qwen visual-delta path: image features are projected to LLM
-    hidden size once, adapted by a per-layer low-rank residual, then converted
-    to K/V by the frozen language layer's native k_proj/v_proj. Image tokens do
-    not pass through the LLM FFN.
-    """
+) -> dict[str, Any]:
     if visual_memory is None:
         visual_memory = llava_projected_image_features(model, pixel_values)
 
@@ -706,15 +1147,43 @@ def student_forward_llava_injection(
     else:
         image_position_ids = torch.arange(image_len, device=device).unsqueeze(0).expand(batch, -1)
 
-    img_allowed = text_position_ids.unsqueeze(2) >= image_position_ids.unsqueeze(1)
-    text_allowed = text_position_ids.unsqueeze(2) >= text_position_ids.unsqueeze(1)
-    prefix_mask = torch.cat([img_allowed, text_allowed], dim=-1)
-    attn_mask = torch.zeros((batch, 1, text_len, image_len + text_len), device=device, dtype=dtype)
-    attn_mask.masked_fill_(~prefix_mask.unsqueeze(1), torch.finfo(dtype).min)
+    attn_mask = _llava_prefix_attention_mask(text_position_ids, image_position_ids, dtype=dtype)
+    text_position_embeddings = rotary_emb(hidden, text_position_ids)
+    image_position_embeddings = rotary_emb(hidden, image_position_ids)
+    return {
+        "hidden": hidden,
+        "visual_memory": visual_memory,
+        "text_position_ids": text_position_ids,
+        "image_position_ids": image_position_ids,
+        "text_position_embeddings": text_position_embeddings,
+        "image_position_embeddings": image_position_embeddings,
+        "attn_mask": attn_mask,
+    }
+
+
+def student_forward_llava_injection_prepared(
+    model: LlavaForConditionalGeneration,
+    adapter: "QwenVisualDeltaAdapter",
+    *,
+    hidden: torch.Tensor,
+    visual_memory: torch.Tensor,
+    text_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    image_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attn_mask: torch.Tensor,
+    text_position_ids: torch.Tensor | None = None,
+    image_position_ids: torch.Tensor | None = None,
+    use_hf_attention: bool = False,
+) -> torch.Tensor:
+    language_model = _get_language_model(model)
+    layers = language_model.layers
+    adapter_down = adapter.visual_adapter_down
+    adapter_up = adapter.visual_adapter_up
+    visual_memory_from_modules = adapter.visual_memory_from_modules
+    compile_exact = torch.compiler.is_compiling()
 
     for layer_idx, layer in enumerate(layers):
         residual = hidden
-        normed = layer.input_layernorm(hidden)
+        normed = _eager_module_call(layer.input_layernorm, hidden) if compile_exact else layer.input_layernorm(hidden)
         attn = layer.self_attn
         input_shape = normed.shape[:-1]
         hidden_shape = (*input_shape, -1, attn.head_dim)
@@ -722,8 +1191,92 @@ def student_forward_llava_injection(
         query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
         text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
         text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-        query = _apply_rope(rotary_emb, query, text_position_ids, normed)
-        text_key = _apply_rope(rotary_emb, text_key, text_position_ids, normed)
+        query, text_key = _apply_rope_pair_from_embeddings(query, text_key, text_position_embeddings)
+
+        if compile_exact:
+            vision_states = _eager_module_call(
+                visual_memory_from_modules,
+                visual_memory,
+                adapter_down[layer_idx],
+                adapter_up[layer_idx],
+            )
+            normed_vision = _eager_module_call(layer.input_layernorm, vision_states)
+        else:
+            vision_states = visual_memory_from_modules(visual_memory, adapter_down[layer_idx], adapter_up[layer_idx])
+            normed_vision = layer.input_layernorm(vision_states)
+        vision_shape = normed_vision.shape[:-1]
+        vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
+        visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        visual_key = _apply_rope_one_from_embeddings(visual_key, image_position_embeddings)
+
+        attn_out = (
+            _hf_sdpa_prefix_causal_attention_heads(
+                attn,
+                query,
+                visual_key,
+                visual_value,
+                text_key,
+                text_value,
+                attention_mask=attn_mask,
+                scaling=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+            )
+            if use_hf_attention
+            else _prefix_causal_attention_heads(
+                query,
+                visual_key,
+                visual_value,
+                text_key,
+                text_value,
+                attention_mask=attn_mask,
+                scaling=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+            )
+        )
+        hidden = residual + attn.o_proj(attn_out.reshape(*input_shape, -1))
+        residual = hidden
+        post_normed = _eager_module_call(layer.post_attention_layernorm, hidden) if compile_exact else layer.post_attention_layernorm(hidden)
+        hidden = residual + (_eager_module_call(layer.mlp, post_normed) if compile_exact else layer.mlp(post_normed))
+
+    hidden = _eager_module_call(language_model.norm, hidden) if compile_exact else language_model.norm(hidden)
+    return model.lm_head(hidden)
+
+
+def student_forward_llava_injection_prepared_hf_attention(
+    model: LlavaForConditionalGeneration,
+    adapter: "QwenVisualDeltaAdapter",
+    **prepared: Any,
+) -> torch.Tensor:
+    return student_forward_llava_injection_prepared(model, adapter, **prepared, use_hf_attention=True)
+
+
+def llava_injection_prefill_cache_prepared(
+    model: LlavaForConditionalGeneration,
+    adapter: "QwenVisualDeltaAdapter",
+    *,
+    hidden: torch.Tensor,
+    visual_memory: torch.Tensor,
+    text_position_ids: torch.Tensor,
+    image_position_ids: torch.Tensor,
+    text_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    image_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attn_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    language_model = _get_language_model(model)
+    layer_caches: list[dict[str, torch.Tensor]] = []
+    layer_inputs: list[torch.Tensor] = []
+    layer_after_attention: list[torch.Tensor] = []
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        layer_inputs.append(hidden)
+        residual = hidden
+        normed = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+        query, text_key = _apply_rope_pair_from_embeddings(query, text_key, text_position_embeddings)
 
         vision_states = adapter.visual_memory_from_modules(
             visual_memory,
@@ -735,29 +1288,132 @@ def student_forward_llava_injection(
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
         visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
         visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
-        visual_key = _apply_rope(rotary_emb, visual_key, image_position_ids, normed_vision)
-
-        key = torch.cat([visual_key, text_key], dim=2)
-        value = torch.cat([visual_value, text_value], dim=2)
-        if query.shape[1] != key.shape[1]:
-            key = llama_repeat_kv(key, query.shape[1] // key.shape[1])
-            value = llama_repeat_kv(value, query.shape[1] // value.shape[1])
-        attn_out = F.scaled_dot_product_attention(
+        visual_key = _apply_rope_one_from_embeddings(visual_key, image_position_embeddings)
+        heads = _prefix_causal_attention_heads(
             query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+            visual_key,
+            visual_value,
+            text_key,
+            text_value,
+            attention_mask=attn_mask,
+            scaling=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
         )
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        hidden = residual + attn.o_proj(attn_out)
+        layer_caches.append({"visual_key": visual_key.contiguous(), "visual_value": visual_value.contiguous()})
+        attention_output = attn.o_proj(heads.reshape(*input_shape, -1).contiguous())
+        hidden = residual + attention_output
+        layer_after_attention.append(hidden)
         residual = hidden
         hidden = residual + layer.mlp(layer.post_attention_layernorm(hidden))
 
-    hidden = language_model.norm(hidden)
-    return model.lm_head(hidden)
+    logits = model.lm_head(language_model.norm(hidden))
+    cache = {
+        "layers": layer_caches,
+        "layer_inputs": layer_inputs,
+        "layer_after_attention": layer_after_attention,
+        "text_position_ids": text_position_ids.clone(),
+        "image_position_ids": image_position_ids.clone(),
+        "next_position_ids": text_position_ids[:, -1:].clone() + 1,
+        "mode": "native_visual_kv_injection",
+    }
+    return logits, cache
+
+
+def llava_injection_prefill_cache(
+    model: LlavaForConditionalGeneration,
+    adapter: "QwenVisualDeltaAdapter",
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+    visual_memory: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    prepared = prepare_llava_injection_inputs(
+        model,
+        input_ids,
+        pixel_values,
+        image_token_id,
+        attention_mask=attention_mask,
+        visual_memory=visual_memory,
+    )
+    return llava_injection_prefill_cache_prepared(model, adapter, **prepared)
+
+
+def llava_injection_decode_step_shape_exact(
+    model: LlavaForConditionalGeneration,
+    adapter: "QwenVisualDeltaAdapter",
+    token_ids: torch.Tensor,
+    cache: dict[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    language_model = _get_language_model(model)
+    h = language_model.embed_tokens(token_ids)
+    next_position_ids = cache["next_position_ids"]
+    full_text_position_ids = torch.cat([cache["text_position_ids"], next_position_ids], dim=1)
+    attention_mask = _llava_prefix_attention_mask(
+        full_text_position_ids,
+        cache["image_position_ids"],
+        dtype=h.dtype,
+    )
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        full_layer_input = torch.cat([cache["layer_inputs"][layer_idx], h], dim=1)
+        residual = full_layer_input
+        normed = layer.input_layernorm(full_layer_input)
+        attn = layer.self_attn
+        input_shape = normed.shape[:-1]
+        hidden_shape = (*input_shape, -1, attn.head_dim)
+        query = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_key = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
+        text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
+        position_embeddings = language_model.rotary_emb(normed, full_text_position_ids)
+        query, text_key = _apply_rope_pair_from_embeddings(query, text_key, position_embeddings)
+        layer_cache = cache["layers"][layer_idx]
+        heads = _prefix_causal_attention_heads(
+            query,
+            layer_cache["visual_key"],
+            layer_cache["visual_value"],
+            text_key,
+            text_value,
+            attention_mask=attention_mask,
+            scaling=float(getattr(attn, "scaling", attn.head_dim ** -0.5)),
+        )
+        full_attention = attn.o_proj(heads.reshape(*input_shape, -1).contiguous())
+        full_after_attention = residual + full_attention
+        full_output = full_after_attention + layer.mlp(layer.post_attention_layernorm(full_after_attention))
+        h = full_output[:, -1:]
+        cache["layer_inputs"][layer_idx] = full_layer_input
+        cache["layer_after_attention"][layer_idx] = full_after_attention
+
+    cache["text_position_ids"] = full_text_position_ids
+    cache["next_position_ids"] = next_position_ids + 1
+    logits = model.lm_head(language_model.norm(h))
+    return logits, cache
+
+
+def student_forward_llava_injection(
+    model: LlavaForConditionalGeneration,
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor,
+    adapter: "QwenVisualDeltaAdapter",
+    image_token_id: int,
+    attention_mask: torch.Tensor | None = None,
+    visual_memory: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run LLaVA text-only LLM with native projected image states as per-layer KV prefix.
+
+    This mirrors the Qwen visual-delta path: image features are projected to LLM
+    hidden size once, adapted by a per-layer low-rank residual, then converted
+    to K/V by the frozen language layer's native k_proj/v_proj. Image tokens do
+    not pass through the LLM FFN.
+    """
+    prepared = prepare_llava_injection_inputs(
+        model,
+        input_ids,
+        pixel_values,
+        image_token_id,
+        attention_mask=attention_mask,
+        visual_memory=visual_memory,
+    )
+    return student_forward_llava_injection_prepared(model, adapter, **prepared)
 
 
 def student_forward_optimized(
@@ -854,6 +1510,8 @@ def load_frozen_qwen3vl(
     attn_implementation: str = "flash_attention_2",
 ) -> tuple[Any, Qwen3VLForConditionalGeneration]:
     processor = AutoProcessor.from_pretrained(model_path)
+    if attn_implementation == "auto":
+        attn_implementation = "flash_attention_2"
     kwargs: dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
@@ -959,13 +1617,20 @@ def prepare_qwen3vl_batch_inputs(
     return inputs, text_ids, answer_mask, image_paths
 
 
-def qwen_position_ids(model: torch.nn.Module, inputs: dict[str, Tensor]) -> Tensor:
+def qwen_position_ids(
+    model: torch.nn.Module,
+    inputs: dict[str, Tensor],
+    *,
+    inputs_embeds: Tensor | None = None,
+) -> Tensor:
     qwen_model = model.model
+    if inputs_embeds is None:
+        inputs_embeds = qwen_model.get_input_embeddings()(inputs["input_ids"])
     position_ids = qwen_model.compute_3d_position_ids(
         input_ids=inputs["input_ids"],
         image_grid_thw=inputs.get("image_grid_thw"),
         video_grid_thw=inputs.get("video_grid_thw"),
-        inputs_embeds=qwen_model.get_input_embeddings()(inputs["input_ids"]),
+        inputs_embeds=inputs_embeds,
         attention_mask=inputs.get("attention_mask"),
         past_key_values=None,
         mm_token_type_ids=inputs.get("mm_token_type_ids"),
@@ -976,19 +1641,51 @@ def qwen_position_ids(model: torch.nn.Module, inputs: dict[str, Tensor]) -> Tens
 
 
 @torch.no_grad()
-def build_qwen_initial_context(model: torch.nn.Module, inputs: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+def qwen_visual_grid_metadata(model: torch.nn.Module, image_grid_thw: Tensor) -> dict[str, Any]:
+    visual = model.model.visual
+    interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+        image_grid_thw,
+        num_grid_per_side=visual.num_grid_per_side,
+        mode=visual.interpolation_mode,
+        align_corners=visual.interpolation_align_corners,
+        spatial_merge_size=visual.config.spatial_merge_size,
+    )
+    position_ids = get_vision_position_ids(image_grid_thw, visual.spatial_merge_size)
+    cu_seqlens, max_seqlen = get_vision_attention_seqlens(image_grid_thw, visual.config)
+    return {
+        "interp_indices": interp_indices,
+        "interp_weights": interp_weights,
+        "position_ids": position_ids,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }
+
+
+@torch.no_grad()
+def build_qwen_initial_context(
+    model: torch.nn.Module,
+    inputs: dict[str, Tensor],
+    *,
+    position_ids: Tensor | None = None,
+    visual_grid_metadata: dict[str, Any] | None = None,
+) -> tuple[Tensor, Tensor]:
     qwen_model = model.model
     input_ids = inputs["input_ids"]
     inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
-    image_outputs = qwen_model.get_image_features(
-        inputs["pixel_values"],
-        inputs["image_grid_thw"],
+    position_inputs_embeds = inputs_embeds
+    image_kwargs = dict(visual_grid_metadata) if visual_grid_metadata is not None else {}
+    image_outputs = qwen_model.visual(
+        inputs["pixel_values"].type(qwen_model.visual.dtype),
+        grid_thw=inputs["image_grid_thw"],
         return_dict=True,
+        **image_kwargs,
     )
-    image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
-    image_mask, _ = qwen_model.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
+    image_embeds = image_outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == int(qwen_model.config.image_token_id)).unsqueeze(-1).to(device=inputs_embeds.device)
     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-    return inputs_embeds, qwen_position_ids(model, inputs)
+    if position_ids is None:
+        position_ids = qwen_position_ids(model, inputs, inputs_embeds=position_inputs_embeds)
+    return inputs_embeds, position_ids
 
 
 def _hash_tensor(hasher: Any, tensor: Tensor) -> None:
@@ -1052,37 +1749,52 @@ def get_qwen_text_image_positions(
     mm_token_type_ids: Tensor,
     position_ids: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    batch = input_ids.shape[0]
-    rows_text: list[list[int]] = []
-    rows_image: list[list[int]] = []
-    max_text = 0
-    max_image = 0
-    for batch_idx in range(batch):
-        valid = torch.nonzero(attention_mask[batch_idx].bool(), as_tuple=False).flatten().tolist()
-        text = [int(i) for i in valid if int(mm_token_type_ids[batch_idx, int(i)].item()) == 0]
-        image = [int(i) for i in valid if int(mm_token_type_ids[batch_idx, int(i)].item()) == 1]
-        if not text or not image:
-            raise ValueError("Qwen sample must contain both text and image positions")
-        rows_text.append(text)
-        rows_image.append(image)
-        max_text = max(max_text, len(text))
-        max_image = max(max_image, len(image))
-
     device = input_ids.device
+    valid = attention_mask.to(device=device, dtype=torch.bool)
+    token_types = mm_token_type_ids.to(device=device)
+    text_valid = valid & (token_types == 0)
+    image_valid = valid & (token_types == 1)
+    batch = input_ids.shape[0]
+    if batch == 1:
+        text_src = torch.where(text_valid[0])[0]
+        image_src = torch.where(image_valid[0])[0]
+        if text_src.numel() == 0 or image_src.numel() == 0:
+            raise ValueError("Qwen sample must contain both text and image positions")
+        text_positions = text_src.unsqueeze(0)
+        image_positions = image_src.unsqueeze(0)
+        text_mask = torch.ones((1, text_src.numel()), device=device, dtype=torch.bool)
+        image_mask = torch.ones((1, image_src.numel()), device=device, dtype=torch.bool)
+        text_position_ids = position_ids[:, :1, text_src]
+        return text_positions, image_positions, text_position_ids, text_mask, image_mask, valid
+
+    text_counts = text_valid.sum(dim=1)
+    image_counts = image_valid.sum(dim=1)
+    if not bool(((text_counts > 0) & (image_counts > 0)).all().item()):
+        raise ValueError("Qwen sample must contain both text and image positions")
+
+    max_text = int(text_counts.max().item())
+    max_image = int(image_counts.max().item())
     text_positions = torch.zeros((batch, max_text), device=device, dtype=torch.long)
     image_positions = torch.zeros((batch, max_image), device=device, dtype=torch.long)
     text_mask = torch.zeros((batch, max_text), device=device, dtype=torch.bool)
     image_mask = torch.zeros((batch, max_image), device=device, dtype=torch.bool)
     text_position_ids = torch.zeros((3, batch, max_text), device=device, dtype=position_ids.dtype)
-    for batch_idx in range(batch):
-        t = torch.tensor(rows_text[batch_idx], device=device, dtype=torch.long)
-        v = torch.tensor(rows_image[batch_idx], device=device, dtype=torch.long)
-        text_positions[batch_idx, : t.numel()] = t
-        image_positions[batch_idx, : v.numel()] = v
-        text_mask[batch_idx, : t.numel()] = True
-        image_mask[batch_idx, : v.numel()] = True
-        text_position_ids[:, batch_idx, : t.numel()] = position_ids[:, batch_idx].index_select(1, t)
-    return text_positions, image_positions, text_position_ids, text_mask, image_mask, attention_mask.bool()
+
+    text_batch, text_src = torch.nonzero(text_valid, as_tuple=True)
+    image_batch, image_src = torch.nonzero(image_valid, as_tuple=True)
+    text_rank = text_valid.to(dtype=torch.long).cumsum(dim=1).sub(1)[text_batch, text_src]
+    image_rank = image_valid.to(dtype=torch.long).cumsum(dim=1).sub(1)[image_batch, image_src]
+
+    text_positions[text_batch, text_rank] = text_src
+    image_positions[image_batch, image_rank] = image_src
+    text_mask[text_batch, text_rank] = True
+    image_mask[image_batch, image_rank] = True
+
+    dim_idx = torch.arange(3, device=device).view(3, 1).expand(-1, text_src.numel())
+    text_batch_idx = text_batch.view(1, -1).expand(3, -1)
+    text_rank_idx = text_rank.view(1, -1).expand(3, -1)
+    text_position_ids[dim_idx, text_batch_idx, text_rank_idx] = position_ids[:, text_batch, text_src]
+    return text_positions, image_positions, text_position_ids, text_mask, image_mask, valid
 
 
 def gather_batched_positions(hidden_states: Tensor, positions: Tensor, mask: Tensor) -> Tensor:
@@ -1092,6 +1804,8 @@ def gather_batched_positions(hidden_states: Tensor, positions: Tensor, mask: Ten
 
 
 def qwen_visual_position_ids(full_position_ids: Tensor, image_positions: Tensor, image_mask: Tensor) -> Tensor:
+    if image_positions.shape[0] == 1:
+        return full_position_ids[:, :1, image_positions[0].long()]
     visual_position_ids = torch.zeros(
         3,
         image_positions.shape[0],
@@ -1115,14 +1829,34 @@ def qwen_can_skip_padding_masks(text_mask: Tensor, image_mask: Tensor, compact_n
     return bool(text_mask.all().item() and image_mask.all().item())
 
 
-def qwen_prefix_causal_attention_mask(text_mask: Tensor, image_mask: Tensor, device: torch.device) -> Tensor:
+def qwen_prefix_causal_attention_mask(
+    text_mask: Tensor,
+    image_mask: Tensor,
+    device: torch.device,
+    *,
+    text_positions: Tensor | None = None,
+    image_positions: Tensor | None = None,
+) -> Tensor:
     batch, text_len = text_mask.shape
     visual_len = image_mask.shape[1]
+    if batch == 1 and text_positions is not None and image_positions is not None:
+        text_order = text_positions[0].to(device=device)
+        image_order = image_positions[0].to(device=device)
+        text_allowed = text_order.view(1, text_len) <= text_order.view(text_len, 1)
+        visual_allowed = image_order.view(1, visual_len) <= text_order.view(text_len, 1)
+        return torch.cat([visual_allowed, text_allowed], dim=-1).view(1, 1, text_len, visual_len + text_len)
+
     valid_text = text_mask.to(device=device, dtype=torch.bool)
     valid_visual = image_mask.to(device=device, dtype=torch.bool)
-    causal = torch.ones((text_len, text_len), device=device, dtype=torch.bool).tril()
-    text_allowed = causal.view(1, text_len, text_len) & valid_text.view(batch, 1, text_len)
-    visual_allowed = valid_visual.view(batch, 1, visual_len).expand(batch, text_len, visual_len)
+    if text_positions is not None and image_positions is not None:
+        text_positions = text_positions.to(device=device)
+        image_positions = image_positions.to(device=device)
+        text_allowed = (text_positions[:, None, :] <= text_positions[:, :, None]) & valid_text[:, None, :]
+        visual_allowed = (image_positions[:, None, :] <= text_positions[:, :, None]) & valid_visual[:, None, :]
+    else:
+        causal = torch.ones((text_len, text_len), device=device, dtype=torch.bool).tril()
+        text_allowed = causal.view(1, text_len, text_len) & valid_text.view(batch, 1, text_len)
+        visual_allowed = valid_visual.view(batch, 1, visual_len).expand(batch, text_len, visual_len)
     return torch.cat([visual_allowed, text_allowed], dim=-1).unsqueeze(1)
 
 
@@ -1189,7 +1923,9 @@ class QwenVisualDeltaAdapter(nn.Module):
     ) -> Tensor:
         adapted = down(visual_memory)
         adapted = up(F.silu(adapted))
-        return visual_memory + adapted.to(dtype=visual_memory.dtype)
+        adapted = adapted.to(dtype=visual_memory.dtype)
+        adapted.add_(visual_memory)
+        return adapted
 
 
 def qwen_text_attention_output(
@@ -1272,7 +2008,7 @@ def qwen_native_visual_kv_for_layer(
     value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
     if position_embeddings is None:
         position_embeddings = language_model.rotary_emb(normed, visual_position_ids)
-    _, key = qwen_apply_rotary_pos_emb(key, key, *position_embeddings)
+    key = _apply_rope_one_from_embeddings(key, position_embeddings)
     if repeat_kv:
         key = qwen_repeat_kv(key, int(attn.num_key_value_groups))
         value = qwen_repeat_kv(value, int(attn.num_key_value_groups))
@@ -1311,12 +2047,19 @@ def qwen_lm_head_logits(
 ) -> Tensor:
     if logits_to_keep > 0:
         if logits_to_keep == 1 and text_mask is not None:
-            last_idx = text_mask.long().sum(dim=1).sub(1).clamp_min(0)
-            batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-            hidden_states = hidden_states[batch_idx, last_idx].unsqueeze(1)
+            if text_mask.shape[0] == 1:
+                hidden_states = hidden_states[:, -1:]
+            else:
+                last_idx = text_mask.long().sum(dim=1).sub(1).clamp_min(0)
+                batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+                hidden_states = hidden_states[batch_idx, last_idx].unsqueeze(1)
         else:
             hidden_states = hidden_states[:, -int(logits_to_keep) :]
-    return model.lm_head(language_model.norm(hidden_states))
+    if torch.compiler.is_compiling():
+        hidden_states = _eager_module_call(language_model.norm, hidden_states)
+    else:
+        hidden_states = language_model.norm(hidden_states)
+    return model.lm_head(hidden_states)
 
 
 def qwen_text_attention_output_with_visual_kv(
@@ -1433,6 +2176,504 @@ def run_qwen_layer_from_attention_output_for_layer(
     return residual + hidden_states
 
 
+def prepare_qwen_visual_delta_inputs(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    mm_token_type_ids: Tensor,
+    initial_hidden: Tensor,
+    position_ids: Tensor,
+    *,
+    reuse_position_embeddings: bool = True,
+) -> dict[str, Any]:
+    language_model = model.model.language_model
+    adapter_dtype = next(adapter.parameters()).dtype
+    text_pos, image_pos, text_position_ids, text_mask, image_mask, _ = get_qwen_text_image_positions(
+        input_ids,
+        attention_mask,
+        mm_token_type_ids,
+        position_ids,
+    )
+    visual_position_ids = qwen_visual_position_ids(position_ids, image_pos, image_mask)
+    visual_memory = gather_batched_positions(initial_hidden, image_pos, image_mask).to(dtype=adapter_dtype)
+    h = gather_batched_positions(initial_hidden, text_pos, text_mask).to(dtype=adapter_dtype)
+    prefix_attention_mask = qwen_prefix_causal_attention_mask(
+        text_mask,
+        image_mask,
+        h.device,
+        text_positions=text_pos,
+        image_positions=image_pos,
+    )
+    text_position_embeddings = None
+    visual_position_embeddings = None
+    if reuse_position_embeddings:
+        rotary_emb = language_model.rotary_emb
+        text_position_embeddings = rotary_emb(h, text_position_ids)
+        visual_position_embeddings = rotary_emb(visual_memory, visual_position_ids)
+    return {
+        "h": h,
+        "visual_memory": visual_memory,
+        "text_mask": text_mask,
+        "image_mask": image_mask,
+        "text_positions": text_pos,
+        "image_positions": image_pos,
+        "text_position_ids": text_position_ids,
+        "visual_position_ids": visual_position_ids,
+        "prefix_attention_mask": prefix_attention_mask,
+        "text_position_embeddings": text_position_embeddings,
+        "visual_position_embeddings": visual_position_embeddings,
+    }
+
+
+def qwen_visual_delta_logits_prepared(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    *,
+    h: Tensor,
+    visual_memory: Tensor,
+    text_mask: Tensor,
+    text_position_ids: Tensor,
+    visual_position_ids: Tensor,
+    prefix_attention_mask: Tensor,
+    text_position_embeddings: tuple[Tensor, Tensor] | None = None,
+    visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
+    collect_states: bool = False,
+    collect_state_indices: set[int] | None = None,
+    logits_to_keep: int = 0,
+    use_hf_attention: bool = False,
+) -> tuple[Tensor, Tensor, list[Tensor] | None]:
+    language_model = model.model.language_model
+    layers = language_model.layers
+    rotary_emb = language_model.rotary_emb
+    adapter_down = adapter.visual_adapter_down
+    adapter_up = adapter.visual_adapter_up
+    visual_memory_from_modules = adapter.visual_memory_from_modules
+    compile_exact = torch.compiler.is_compiling()
+    states = None
+    if collect_states:
+        if collect_state_indices is None:
+            states = [h]
+        else:
+            states = [h.new_empty(0) for _ in range(len(layers) + 1)]
+            if 0 in collect_state_indices:
+                states[0] = h
+    for layer_idx, layer in enumerate(layers):
+        attn = layer.self_attn
+        normed_text = _eager_module_call(layer.input_layernorm, h) if compile_exact else layer.input_layernorm(h)
+        text_shape = normed_text.shape[:-1]
+        hidden_shape = (*text_shape, -1, attn.head_dim)
+        raw_query = attn.q_proj(normed_text).view(hidden_shape)
+        raw_text_key = attn.k_proj(normed_text).view(hidden_shape)
+        query = (_eager_module_call(attn.q_norm, raw_query) if compile_exact else attn.q_norm(raw_query)).transpose(1, 2)
+        text_key = (_eager_module_call(attn.k_norm, raw_text_key) if compile_exact else attn.k_norm(raw_text_key)).transpose(1, 2)
+        text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
+        layer_text_position_embeddings = text_position_embeddings
+        if layer_text_position_embeddings is None:
+            layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
+        query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
+
+        if compile_exact:
+            vision_states = _eager_module_call(
+                visual_memory_from_modules,
+                visual_memory,
+                adapter_down[layer_idx],
+                adapter_up[layer_idx],
+            )
+            normed_vision = _eager_module_call(layer.input_layernorm, vision_states)
+        else:
+            vision_states = visual_memory_from_modules(visual_memory, adapter_down[layer_idx], adapter_up[layer_idx])
+            normed_vision = layer.input_layernorm(vision_states)
+        vision_shape = normed_vision.shape[:-1]
+        vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
+        raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
+        visual_key = (_eager_module_call(attn.k_norm, raw_visual_key) if compile_exact else attn.k_norm(raw_visual_key)).transpose(1, 2)
+        visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        layer_visual_position_embeddings = visual_position_embeddings
+        if layer_visual_position_embeddings is None:
+            layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
+        visual_key = _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings)
+
+        heads = (
+            _hf_sdpa_prefix_causal_attention_heads(
+                attn,
+                query,
+                visual_key,
+                visual_value,
+                text_key,
+                text_value,
+                attention_mask=prefix_attention_mask,
+                scaling=float(attn.scaling),
+            )
+            if use_hf_attention
+            else _prefix_causal_attention_heads(
+                query,
+                visual_key,
+                visual_value,
+                text_key,
+                text_value,
+                attention_mask=prefix_attention_mask,
+                scaling=float(attn.scaling),
+            )
+        )
+        text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
+        h = h + text_attention.to(dtype=h.dtype)
+        residual = h
+        h = _eager_module_call(layer.post_attention_layernorm, h) if compile_exact else layer.post_attention_layernorm(h)
+        h = _eager_module_call(layer.mlp, h) if compile_exact else layer.mlp(h)
+        h = residual + h
+        if states is not None:
+            state_idx = layer_idx + 1
+            if collect_state_indices is None:
+                states.append(h)
+            elif state_idx in collect_state_indices:
+                states[state_idx] = h
+    logits = qwen_lm_head_logits(model, language_model, h, text_mask, logits_to_keep=logits_to_keep)
+    return logits, text_mask, states
+
+
+def qwen_visual_delta_logits_prepared_hf_attention(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    **prepared: Any,
+) -> tuple[Tensor, Tensor, list[Tensor] | None]:
+    return qwen_visual_delta_logits_prepared(model, adapter, **prepared, use_hf_attention=True)
+
+
+def qwen_visual_delta_prefill_cache_prepared(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    *,
+    h: Tensor,
+    visual_memory: Tensor,
+    text_mask: Tensor,
+    image_mask: Tensor,
+    text_positions: Tensor,
+    image_positions: Tensor,
+    text_position_ids: Tensor,
+    visual_position_ids: Tensor,
+    prefix_attention_mask: Tensor,
+    text_position_embeddings: tuple[Tensor, Tensor] | None = None,
+    visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
+    logits_to_keep: int = 1,
+) -> tuple[Tensor, Tensor, dict[str, Any]]:
+    language_model = model.model.language_model
+    layers = language_model.layers
+    rotary_emb = language_model.rotary_emb
+    adapter_down = adapter.visual_adapter_down
+    adapter_up = adapter.visual_adapter_up
+    visual_memory_from_modules = adapter.visual_memory_from_modules
+    layer_caches: list[dict[str, Tensor]] = []
+    layer_inputs: list[Tensor] = []
+    layer_after_attention: list[Tensor] = []
+
+    for layer_idx, layer in enumerate(layers):
+        layer_inputs.append(h)
+        attn = layer.self_attn
+        normed_text = _compile_exact_module_call(layer.input_layernorm, h)
+        text_shape = normed_text.shape[:-1]
+        hidden_shape = (*text_shape, -1, attn.head_dim)
+        raw_query = attn.q_proj(normed_text).view(hidden_shape)
+        raw_text_key = attn.k_proj(normed_text).view(hidden_shape)
+        query = _compile_exact_module_call(attn.q_norm, raw_query).transpose(1, 2)
+        text_key = _compile_exact_module_call(attn.k_norm, raw_text_key).transpose(1, 2)
+        text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
+        layer_text_position_embeddings = text_position_embeddings
+        if layer_text_position_embeddings is None:
+            layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
+        query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
+
+        vision_states = _compile_exact_module_call(
+            visual_memory_from_modules,
+            visual_memory,
+            adapter_down[layer_idx],
+            adapter_up[layer_idx],
+        )
+        normed_vision = _compile_exact_module_call(layer.input_layernorm, vision_states)
+        vision_shape = normed_vision.shape[:-1]
+        vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
+        raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
+        visual_key = _compile_exact_module_call(attn.k_norm, raw_visual_key).transpose(1, 2)
+        visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+        layer_visual_position_embeddings = visual_position_embeddings
+        if layer_visual_position_embeddings is None:
+            layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
+        visual_key = _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings)
+
+        heads = _prefix_causal_attention_heads(
+            query,
+            visual_key,
+            visual_value,
+            text_key,
+            text_value,
+            attention_mask=prefix_attention_mask,
+            scaling=float(attn.scaling),
+        )
+        layer_caches.append(
+            {
+                "text_key": text_key.contiguous(),
+                "text_value": text_value.contiguous(),
+                "visual_key": visual_key.contiguous(),
+                "visual_value": visual_value.contiguous(),
+            }
+        )
+        text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
+        h = h + text_attention.to(dtype=h.dtype)
+        layer_after_attention.append(h)
+        residual = h
+        h = _compile_exact_module_call(layer.post_attention_layernorm, h)
+        h = _compile_exact_module_call(layer.mlp, h)
+        h = residual + h
+
+    logits = qwen_lm_head_logits(model, language_model, h, text_mask, logits_to_keep=logits_to_keep)
+    last_idx = text_mask.long().sum(dim=1).sub(1).clamp_min(0).view(1, -1, 1).expand(text_position_ids.shape[0], -1, 1)
+    next_position_ids = text_position_ids.gather(2, last_idx) + 1
+    next_text_positions = text_positions.gather(1, text_mask.long().sum(dim=1).sub(1).clamp_min(0).view(-1, 1)) + 1
+    cache = {
+        "layers": layer_caches,
+        "text_mask": text_mask.clone(),
+        "image_mask": image_mask.clone(),
+        "text_positions": text_positions.clone(),
+        "image_positions": image_positions.clone(),
+        "text_position_ids": text_position_ids.clone(),
+        "layer_inputs": layer_inputs,
+        "layer_after_attention": layer_after_attention,
+        "next_position_ids": next_position_ids,
+        "next_text_positions": next_text_positions,
+    }
+    return logits, text_mask, cache
+
+
+def qwen_visual_delta_prefill_cache(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    mm_token_type_ids: Tensor,
+    initial_hidden: Tensor,
+    position_ids: Tensor,
+    *,
+    logits_to_keep: int = 1,
+    reuse_position_embeddings: bool = True,
+) -> tuple[Tensor, Tensor, dict[str, Any]]:
+    prepared = prepare_qwen_visual_delta_inputs(
+        model,
+        adapter,
+        input_ids,
+        attention_mask,
+        mm_token_type_ids,
+        initial_hidden,
+        position_ids,
+        reuse_position_embeddings=reuse_position_embeddings,
+    )
+    return qwen_visual_delta_prefill_cache_prepared(
+        model,
+        adapter,
+        h=prepared["h"],
+        visual_memory=prepared["visual_memory"],
+        text_mask=prepared["text_mask"],
+        image_mask=prepared["image_mask"],
+        text_positions=prepared["text_positions"],
+        image_positions=prepared["image_positions"],
+        text_position_ids=prepared["text_position_ids"],
+        visual_position_ids=prepared["visual_position_ids"],
+        prefix_attention_mask=prepared["prefix_attention_mask"],
+        text_position_embeddings=prepared["text_position_embeddings"],
+        visual_position_embeddings=prepared["visual_position_embeddings"],
+        logits_to_keep=logits_to_keep,
+    )
+
+
+def _qwen_decode_attention_mask(
+    cache: dict[str, Any],
+    token_position_ids: Tensor,
+    current_text_mask: Tensor | None = None,
+) -> Tensor | None:
+    text_mask = cache["text_mask"].to(dtype=torch.bool)
+    image_mask = cache["image_mask"].to(dtype=torch.bool)
+    image_positions = cache["image_positions"].to(device=token_position_ids.device)
+    current_pos = token_position_ids[0, :, 0].view(-1, 1)
+    visual_allowed = image_mask & (image_positions <= current_pos)
+    if current_text_mask is None:
+        current_text = torch.ones((text_mask.shape[0], 1), device=text_mask.device, dtype=torch.bool)
+    else:
+        current_text = current_text_mask.to(device=text_mask.device, dtype=torch.bool).view(-1, 1)
+    allowed = torch.cat([visual_allowed, text_mask, current_text], dim=1)
+    return allowed[:, None, None, :]
+
+
+def qwen_visual_delta_decode_step(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    token_ids: Tensor,
+    cache: dict[str, Any],
+    *,
+    logits_to_keep: int = 1,
+    token_active_mask: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    language_model = model.model.language_model
+    h = model.model.get_input_embeddings()(token_ids)
+    token_position_ids = cache["next_position_ids"]
+    token_position_embeddings = language_model.rotary_emb(h, token_position_ids)
+    attention_mask = _qwen_decode_attention_mask(cache, token_position_ids, token_active_mask)
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        attn = layer.self_attn
+        normed_text = _compile_exact_module_call(layer.input_layernorm, h)
+        text_shape = normed_text.shape[:-1]
+        hidden_shape = (*text_shape, -1, attn.head_dim)
+        raw_query = attn.q_proj(normed_text).view(hidden_shape)
+        raw_text_key = attn.k_proj(normed_text).view(hidden_shape)
+        query = _compile_exact_module_call(attn.q_norm, raw_query).transpose(1, 2)
+        text_key = _compile_exact_module_call(attn.k_norm, raw_text_key).transpose(1, 2)
+        text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
+        query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, token_position_embeddings)
+
+        layer_cache = cache["layers"][layer_idx]
+        key = torch.cat([layer_cache["visual_key"], layer_cache["text_key"], text_key], dim=2)
+        value = torch.cat([layer_cache["visual_value"], layer_cache["text_value"], text_value], dim=2)
+        heads = qwen_prefix_causal_attention_heads(
+            query,
+            key,
+            value,
+            attention_mask=attention_mask,
+            scaling=float(attn.scaling),
+        )
+        layer_cache["text_key"] = torch.cat([layer_cache["text_key"], text_key.contiguous()], dim=2)
+        layer_cache["text_value"] = torch.cat([layer_cache["text_value"], text_value.contiguous()], dim=2)
+        text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
+        h = h + text_attention.to(dtype=h.dtype)
+        residual = h
+        h = _compile_exact_module_call(layer.post_attention_layernorm, h)
+        h = _compile_exact_module_call(layer.mlp, h)
+        h = residual + h
+
+    if token_active_mask is None:
+        active_column = torch.ones((cache["text_mask"].shape[0], 1), device=cache["text_mask"].device, dtype=torch.bool)
+    else:
+        active_column = token_active_mask.to(device=cache["text_mask"].device, dtype=torch.bool).view(-1, 1)
+    cache["text_mask"] = torch.cat([cache["text_mask"], active_column], dim=1)
+    cache["next_position_ids"] = token_position_ids + 1
+    logits = qwen_lm_head_logits(model, language_model, h, None, logits_to_keep=logits_to_keep)
+    return logits, cache
+
+
+def qwen_visual_delta_decode_step_shape_exact(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    token_ids: Tensor,
+    cache: dict[str, Any],
+    *,
+    logits_to_keep: int = 1,
+    token_active_mask: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Any]]:
+    language_model = model.model.language_model
+    h = model.model.get_input_embeddings()(token_ids)
+    token_position_ids = cache["next_position_ids"]
+    text_position_ids = cache["text_position_ids"]
+    token_text_positions = cache["next_text_positions"]
+    full_text_position_ids = torch.cat([text_position_ids, token_position_ids], dim=2)
+    if token_active_mask is None:
+        active_column = torch.ones((cache["text_mask"].shape[0], 1), device=cache["text_mask"].device, dtype=torch.bool)
+    else:
+        active_column = token_active_mask.to(device=cache["text_mask"].device, dtype=torch.bool).view(-1, 1)
+    full_text_mask = torch.cat([cache["text_mask"], active_column], dim=1)
+    full_text_positions = torch.cat([cache["text_positions"], token_text_positions], dim=1)
+    attention_mask = qwen_prefix_causal_attention_mask(
+        full_text_mask,
+        cache["image_mask"],
+        h.device,
+        text_positions=full_text_positions,
+        image_positions=cache["image_positions"],
+    )
+
+    for layer_idx, layer in enumerate(language_model.layers):
+        attn = layer.self_attn
+        prompt_layer_input = cache["layer_inputs"][layer_idx]
+        full_layer_input = torch.cat([prompt_layer_input, h], dim=1)
+        normed_text = _compile_exact_module_call(layer.input_layernorm, full_layer_input)
+        text_shape = normed_text.shape[:-1]
+        hidden_shape = (*text_shape, -1, attn.head_dim)
+        raw_query = attn.q_proj(normed_text).view(hidden_shape)
+        raw_text_key = attn.k_proj(normed_text).view(hidden_shape)
+        query = _compile_exact_module_call(attn.q_norm, raw_query).transpose(1, 2)
+        text_key = _compile_exact_module_call(attn.k_norm, raw_text_key).transpose(1, 2)
+        text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
+        text_position_embeddings = language_model.rotary_emb(normed_text, full_text_position_ids)
+        query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, text_position_embeddings)
+
+        layer_cache = cache["layers"][layer_idx]
+        heads = _prefix_causal_attention_heads(
+            query,
+            layer_cache["visual_key"],
+            layer_cache["visual_value"],
+            text_key,
+            text_value,
+            attention_mask=attention_mask,
+            scaling=float(attn.scaling),
+        )
+        full_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
+        full_after_attention = full_layer_input + full_attention.to(dtype=full_layer_input.dtype)
+        residual = full_after_attention
+        full_post_normed = _compile_exact_module_call(layer.post_attention_layernorm, full_after_attention)
+        full_output = residual + _compile_exact_module_call(layer.mlp, full_post_normed)
+        h = full_output[:, -1:]
+        cache["layer_inputs"][layer_idx] = full_layer_input
+        cache["layer_after_attention"][layer_idx] = full_after_attention
+        cache["layers"][layer_idx]["text_key"] = text_key.contiguous()
+        cache["layers"][layer_idx]["text_value"] = text_value.contiguous()
+
+    cache["text_mask"] = full_text_mask
+    cache["text_positions"] = full_text_positions
+    cache["text_position_ids"] = full_text_position_ids
+    cache["next_position_ids"] = token_position_ids + 1
+    cache["next_text_positions"] = token_text_positions + 1
+    logits = qwen_lm_head_logits(model, language_model, h, None, logits_to_keep=logits_to_keep)
+    return logits, cache
+
+
+def qwen_visual_delta_logits_from_tensors(
+    model: torch.nn.Module,
+    adapter: QwenVisualDeltaAdapter,
+    input_ids: Tensor,
+    attention_mask: Tensor,
+    mm_token_type_ids: Tensor,
+    initial_hidden: Tensor,
+    position_ids: Tensor,
+    *,
+    collect_states: bool = False,
+    compact_no_padding: bool = False,
+    collect_state_indices: set[int] | None = None,
+    logits_to_keep: int = 0,
+    reuse_position_embeddings: bool = True,
+) -> tuple[Tensor, Tensor, list[Tensor] | None]:
+    prepared = prepare_qwen_visual_delta_inputs(
+        model,
+        adapter,
+        input_ids,
+        attention_mask,
+        mm_token_type_ids,
+        initial_hidden,
+        position_ids,
+        reuse_position_embeddings=reuse_position_embeddings,
+    )
+    return qwen_visual_delta_logits_prepared(
+        model,
+        adapter,
+        h=prepared["h"],
+        visual_memory=prepared["visual_memory"],
+        text_mask=prepared["text_mask"],
+        text_position_ids=prepared["text_position_ids"],
+        visual_position_ids=prepared["visual_position_ids"],
+        prefix_attention_mask=prepared["prefix_attention_mask"],
+        text_position_embeddings=prepared["text_position_embeddings"],
+        visual_position_embeddings=prepared["visual_position_embeddings"],
+        collect_states=collect_states,
+        collect_state_indices=collect_state_indices,
+        logits_to_keep=logits_to_keep,
+    )
+
+
 def qwen_visual_delta_logits(
     model: torch.nn.Module,
     adapter: QwenVisualDeltaAdapter,
@@ -1446,65 +2687,22 @@ def qwen_visual_delta_logits(
     logits_to_keep: int = 0,
     reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
-    language_model = model.model.language_model
     if initial_hidden is None or position_ids is None:
         initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-    text_pos, image_pos, text_position_ids, text_mask, image_mask, _ = get_qwen_text_image_positions(
+    return qwen_visual_delta_logits_from_tensors(
+        model,
+        adapter,
         inputs["input_ids"],
         inputs["attention_mask"],
         inputs["mm_token_type_ids"],
+        initial_hidden,
         position_ids,
+        collect_states=collect_states,
+        compact_no_padding=compact_no_padding,
+        collect_state_indices=collect_state_indices,
+        logits_to_keep=logits_to_keep,
+        reuse_position_embeddings=reuse_position_embeddings,
     )
-    visual_position_ids = qwen_visual_position_ids(position_ids, image_pos, image_mask)
-    compact_no_padding = qwen_can_skip_padding_masks(text_mask, image_mask, compact_no_padding)
-    text_padding_mask = None if compact_no_padding else ~text_mask
-    vision_padding_mask = None if compact_no_padding else ~image_mask
-    visual_memory = gather_batched_positions(initial_hidden, image_pos, image_mask).to(
-        dtype=next(adapter.parameters()).dtype
-    )
-    h = gather_batched_positions(initial_hidden, text_pos, text_mask).to(dtype=next(adapter.parameters()).dtype)
-    prefix_attention_mask = qwen_prefix_causal_attention_mask(text_mask, image_mask, h.device)
-    text_position_embeddings = None
-    visual_position_embeddings = None
-    if reuse_position_embeddings:
-        text_position_embeddings = language_model.rotary_emb(h, text_position_ids)
-        visual_position_embeddings = language_model.rotary_emb(visual_memory, visual_position_ids)
-    states = None
-    if collect_states:
-        if collect_state_indices is None:
-            states = [h]
-        else:
-            states = [h.new_empty(0) for _ in range(len(language_model.layers) + 1)]
-            if 0 in collect_state_indices:
-                states[0] = h
-    for layer_idx, layer in enumerate(language_model.layers):
-        vision_states = adapter.visual_memory_from_modules(
-            visual_memory,
-            adapter.visual_adapter_down[layer_idx],
-            adapter.visual_adapter_up[layer_idx],
-        )
-        text_attention = qwen_text_attention_output_with_visual_kv_for_layer(
-            language_model,
-            layer,
-            h,
-            text_position_ids,
-            vision_states,
-            visual_position_ids,
-            text_padding_mask=text_padding_mask,
-            vision_padding_mask=vision_padding_mask,
-            prefix_attention_mask=prefix_attention_mask,
-            text_position_embeddings=text_position_embeddings,
-            visual_position_embeddings=visual_position_embeddings,
-        )
-        h = run_qwen_layer_from_attention_output_for_layer(layer, h, text_attention, None)
-        if states is not None:
-            state_idx = layer_idx + 1
-            if collect_state_indices is None:
-                states.append(h)
-            elif state_idx in collect_state_indices:
-                states[state_idx] = h
-    logits = qwen_lm_head_logits(model, language_model, h, text_mask, logits_to_keep=logits_to_keep)
-    return logits, text_mask, states
 
 
 def load_qwen_visual_delta_checkpoint(
