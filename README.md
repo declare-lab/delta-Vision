@@ -16,6 +16,15 @@ No MLP computation on visual tokens at any layer -- the main source of speedup.
 
 ## Results
 
+### Latest Speed Snapshot (latest)
+
+| Model | Teacher (ms) | Ours (e2e ms) | Speedup |
+|---|---:|---:|---:|
+| Qwen3-VL-4B injection e2e | 37.03 | 18.61 | 1.99x |
+| LLaVA injection e2e | 36.59 | 20.77 | 1.76x |
+
+这两条是当前最新一次短任务 benchmark 的 e2e 对比，数值会随输入长度和 batch 略有波动。
+
 ### LLaVA Family (shared CLIP ViT-L/14@336)
 
 | Model | LLM | Teacher | Adapter-only | Params | E2E Speedup | KV Cached |
