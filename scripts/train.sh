@@ -28,6 +28,7 @@ Common:
   SAVE_EVERY=1000
 
 Qwen defaults train embedding_adapter with token-mean KL and lambda_trajectory=0.5.
+Set OUTPUT_MODE=recurrent_embedding_adapter for the recurrent embedding adapter.
 LLaVA defaults train kv_adapter.
 EOF
   exit 0
@@ -39,7 +40,12 @@ export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export DELTA_VISION_IMAGE_ROOT="$DATA_ROOT"
 
 if [[ "$MODEL_KIND" == "qwen" ]]; then
-  RUN_NAME=${RUN_NAME:-qwen_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  OUTPUT_MODE=${OUTPUT_MODE:-embedding_adapter}
+  if [[ "$OUTPUT_MODE" == "recurrent_embedding_adapter" ]]; then
+    RUN_NAME=${RUN_NAME:-qwen_recurrent_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  else
+    RUN_NAME=${RUN_NAME:-qwen_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  fi
   OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/qwen_topk1024_freezeqkv/$RUN_NAME/checkpoints}
   LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
   METRICS_JSONL=${METRICS_JSONL:-$OUTPUT_DIR/train_metrics.jsonl}
@@ -73,7 +79,6 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
   KL_TOPK=${KL_TOPK:-1024}
   LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
-  OUTPUT_MODE=${OUTPUT_MODE:-embedding_adapter}
   VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
 
   if [[ "$MODEL_PATH" != /* ]]; then
@@ -158,7 +163,14 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   )
 
 elif [[ "$MODEL_KIND" == "llava" ]]; then
-  RUN_NAME=${RUN_NAME:-llava_kv_adapter_$(date +%Y%m%d_%H%M%S)}
+  OUTPUT_MODE=${OUTPUT_MODE:-kv_adapter}
+  if [[ "$OUTPUT_MODE" == "recurrent_embedding_adapter" ]]; then
+    RUN_NAME=${RUN_NAME:-llava_recurrent_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  elif [[ "$OUTPUT_MODE" == "embedding_adapter" ]]; then
+    RUN_NAME=${RUN_NAME:-llava_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  else
+    RUN_NAME=${RUN_NAME:-llava_kv_adapter_$(date +%Y%m%d_%H%M%S)}
+  fi
   OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/$RUN_NAME}
   LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
   MODEL_PATH=${MODEL_PATH:-models/llava-1.5-7b-hf}
@@ -214,7 +226,7 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
     --kl-topk "${KL_TOPK:-1024}"
     --log-every "${LOG_EVERY:-10}"
     --save-every "${SAVE_EVERY:-500}"
-    --output-mode "${OUTPUT_MODE:-kv_adapter}"
+    --output-mode "$OUTPUT_MODE"
     --deepspeed-config "$DS_CONFIG"
     --seed "${SEED:-42}"
   )

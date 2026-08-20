@@ -30,6 +30,7 @@ from src.model import (
     extract_vision_kv,
     gather_batched_positions,
     get_qwen_text_image_positions,
+    is_embedding_adapter_mode,
     load_frozen_llava,
     load_frozen_qwen3vl,
     prepare_qwen3vl_batch_inputs,
@@ -780,9 +781,9 @@ def run_llava(args: argparse.Namespace) -> None:
     head_dim = language_model.config.hidden_size // language_model.config.num_attention_heads
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
-    if args.output_mode == "embedding_adapter":
+    if is_embedding_adapter_mode(args.output_mode):
         adapter_config = {
-            "adapter_type": "embedding_adapter",
+            "adapter_type": args.output_mode,
             "hidden_size": int(language_model.config.hidden_size),
             "num_llm_layers": num_llm_layers,
             "num_heads": int(language_model.config.num_attention_heads),
@@ -792,7 +793,7 @@ def run_llava(args: argparse.Namespace) -> None:
         }
         adapter = QwenEmbeddingAdapter.from_language_model(
             language_model,
-            mode="embedding_adapter",
+            mode=args.output_mode,
             visual_adapter_rank=args.visual_adapter_rank,
         )
     else:
@@ -839,7 +840,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     if args.init_checkpoint:
         ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=args.output_mode != "embedding_adapter")
+        missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=not is_embedding_adapter_mode(args.output_mode))
         if is_main:
             print(f"Loaded init checkpoint: {args.init_checkpoint} missing={list(missing)} unexpected={list(unexpected)}")
 
@@ -883,7 +884,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     metrics_path = Path(args.output_dir) / "train_metrics.jsonl"
     step = 0
-    use_embedding_adapter = args.output_mode == "embedding_adapter"
+    use_embedding_adapter = is_embedding_adapter_mode(args.output_mode)
 
     for epoch in range(100):
         sampler.set_epoch(epoch)
@@ -1138,6 +1139,8 @@ def run_qwen(args: argparse.Namespace) -> None:
         wandb.define_metric("train/step")
         wandb.define_metric("train/*", step_metric="train/step")
 
+    checkpoint_prefix = "qwen_recurrent_embedding_adapter" if args.output_mode == "recurrent_embedding_adapter" else "qwen_embedding_adapter"
+
     if is_rank0():
         print(
             f"qwen embedding adapter train mode={args.output_mode} world_size={world_size} "
@@ -1209,12 +1212,12 @@ def run_qwen(args: argparse.Namespace) -> None:
         if global_step % args.save_every == 0:
             engine.save_checkpoint(str(output_dir / "optimizer"), tag=f"step{global_step}")
             if is_rank0():
-                save_checkpoint(engine.module, output_dir / f"qwen_embedding_adapter_step{global_step}.pt", args, global_step)
+                save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
 
     engine.save_checkpoint(str(output_dir / "optimizer"), tag="final")
     if is_rank0():
-        save_checkpoint(engine.module, output_dir / f"qwen_embedding_adapter_step{global_step}.pt", args, global_step)
-        save_checkpoint(engine.module, output_dir / "qwen_embedding_adapter_final.pt", args, global_step)
+        save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
+        save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_final.pt", args, global_step)
     distributed_barrier(device)
     if distributed_is_initialized():
         dist.destroy_process_group()

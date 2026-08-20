@@ -319,7 +319,7 @@ def load_adapter_checkpoint(
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     saved_config = ckpt.get("adapter_config", {}) if isinstance(ckpt, dict) else {}
     output_mode = canonical_adapter_mode(saved_config.get("output_mode") or ckpt_args.get("output_mode") or "kv_adapter")
-    if output_mode == "embedding_adapter":
+    if is_embedding_adapter_mode(output_mode):
         if language_model is None:
             raise ValueError("language_model is required to load an embedding_adapter checkpoint")
         state_dict = ckpt["state_dict"]
@@ -332,7 +332,7 @@ def load_adapter_checkpoint(
         )
         adapter = QwenEmbeddingAdapter.from_language_model(
             language_model,
-            mode="embedding_adapter",
+            mode=output_mode,
             visual_adapter_rank=visual_adapter_rank,
         )
         missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
@@ -345,7 +345,6 @@ def load_adapter_checkpoint(
             "missing": list(missing),
             "unexpected": list(unexpected),
         }
-        adapter.output_mode = output_mode
         return adapter, list(metadata["source_layers"]), metadata
 
     config, source_layers = infer_adapter_config_from_checkpoint(ckpt, language_model=language_model)
@@ -1070,7 +1069,6 @@ def student_forward_llava_embedding_adapter_prepared(
     language_model = _get_language_model(model)
     layers = language_model.layers
     compile_exact = torch.compiler.is_compiling()
-    # Pre-compute all visual memories in one batched BMM (4x faster)
     all_vis_memories = adapter.all_visual_memories_batched(visual_memory)  # [L, B, N, H]
 
     for layer_idx, layer in enumerate(layers):
@@ -1085,17 +1083,8 @@ def student_forward_llava_embedding_adapter_prepared(
         text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
         query, text_key = _apply_rope_pair_from_embeddings(query, text_key, text_position_embeddings)
 
-        if compile_exact:
-            vision_states = _eager_module_call(
-                adapter.visual_memory_from_modules,
-                visual_memory,
-                adapter.visual_adapter_down[layer_idx],
-                adapter_up[layer_idx],
-            )
-            normed_vision = _eager_module_call(layer.input_layernorm, vision_states)
-        else:
-            vision_states = all_vis_memories[layer_idx]
-            normed_vision = layer.input_layernorm(vision_states)
+        vision_states = all_vis_memories[layer_idx]
+        normed_vision = _eager_module_call(layer.input_layernorm, vision_states) if compile_exact else layer.input_layernorm(vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
         visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
@@ -1157,6 +1146,7 @@ def llava_embedding_adapter_prefill_cache_prepared(
     layer_caches: list[dict[str, torch.Tensor]] = []
     layer_inputs: list[torch.Tensor] = []
     layer_after_attention: list[torch.Tensor] = []
+    layer_visual_memory = visual_memory
 
     for layer_idx, layer in enumerate(language_model.layers):
         layer_inputs.append(hidden)
@@ -1170,11 +1160,9 @@ def llava_embedding_adapter_prefill_cache_prepared(
         text_value = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
         query, text_key = _apply_rope_pair_from_embeddings(query, text_key, text_position_embeddings)
 
-        vision_states = adapter.visual_memory_from_modules(
-            visual_memory,
-            adapter.visual_adapter_down[layer_idx],
-            adapter.visual_adapter_up[layer_idx],
-        )
+        vision_states = adapter.visual_memory_for_layer(layer_visual_memory, layer_idx)
+        if adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
+            layer_visual_memory = vision_states
         normed_vision = layer.input_layernorm(vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
@@ -1205,7 +1193,7 @@ def llava_embedding_adapter_prefill_cache_prepared(
         "text_position_ids": text_position_ids.clone(),
         "image_position_ids": image_position_ids.clone(),
         "next_position_ids": text_position_ids[:, -1:].clone() + 1,
-        "mode": "embedding_adapter",
+        "mode": adapter.mode,
     }
     return logits, cache
 
@@ -1346,11 +1334,12 @@ def student_forward_flex(
 # Adapter mode names.
 KV_ADAPTER_MODE = "kv_adapter"
 EMBEDDING_ADAPTER_MODE = "embedding_adapter"
+RECURRENT_EMBEDDING_ADAPTER_MODE = "recurrent_embedding_adapter"
 _LEGACY_KV_ADAPTER_MODE = "adapter" + "_only"
 _LEGACY_EMBEDDING_ADAPTER_MODE = "native" + "_visual" + "_kv" + "_" + "inject" + "ion"
 
-QWEN_EMBEDDING_ADAPTER_MODES = (EMBEDDING_ADAPTER_MODE,)
-LLAVA_OUTPUT_MODES = (KV_ADAPTER_MODE, EMBEDDING_ADAPTER_MODE)
+QWEN_EMBEDDING_ADAPTER_MODES = (EMBEDDING_ADAPTER_MODE, RECURRENT_EMBEDDING_ADAPTER_MODE)
+LLAVA_OUTPUT_MODES = (KV_ADAPTER_MODE, EMBEDDING_ADAPTER_MODE, RECURRENT_EMBEDDING_ADAPTER_MODE)
 
 
 def canonical_adapter_mode(mode: str | None) -> str | None:
@@ -1366,8 +1355,15 @@ def canonical_adapter_mode(mode: str | None) -> str | None:
         "embedding-adapter": EMBEDDING_ADAPTER_MODE,
         "embedding adapter": EMBEDDING_ADAPTER_MODE,
         _LEGACY_EMBEDDING_ADAPTER_MODE: EMBEDDING_ADAPTER_MODE,
+        RECURRENT_EMBEDDING_ADAPTER_MODE: RECURRENT_EMBEDDING_ADAPTER_MODE,
+        "recurrent-embedding-adapter": RECURRENT_EMBEDDING_ADAPTER_MODE,
+        "recurrent embedding adapter": RECURRENT_EMBEDDING_ADAPTER_MODE,
     }
     return aliases.get(value, value)
+
+
+def is_embedding_adapter_mode(mode: str | None) -> bool:
+    return canonical_adapter_mode(mode) in QWEN_EMBEDDING_ADAPTER_MODES
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -1832,8 +1828,17 @@ class QwenEmbeddingAdapter(nn.Module):
         """Compute all L adapted visual memories in one batched BMM.
         
         Returns [L, B, N, H] - stack of adapted visual memories for each layer.
-        Numerically identical to calling visual_memory_for_layer L times.
+        Static embedding_adapter is batched; recurrent_embedding_adapter feeds each
+        layer's visual memory into the next layer's adapter block.
         """
+        if self.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
+            memories = []
+            current = visual_memory
+            for layer_idx in range(self.num_layers):
+                current = self.visual_memory_for_layer(current, layer_idx)
+                memories.append(current)
+            return torch.stack(memories, dim=0)
+
         L = self.num_layers
         B, N, H = visual_memory.shape
         if self.training:
@@ -1857,6 +1862,14 @@ class QwenEmbeddingAdapter(nn.Module):
             self.visual_adapter_down[layer_idx],
             self.visual_adapter_up[layer_idx],
         )
+
+    def base_visual_memory_for_layer(self, visual_memory: Tensor, layer_idx: int) -> Tensor:
+        if self.mode != RECURRENT_EMBEDDING_ADAPTER_MODE:
+            return visual_memory
+        current = visual_memory
+        for idx in range(layer_idx):
+            current = self.visual_memory_for_layer(current, idx)
+        return current
 
     def visual_memory_from_modules(
         self,
@@ -2293,12 +2306,10 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     language_model = model.model.language_model
     layers = language_model.layers
     rotary_emb = language_model.rotary_emb
-    adapter_down = adapter.visual_adapter_down
-    adapter_up = adapter.visual_adapter_up
-    visual_memory_from_modules = adapter.visual_memory_from_modules
     layer_caches: list[dict[str, Tensor]] = []
     layer_inputs: list[Tensor] = []
     layer_after_attention: list[Tensor] = []
+    layer_visual_memory = visual_memory
 
     for layer_idx, layer in enumerate(layers):
         layer_inputs.append(h)
@@ -2316,12 +2327,9 @@ def qwen_embedding_adapter_prefill_cache_prepared(
             layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
         query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
 
-        vision_states = _compile_exact_module_call(
-            visual_memory_from_modules,
-            visual_memory,
-            adapter_down[layer_idx],
-            adapter_up[layer_idx],
-        )
+        vision_states = adapter.visual_memory_for_layer(layer_visual_memory, layer_idx)
+        if adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
+            layer_visual_memory = vision_states
         normed_vision = _compile_exact_module_call(layer.input_layernorm, vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
@@ -2646,17 +2654,21 @@ def load_qwen_embedding_adapter_checkpoint(
 ) -> tuple[QwenEmbeddingAdapter, dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    saved_config = checkpoint.get("adapter_config", {}) if isinstance(checkpoint, dict) else {}
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    mode = canonical_adapter_mode(str(checkpoint_args.get("output_mode", "embedding_adapter")))
+    mode = canonical_adapter_mode(str(saved_config.get("output_mode") or checkpoint_args.get("output_mode", "embedding_adapter")))
     if mode not in QWEN_EMBEDDING_ADAPTER_MODES:
         raise ValueError(f"checkpoint output_mode={mode!r} is not a Qwen embedding adapter mode")
     adapter = QwenEmbeddingAdapter.from_language_model(
         language_model,
         mode=mode,
         visual_adapter_rank=int(
-            checkpoint_args.get(
+            saved_config.get(
                 "visual_adapter_rank",
-                checkpoint_args.get("visual_transform_rank", 128),
+                checkpoint_args.get(
+                    "visual_adapter_rank",
+                    checkpoint_args.get("visual_transform_rank", 128),
+                ),
             )
         ),
     ).to(device=device, dtype=dtype)

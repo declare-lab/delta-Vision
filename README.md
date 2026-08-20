@@ -1,5 +1,15 @@
 # Vision KV Inject
 
+## Diagnostic Boundary
+
+All diagnostic experiments must live under `test/`.
+
+- Put diagnostic scripts in `test/diagnostics/`.
+- Put diagnostic configs in `test/configs/`.
+- Put diagnostic outputs in `test/results/`.
+- Do not put diagnostic scripts, temporary configs, logs, plots, JSON/CSV outputs, or scratch
+  experiment results under `src/`, `scripts/`, or `artifacts/`.
+
 This repository trains and evaluates lightweight visual adapters for VLM prefill acceleration.
 The current maintained scope is intentionally small:
 
@@ -248,7 +258,7 @@ writes aggregate CSV/JSON summaries with:
 ## Prefill Speed / Metric Table
 
 `src/benchmark_prefill.py` is the unified prefill benchmark utility. The old
-`src/qwen_benchmark_utils.py` path is only a compatibility shim.
+`src/qwen_benchmark_utils.py` path has been removed.
 
 Small Qwen metric table:
 
@@ -308,6 +318,17 @@ Shell entries:
 scripts/train.sh          Unified training wrapper.
 scripts/eval_benchmark.sh Unified benchmark evaluation wrapper.
 ```
+
+Diagnostic experiments:
+
+```text
+test/diagnostics/         Diagnostic experiment scripts.
+test/configs/             Diagnostic experiment configs.
+test/results/             Diagnostic outputs, ignored by git.
+```
+
+Keep exploratory diagnostics under `test/`. Do not mix temporary experiment code or results into
+`src/`, `scripts/`, or `artifacts/`.
 
 ## Current Compatibility Policy
 

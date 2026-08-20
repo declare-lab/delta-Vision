@@ -11,6 +11,7 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 MODEL_KIND=${MODEL_KIND:-qwen}
 BENCHMARK=${BENCHMARK:-mmstar}
 BENCHMARKS=${BENCHMARKS:-}
+OUTPUT_MODE=${OUTPUT_MODE:-}
 STEP=${STEP:-500}
 STEPS=${STEPS:-}
 EVAL_ALL_CKPTS=${EVAL_ALL_CKPTS:-0}
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --checkpoint|--ckpt)
       CKPT="$2"
+      shift 2
+      ;;
+    --output-mode)
+      OUTPUT_MODE="$2"
       shift 2
       ;;
     --run-dir)
@@ -98,6 +103,7 @@ Options:
   --model-path PATH        Base model path. Relative paths resolve under DATA_ROOT.
   --data PATH              Override benchmark JSONL path. Use only for single eval.
   --checkpoint PATH        Adapter checkpoint path. Use only for single eval.
+  --output-mode MODE       Override checkpoint output mode, e.g. recurrent_embedding_adapter.
   --run-dir PATH           Run directory containing checkpoints.
   --step N                 Single checkpoint step.
   --steps LIST             Space-separated checkpoint steps.
@@ -161,8 +167,8 @@ step_list_for_run() {
   ckpt_dir="$(checkpoint_dir_for_run "$run_dir")"
   if [[ "$MODEL_KIND" == "qwen" ]]; then
     local legacy_qwen_checkpoint_prefix="qwen_visual""_""del""ta"
-    find "$ckpt_dir" -maxdepth 1 -type f \( -name 'qwen_embedding_adapter_step*.pt' -o -name "${legacy_qwen_checkpoint_prefix}_step*.pt" \) -printf '%f\n' \
-      | sed -E "s/^(qwen_embedding_adapter|${legacy_qwen_checkpoint_prefix})_step([0-9]+)\.pt$/\2/" \
+    find "$ckpt_dir" -maxdepth 1 -type f \( -name 'qwen_embedding_adapter_step*.pt' -o -name 'qwen_recurrent_embedding_adapter_step*.pt' -o -name "${legacy_qwen_checkpoint_prefix}_step*.pt" \) -printf '%f\n' \
+      | sed -E "s/^(qwen_embedding_adapter|qwen_recurrent_embedding_adapter|${legacy_qwen_checkpoint_prefix})_step([0-9]+)\.pt$/\2/" \
       | sort -n -u
   else
     find "$ckpt_dir" -maxdepth 1 -type f -name 'step_*.pt' -printf '%f\n' \
@@ -230,6 +236,7 @@ if [[ "${SINGLE_EVAL:-0}" != "1" && ( -n "$BENCHMARKS" || -n "$STEPS" || "$EVAL_
       RUN_DIR="$RUN_DIR" \
       STEP="$step" \
       OUT_DIR="$out_dir" \
+      OUTPUT_MODE="$OUTPUT_MODE" \
       MAX_SAMPLES="$MAX_SAMPLES" \
       NUM_SHARDS="$NUM_SHARDS" \
       TEACHER_CACHE_DIR="$TEACHER_CACHE_DIR" \
@@ -371,6 +378,10 @@ if [[ -z "${CKPT:-}" && -n "${RUN_DIR:-}" ]]; then
       "$RUN_DIR/checkpoints/qwen_embedding_adapter_step${STEP}.pt" \
       "$RUN_DIR/qwen_embedding_adapter_final.pt" \
       "$RUN_DIR/checkpoints/qwen_embedding_adapter_final.pt" \
+      "$RUN_DIR/qwen_recurrent_embedding_adapter_step${STEP}.pt" \
+      "$RUN_DIR/checkpoints/qwen_recurrent_embedding_adapter_step${STEP}.pt" \
+      "$RUN_DIR/qwen_recurrent_embedding_adapter_final.pt" \
+      "$RUN_DIR/checkpoints/qwen_recurrent_embedding_adapter_final.pt" \
       "$RUN_DIR/${legacy_qwen_checkpoint_prefix}_step${STEP}.pt" \
       "$RUN_DIR/checkpoints/${legacy_qwen_checkpoint_prefix}_step${STEP}.pt" \
       "$RUN_DIR/${legacy_qwen_checkpoint_prefix}_final.pt" \
@@ -461,6 +472,10 @@ ANSWER_ARGS=()
 if [[ -n "${ANSWER_INSTRUCTION:-}" ]]; then
   ANSWER_ARGS=(--answer-instruction "$ANSWER_INSTRUCTION")
 fi
+OUTPUT_MODE_ARGS=()
+if [[ -n "$OUTPUT_MODE" ]]; then
+  OUTPUT_MODE_ARGS=(--output-mode "$OUTPUT_MODE")
+fi
 PREFILL_ARGS=()
 if [[ "${MEASURE_PREFILL:-1}" == "0" ]]; then
   PREFILL_ARGS=(--no-measure-prefill)
@@ -540,6 +555,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     --max-new-tokens "$MAX_NEW_TOKENS" \
     "${MAX_SAMPLE_ARGS[@]}" \
     "${ANSWER_ARGS[@]}" \
+    "${OUTPUT_MODE_ARGS[@]}" \
     "${PREFILL_ARGS[@]}" \
     "${EARLY_STOP_ARGS[@]}" \
     "${COMPILE_ARGS[@]}" \
@@ -569,6 +585,7 @@ done
   --max-new-tokens "$MAX_NEW_TOKENS" \
   "${MAX_SAMPLE_ARGS[@]}" \
   "${ANSWER_ARGS[@]}" \
+  "${OUTPUT_MODE_ARGS[@]}" \
   "${PREFILL_ARGS[@]}" \
   "${EARLY_STOP_ARGS[@]}" \
   "${COMPILE_ARGS[@]}" \

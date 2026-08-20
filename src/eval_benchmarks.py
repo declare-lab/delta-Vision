@@ -42,6 +42,7 @@ from src.model import (
     teacher_forward,
     canonical_adapter_mode,
     dtype_from_name,
+    is_embedding_adapter_mode,
     build_qwen_initial_context,
     load_or_build_qwen_initial_context,
     load_frozen_qwen3vl,
@@ -272,7 +273,7 @@ def generate_adapter_llava(
     logits = None
     decode_cache = None
     if adapter_decode_cache:
-        if output_mode == "embedding_adapter":
+        if is_embedding_adapter_mode(output_mode):
             logits, decode_cache = llava_embedding_adapter_prefill_cache(
                 model,
                 adapter,
@@ -295,7 +296,7 @@ def generate_adapter_llava(
 
     for _ in range(max_new_tokens):
         if logits is None:
-            if output_mode == "embedding_adapter":
+            if is_embedding_adapter_mode(output_mode):
                 logits = student_forward_llava_embedding_adapter(
                     model,
                     full_ids,
@@ -326,7 +327,7 @@ def generate_adapter_llava(
             break
         if adapter_decode_cache:
             assert decode_cache is not None
-            if output_mode == "embedding_adapter":
+            if is_embedding_adapter_mode(output_mode):
                 logits, decode_cache = llava_embedding_adapter_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
             else:
                 logits, decode_cache = llava_kv_adapter_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
@@ -390,7 +391,7 @@ def evaluate_llava_shard(
         choices = item.get("choices")
         text_tokens, image_tokens = _llava_token_counts(input_ids, attention_mask, image_token_id)
 
-        if output_mode == "embedding_adapter":
+        if is_embedding_adapter_mode(output_mode):
             source_k = source_v = None
             source_s = 0.0
         else:
@@ -419,7 +420,7 @@ def evaluate_llava_shard(
         )
 
         def adapter_prefill():
-            if output_mode == "embedding_adapter":
+            if is_embedding_adapter_mode(output_mode):
                 if adapter_decode_cache:
                     return llava_embedding_adapter_prefill_cache(
                         model,
@@ -569,7 +570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shard-id", type=int, default=None, help="If set, only run this shard")
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--output-mode", choices=("kv_adapter", "embedding_adapter"), default=None)
+    parser.add_argument("--output-mode", choices=("kv_adapter", "embedding_adapter", "recurrent_embedding_adapter"), default=None)
     parser.add_argument("--answer-instruction", default=None)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="auto")
@@ -2033,6 +2034,10 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
     configure_torch_runtime()
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
     adapter, meta = load_qwen_embedding_adapter_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
+    if args.output_mode is not None:
+        if not is_embedding_adapter_mode(args.output_mode):
+            raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
+        adapter.mode = args.output_mode
     if meta["missing"] or meta["unexpected"]:
         print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
     adapter_logits_fn = build_qwen_adapter_logits_fn(

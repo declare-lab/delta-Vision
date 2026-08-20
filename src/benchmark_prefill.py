@@ -965,6 +965,7 @@ def print_qwen_results(
 def run_qwen3vl(args: argparse.Namespace) -> None:
     from src.model import (
         build_qwen_initial_context,
+        is_embedding_adapter_mode,
         load_or_build_qwen_initial_context,
         load_frozen_qwen3vl,
         load_qwen_embedding_adapter_checkpoint,
@@ -1079,7 +1080,11 @@ def run_qwen3vl(args: argparse.Namespace) -> None:
             device,
             dtype,
         )
-        mode = str(meta.get("args", {}).get("output_mode", getattr(adapter, "mode", "")))
+        if args.output_mode is not None:
+            if not is_embedding_adapter_mode(args.output_mode):
+                raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
+            adapter.mode = args.output_mode
+        mode = str(getattr(adapter, "mode", meta.get("args", {}).get("output_mode", "")))
         total_params = count_total_params(adapter)
         active_params = count_active_qwen_params(adapter)
         checkpoint_gb = checkpoint.stat().st_size / (1024.0**3)
@@ -1206,6 +1211,7 @@ def run_qwen3vl(args: argparse.Namespace) -> None:
 def run_qwen3vl_batch_prefill(args: argparse.Namespace) -> None:
     from src.model import (
         build_qwen_initial_context,
+        is_embedding_adapter_mode,
         load_or_build_qwen_initial_context,
         load_frozen_qwen3vl,
         load_qwen_embedding_adapter_checkpoint,
@@ -1261,6 +1267,10 @@ def run_qwen3vl_batch_prefill(args: argparse.Namespace) -> None:
     adapter_e2e_forwards: dict[str, Callable[[dict[str, torch.Tensor]], torch.Tensor]] = {}
     for label, checkpoint in checkpoint_specs:
         adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
+        if args.output_mode is not None:
+            if not is_embedding_adapter_mode(args.output_mode):
+                raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
+            adapter.mode = args.output_mode
         adapters.append((label, checkpoint, adapter, meta))
         adapter_cached_forwards[label] = build_qwen_benchmark_delta_fn(
             model,
@@ -1658,7 +1668,7 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
     from src.benchmarks import get_benchmark_spec
     from src.data import QwenBenchmarkDataset
     from src.eval_benchmarks import build_qwen_adapter_logits_fn, evaluate_qwen_benchmark_shard
-    from src.model import load_frozen_qwen3vl, load_qwen_embedding_adapter_checkpoint
+    from src.model import is_embedding_adapter_mode, load_frozen_qwen3vl, load_qwen_embedding_adapter_checkpoint
 
     checkpoint_specs = collect_checkpoint_specs(args)
     if len(checkpoint_specs) != 1:
@@ -1674,6 +1684,10 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
     label, checkpoint = checkpoint_specs[0]
     adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
+    if args.output_mode is not None:
+        if not is_embedding_adapter_mode(args.output_mode):
+            raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
+        adapter.mode = args.output_mode
     if meta["missing"] or meta["unexpected"]:
         print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
 
@@ -1784,6 +1798,7 @@ def run_llava(args: argparse.Namespace) -> None:
         extract_vision_kv,
         load_adapter_checkpoint,
         load_frozen_llava,
+        is_embedding_adapter_mode,
         llava_projected_image_features,
         prepare_llava_kv_adapter_inputs,
         prepare_llava_embedding_adapter_inputs,
@@ -1823,8 +1838,8 @@ def run_llava(args: argparse.Namespace) -> None:
     else:
         raise ValueError("LLaVA benchmark requires --checkpoint")
     output_mode = args.output_mode or str(metadata.get("output_mode") or "kv_adapter")
-    if output_mode not in ("kv_adapter", "embedding_adapter"):
-        raise ValueError(f"LLaVA benchmark only supports kv_adapter/embedding_adapter, got {output_mode!r}")
+    if output_mode not in ("kv_adapter", "embedding_adapter", "recurrent_embedding_adapter"):
+        raise ValueError(f"LLaVA benchmark only supports kv_adapter/embedding_adapter/recurrent_embedding_adapter, got {output_mode!r}")
     if bool(args.cuda_graph) and bool(args.compile_e2e):
         raise RuntimeError("--cuda-graph and --compile-e2e are separate LLaVA e2e fast paths; enable only one")
     kv_adapter_prepared_fn = (
@@ -1840,7 +1855,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     attention_mask = inputs.get("attention_mask", None)
     with torch.inference_mode():
-        if output_mode == "embedding_adapter":
+        if is_embedding_adapter_mode(output_mode):
             visual_memory = llava_projected_image_features(model, inputs.pixel_values)
             source_k = source_v = None
         else:
@@ -1849,7 +1864,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     e2e_graph_runner = None
     if bool(args.cuda_graph):
-        if output_mode == "embedding_adapter":
+        if is_embedding_adapter_mode(output_mode):
             e2e_graph_runner = PreparedCudaGraphRunner(
                 "llava_embedding_adapter_e2e_cuda_graph",
                 lambda prepared: injection_prepared_fn(model, adapter, **prepared),
@@ -1867,7 +1882,7 @@ def run_llava(args: argparse.Namespace) -> None:
             )
 
     def adapter_forward_with_extraction() -> torch.Tensor:
-        if output_mode == "embedding_adapter":
+        if is_embedding_adapter_mode(output_mode):
             if e2e_graph_runner is not None:
                 next_visual_memory = llava_projected_image_features(model, inputs.pixel_values)
                 prepared = prepare_llava_embedding_adapter_inputs(
@@ -1929,7 +1944,7 @@ def run_llava(args: argparse.Namespace) -> None:
             attention_mask=attention_mask,
         )
 
-    if output_mode == "embedding_adapter":
+    if is_embedding_adapter_mode(output_mode):
         assert visual_memory is not None
         cached_prepared = prepare_llava_embedding_adapter_inputs(
             model,
@@ -2164,7 +2179,7 @@ def parse_args() -> argparse.Namespace:
         default="default",
         help="Force a PyTorch SDPA backend for diagnostics. Default leaves backend selection unchanged.",
     )
-    parser.add_argument("--output-mode", choices=("kv_adapter", "embedding_adapter"), default=None)
+    parser.add_argument("--output-mode", choices=("kv_adapter", "embedding_adapter", "recurrent_embedding_adapter"), default=None)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
