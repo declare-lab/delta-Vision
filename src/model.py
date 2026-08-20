@@ -1296,41 +1296,6 @@ def student_forward_llava_embedding_adapter(
     return student_forward_llava_embedding_adapter_prepared(model, adapter, **prepared)
 
 
-def student_forward_optimized(
-    model: LlavaForConditionalGeneration,
-    input_ids: torch.Tensor,
-    adapter: PerLayerKVAdapter,
-    source_k: torch.Tensor,
-    source_v: torch.Tensor,
-    image_token_id: int,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compatibility wrapper for the older flash-attention experiment.
-
-    The old Q-padding trick only matched a synthetic image-prefix layout. Route
-    through the canonical path so benchmarks cannot silently use different
-    sequence semantics.
-    """
-    return student_forward_with_visual_kv(
-        model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
-    )
-
-
-def student_forward_flex(
-    model: LlavaForConditionalGeneration,
-    input_ids: torch.Tensor,
-    adapter: PerLayerKVAdapter,
-    source_k: torch.Tensor,
-    source_v: torch.Tensor,
-    image_token_id: int,
-    attention_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compatibility wrapper for the older flex-attention experiment."""
-    return student_forward_with_visual_kv(
-        model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
-    )
-
-
 # Adapter mode names.
 KV_ADAPTER_MODE = "kv_adapter"
 EMBEDDING_ADAPTER_MODE = "embedding_adapter"
@@ -1731,14 +1696,6 @@ def qwen_visual_position_ids(full_position_ids: Tensor, image_positions: Tensor,
     return visual_position_ids
 
 
-def qwen_can_skip_padding_masks(text_mask: Tensor, image_mask: Tensor, compact_no_padding: bool) -> bool:
-    if not compact_no_padding:
-        return False
-    if text_mask.shape[0] <= 1:
-        return True
-    return bool(text_mask.all().item() and image_mask.all().item())
-
-
 def qwen_prefix_causal_attention_mask(
     text_mask: Tensor,
     image_mask: Tensor,
@@ -1882,68 +1839,6 @@ class QwenEmbeddingAdapter(nn.Module):
         adapted = adapted.to(dtype=visual_memory.dtype)
         adapted.add_(visual_memory)
         return adapted
-
-
-def qwen_text_attention_output(
-    language_model: torch.nn.Module,
-    layer_idx: int,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-    padding_mask: Tensor | None = None,
-) -> Tensor:
-    return qwen_text_attention_output_for_layer(
-        language_model,
-        language_model.layers[layer_idx],
-        hidden_states,
-        position_ids,
-        padding_mask,
-    )
-
-
-def qwen_text_attention_output_for_layer(
-    language_model: torch.nn.Module,
-    layer: torch.nn.Module,
-    hidden_states: Tensor,
-    position_ids: Tensor,
-    padding_mask: Tensor | None = None,
-) -> Tensor:
-    attention_mask_2d = None if padding_mask is None else (~padding_mask).to(dtype=torch.long)
-    text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
-    attention_mask = create_causal_mask(
-        config=language_model.config,
-        inputs_embeds=hidden_states,
-        attention_mask=attention_mask_2d,
-        past_key_values=None,
-        position_ids=text_position_ids,
-    )
-    position_embeddings = language_model.rotary_emb(hidden_states, position_ids)
-    normed = layer.input_layernorm(hidden_states)
-    attn_output, _ = layer.self_attn(
-        hidden_states=normed,
-        position_embeddings=position_embeddings,
-        attention_mask=attention_mask,
-        past_key_values=None,
-    )
-    return attn_output
-
-
-def qwen_project_visual_kv(
-    language_model: torch.nn.Module,
-    layer_idx: int,
-    vision_states: Tensor,
-    visual_position_ids: Tensor,
-    padding_mask: Tensor | None,
-    *,
-    repeat_kv: bool = True,
-) -> tuple[Tensor, Tensor, Tensor | None]:
-    return qwen_project_visual_kv_for_layer(
-        language_model,
-        language_model.layers[layer_idx],
-        vision_states,
-        visual_position_ids,
-        padding_mask,
-        repeat_kv=repeat_kv,
-    )
 
 
 def qwen_project_visual_kv_for_layer(

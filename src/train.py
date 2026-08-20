@@ -409,23 +409,6 @@ def masked_ce_loss(
     return token_mean.to(dtype=student_logits.dtype), per_sample.to(dtype=student_logits.dtype), answer_counts
 
 
-def qwen_eos_token_ids(tokenizer: Any) -> set[int]:
-    raw_ids = tokenizer.eos_token_id
-    if raw_ids is None:
-        return set()
-    if isinstance(raw_ids, int):
-        return {int(raw_ids)}
-    return {int(token_id) for token_id in raw_ids}
-
-
-def qwen_last_token_logits(logits: Tensor, text_mask: Tensor) -> Tensor:
-    if logits.shape[1] == 1:
-        return logits[:, -1]
-    last_idx = text_mask.long().sum(dim=1).sub(1).clamp_min(0)
-    batch_idx = torch.arange(logits.shape[0], device=logits.device)
-    return logits[batch_idx, last_idx]
-
-
 def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
     paths = resolve_row_image_paths(row, image_root)
     total = 0
