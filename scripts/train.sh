@@ -4,50 +4,240 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PY=${PY:-.venv/bin/python}
-MODEL_PATH=${MODEL_PATH:-../delta-vision/models/llava-1.5-7b-hf}
-DATA=${DATA:-../delta-vision/data/pixmo_ama_train.jsonl}
-DATA_ROOT=${DATA_ROOT:-../delta-vision}
-RUN_NAME=${RUN_NAME:-vkv_inject_$(date +%Y%m%d_%H%M%S)}
-OUT_DIR=${OUT_DIR:-artifacts/$RUN_NAME}
+PY=${PY:-$ROOT_DIR/.venv/bin/python}
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
-NUM_GPUS=${NUM_GPUS:-8}
-MASTER_PORT=${MASTER_PORT:-29500}
+MODEL_KIND=${MODEL_KIND:-qwen}
+MODEL_KIND="$(printf '%s' "$MODEL_KIND" | tr '[:upper:]' '[:lower:]')"
+DATA_ROOT=${DATA_ROOT:-/lustre-data/leijingdi/code/delta-vision}
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-export TOKENIZERS_PARALLELISM=false
-export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
-export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo}
-export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
-export NCCL_NET=Socket
-unset NCCL_NET_PLUGIN 2>/dev/null || true
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage: scripts/train.sh
 
-WANDB_ARGS=""
-if [[ "${WANDB:-0}" == "1" ]]; then
-  WANDB_ARGS="--wandb --wandb-project ${WANDB_PROJECT:-vision-kv-inject} --wandb-run-name ${RUN_NAME} --wandb-mode ${WANDB_MODE:-online}"
+Configure with environment variables.
+
+Common:
+  MODEL_KIND=qwen|llava
+  RUN_NAME=NAME
+  MODEL_PATH=PATH
+  DATA=JSONL
+  DATA_ROOT=PATH
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  MAX_STEPS=12000
+  SAVE_EVERY=1000
+
+Qwen defaults train embedding_adapter with token-mean KL and lambda_trajectory=0.5.
+LLaVA defaults train kv_adapter.
+EOF
+  exit 0
 fi
 
-echo "=== Vision KV Inject Training ==="
-echo "run=$RUN_NAME"
-echo "output=$OUT_DIR"
-echo "data=$DATA"
-echo "gpus=$NUM_GPUS"
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+export DELTA_VISION_IMAGE_ROOT="$DATA_ROOT"
 
-$PY -m torch.distributed.run \
-  --nproc_per_node "$NUM_GPUS" \
-  --master_port "$MASTER_PORT" \
-  -m src.train \
-  --model-path "$MODEL_PATH" \
-  --data "$DATA" \
-  --data-root "$DATA_ROOT" \
-  --output-dir "$OUT_DIR" \
-  --max-steps "${MAX_STEPS:-4000}" \
-  --batch-size "${BATCH_SIZE:-1}" \
-  --lr "${LR:-1e-4}" \
-  --kl-topk "${KL_TOPK:-1024}" \
-  --log-every "${LOG_EVERY:-10}" \
-  --save-every "${SAVE_EVERY:-500}" \
-  --deepspeed-config configs/ds_zero2.json \
-  --seed 42 \
-  $WANDB_ARGS
+if [[ "$MODEL_KIND" == "qwen" ]]; then
+  RUN_NAME=${RUN_NAME:-qwen_embedding_adapter_$(date +%Y%m%d_%H%M%S)}
+  OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/qwen_topk1024_freezeqkv/$RUN_NAME/checkpoints}
+  LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
+  METRICS_JSONL=${METRICS_JSONL:-$OUTPUT_DIR/train_metrics.jsonl}
+  INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
+
+  MODEL_PATH=${MODEL_PATH:-models/Qwen3-VL-4B-Instruct}
+  DATA=${DATA:-artifacts/data_quality/pixmo_ama_full_valid.clean.jsonl}
+  DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2_coeff.json}
+  PIXEL_AREA_CACHE=${PIXEL_AREA_CACHE:-$ROOT_DIR/artifacts/cache/pixmo_ama_full_valid.clean.pixel_areas.json}
+
+  NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+  MASTER_PORT=${MASTER_PORT:-29540}
+  ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
+  DTYPE=${DTYPE:-bfloat16}
+  MAX_STEPS=${MAX_STEPS:-500}
+  SAVE_EVERY=${SAVE_EVERY:-$MAX_STEPS}
+  LOG_EVERY=${LOG_EVERY:-5}
+  MICRO_BATCH_SIZE_PER_GPU=${MICRO_BATCH_SIZE_PER_GPU:-4}
+  GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+  REQUIRED_WORLD_SIZE=${REQUIRED_WORLD_SIZE:-$NPROC_PER_NODE}
+  DISTRIBUTED_ENGINE=${DISTRIBUTED_ENGINE:-torch_grad_sync}
+
+  LR=${LR:-5e-5}
+  LR_SCHEDULER=${LR_SCHEDULER:-constant}
+  WARMUP_RATIO=${WARMUP_RATIO:-0.0}
+  WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
+  MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+  LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-token}
+  SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
+  LAMBDA_LOGIT=${LAMBDA_LOGIT:-4.0}
+  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
+  KL_TOPK=${KL_TOPK:-1024}
+  LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
+  OUTPUT_MODE=${OUTPUT_MODE:-embedding_adapter}
+  VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
+
+  if [[ "$MODEL_PATH" != /* ]]; then
+    MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+  fi
+  if [[ "$DATA" != /* ]]; then
+    if [[ -f "$ROOT_DIR/$DATA" ]]; then
+      DATA="$ROOT_DIR/$DATA"
+    else
+      DATA="$DATA_ROOT/$DATA"
+    fi
+  fi
+
+  if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
+    unset NCCL_NET
+    unset NCCL_IB_DISABLE
+    unset NCCL_SOCKET_IFNAME
+    unset GLOO_SOCKET_IFNAME
+    unset TORCH_NCCL_ASYNC_ERROR_HANDLING
+  fi
+  for name in NCCL_IB_DISABLE NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_NET; do
+    if [[ -n "${!name:-}" ]]; then
+      export "$name"
+    fi
+  done
+
+  mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")" "$(dirname "$PIXEL_AREA_CACHE")"
+
+  echo "=== Qwen3-VL embedding_adapter train ==="
+  echo "root=$ROOT_DIR"
+  echo "data_root=$DATA_ROOT"
+  echo "run_name=$RUN_NAME"
+  echo "output_dir=$OUTPUT_DIR"
+  echo "metrics=$METRICS_JSONL"
+  echo "init_checkpoint=${INIT_CHECKPOINT:-none}"
+  echo "pixel_area_cache=$PIXEL_AREA_CACHE"
+  echo "log=$LOG_FILE"
+  echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
+  echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
+  echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+  echo "lambda_logit=$LAMBDA_LOGIT lambda_trajectory=$LAMBDA_TRAJECTORY lambda_kv_mse=$LAMBDA_KV_MSE"
+  echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
+
+  CMD=(
+    "$PY" -m torch.distributed.run
+    --nproc_per_node "$NPROC_PER_NODE"
+    --master_port "$MASTER_PORT"
+    -m src.train
+    --model-kind qwen
+    --data "$DATA"
+    --image-root "$DATA_ROOT"
+    --model-path "$MODEL_PATH"
+    --output-dir "$OUTPUT_DIR"
+    --metrics-jsonl "$METRICS_JSONL"
+    --init-checkpoint "$INIT_CHECKPOINT"
+    --max-steps "$MAX_STEPS" --save-every "$SAVE_EVERY"
+    --required-world-size "$REQUIRED_WORLD_SIZE"
+    --micro-batch-size-per-gpu "$MICRO_BATCH_SIZE_PER_GPU" --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS"
+    --lr "$LR" --lr-scheduler "$LR_SCHEDULER"
+    --warmup-ratio "$WARMUP_RATIO"
+    --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO"
+    --min-lr-ratio "$MIN_LR_RATIO"
+    --weight-decay "${WEIGHT_DECAY:-0.01}" --temperature "${TEMPERATURE:-2.0}"
+    --kl-topk "$KL_TOPK"
+    --lambda-trajectory "$LAMBDA_TRAJECTORY" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
+    --loss-normalization "$LOSS_NORMALIZATION"
+    --supervision-loss "$SUPERVISION_LOSS"
+    --output-mode "$OUTPUT_MODE"
+    --visual-adapter-rank "$VISUAL_ADAPTER_RANK"
+    --batch-sampling "${BATCH_SAMPLING:-pixel_bucket}"
+    --pixel-bucket-size "${PIXEL_BUCKET_SIZE:-512}"
+    --pixel-area-cache "$PIXEL_AREA_CACHE"
+    --trajectory-layers "${TRAJECTORY_LAYERS:-4,8,12,16,20,24,28,32,36}"
+    --deepspeed-config "$DS_CONFIG"
+    --dtype "$DTYPE"
+    --attn-implementation "$ATTN_IMPL"
+    --dist-backend "${DIST_BACKEND:-nccl}"
+    --distributed-engine "$DISTRIBUTED_ENGINE"
+    --grad-clip "${GRAD_CLIP:-1.0}"
+    --log-every "$LOG_EVERY"
+    --seed "${SEED:-44}"
+  )
+
+elif [[ "$MODEL_KIND" == "llava" ]]; then
+  RUN_NAME=${RUN_NAME:-llava_kv_adapter_$(date +%Y%m%d_%H%M%S)}
+  OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/$RUN_NAME}
+  LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
+  MODEL_PATH=${MODEL_PATH:-models/llava-1.5-7b-hf}
+  DATA=${DATA:-data/pixmo_ama_train.jsonl}
+  DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}
+  NPROC_PER_NODE=${NPROC_PER_NODE:-${NUM_GPUS:-8}}
+  MASTER_PORT=${MASTER_PORT:-29500}
+
+  if [[ "$MODEL_PATH" != /* ]]; then
+    if [[ -e "$ROOT_DIR/$MODEL_PATH" ]]; then
+      MODEL_PATH="$ROOT_DIR/$MODEL_PATH"
+    else
+      MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+    fi
+  fi
+  if [[ "$DATA" != /* ]]; then
+    if [[ -f "$ROOT_DIR/$DATA" ]]; then
+      DATA="$ROOT_DIR/$DATA"
+    else
+      DATA="$DATA_ROOT/$DATA"
+    fi
+  fi
+
+  export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo}
+  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
+  export NCCL_NET=${NCCL_NET:-Socket}
+  unset NCCL_NET_PLUGIN 2>/dev/null || true
+
+  mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
+
+  echo "=== LLaVA kv_adapter train ==="
+  echo "root=$ROOT_DIR"
+  echo "run_name=$RUN_NAME"
+  echo "output_dir=$OUTPUT_DIR"
+  echo "model_path=$MODEL_PATH"
+  echo "data=$DATA"
+  echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
+
+  CMD=(
+    "$PY" -m torch.distributed.run
+    --nproc_per_node "$NPROC_PER_NODE"
+    --master_port "$MASTER_PORT"
+    -m src.train
+    --model-kind llava
+    --model-path "$MODEL_PATH"
+    --data "$DATA"
+    --data-root "$DATA_ROOT"
+    --output-dir "$OUTPUT_DIR"
+    --max-steps "${MAX_STEPS:-4000}"
+    --batch-size "${BATCH_SIZE:-1}"
+    --lr "${LR:-1e-4}"
+    --kl-topk "${KL_TOPK:-1024}"
+    --log-every "${LOG_EVERY:-10}"
+    --save-every "${SAVE_EVERY:-500}"
+    --output-mode "${OUTPUT_MODE:-kv_adapter}"
+    --deepspeed-config "$DS_CONFIG"
+    --seed "${SEED:-42}"
+  )
+else
+  echo "MODEL_KIND must be qwen or llava, got $MODEL_KIND" >&2
+  exit 1
+fi
+
+if [[ "${WANDB:-0}" == "1" ]]; then
+  CMD+=(
+    --wandb
+    --wandb-project "${WANDB_PROJECT:-vision-kv-inject}"
+    --wandb-run-name "${WANDB_RUN_NAME:-$RUN_NAME}"
+    --wandb-mode "${WANDB_MODE:-online}"
+  )
+  if [[ -n "${WANDB_ENTITY:-}" ]]; then
+    CMD+=(--wandb-entity "$WANDB_ENTITY")
+  fi
+  if [[ -n "${WANDB_RUN_ID:-}" ]]; then
+    CMD+=(--wandb-run-id "$WANDB_RUN_ID")
+  fi
+else
+  CMD+=(--wandb-mode disabled)
+fi
+
+"${CMD[@]}" 2>&1 | tee -a "${LOG_FILE:-/dev/stdout}"

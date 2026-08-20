@@ -114,23 +114,22 @@ def collate_fn(batch: list[dict]) -> dict:
     return result
 
 
-class MMStarDataset(Dataset):
-    """Load MMStar eval JSONL: {index, image, question, answer, category}.
-
-    image paths in the JSONL are relative to data_root.
-    """
+class LlavaBenchmarkDataset(Dataset):
+    """Generic LLaVA benchmark dataset using the unified benchmark JSONL schema."""
 
     def __init__(
         self,
         jsonl_path: str,
         processor,
+        benchmark: str,
         data_root: str | None = None,
         max_samples: int | None = None,
-        answer_instruction: str = "",
+        answer_instruction: str | None = None,
     ):
         self.processor = processor
+        self.spec = get_benchmark_spec(benchmark)
         self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
-        self.answer_instruction = answer_instruction.strip()
+        self.answer_instruction = answer_instruction
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
             self.rows = [json.loads(line) for line in f if line.strip()]
@@ -143,85 +142,47 @@ class MMStarDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
-        image_path = self.data_root / row["image"]
-        question = str(row["question"]).strip()
-        if self.answer_instruction:
-            question = f"{question}\n{self.answer_instruction}"
-        gold = str(row["answer"]).strip().upper()[:1]
-
+        image_path = self._image_path(row)
+        question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
         prompt = f"USER: <image>\n{question}\nASSISTANT:"
-        image = Image.open(image_path).convert("RGB")
-        inputs = self.processor(text=prompt, images=image, return_tensors="pt")
 
-        result = {
+        image = Image.open(image_path).convert("RGB")
+        try:
+            inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        finally:
+            image.close()
+
+        item = {
             "input_ids": inputs["input_ids"].squeeze(0),
             "pixel_values": inputs["pixel_values"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
-            "gold": gold,
+            "answer": row.get("answer"),
+            "answers": row.get("answers"),
+            "choices": row.get("choices"),
+            "row": row,
             "index": row.get("index", idx),
         }
         if "image_sizes" in inputs:
-            result["image_sizes"] = inputs["image_sizes"].squeeze(0)
-        return result
+            item["image_sizes"] = inputs["image_sizes"].squeeze(0)
+        return item
 
+    def _image_path(self, row: dict) -> Path:
+        raw_paths = row.get("images")
+        if raw_paths is None:
+            raw_paths = [row["image"]]
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise ValueError("LLaVA benchmark row must contain image or non-empty images")
+        if len(raw_paths) != 1:
+            raise ValueError("LLaVA benchmark evaluation currently supports exactly one image per sample")
 
-class QwenMMStarDataset(Dataset):
-    """MMStar eval dataset formatted with Qwen3-VL chat template."""
-
-    def __init__(
-        self,
-        jsonl_path: str,
-        processor,
-        data_root: str | None = None,
-        max_samples: int | None = None,
-        answer_instruction: str = "Answer directly with only the letter of the correct option.",
-    ):
-        self.processor = processor
-        self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
-        self.answer_instruction = answer_instruction.strip()
-
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            self.rows = [json.loads(line) for line in f if line.strip()]
-
-        if max_samples is not None:
-            self.rows = self.rows[:max_samples]
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, idx: int) -> dict:
-        row = self.rows[idx]
-        image_path = self.data_root / row["image"]
-        question = str(row["question"]).strip()
-        if self.answer_instruction:
-            question = f"{question}\n{self.answer_instruction}"
-        gold = str(row["answer"]).strip().upper()[:1]
-
-        image = Image.open(image_path).convert("RGB")
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": question},
-                ],
-            }
-        ]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=[text], images=[image], return_tensors="pt", padding=True)
-        if "mm_token_type_ids" not in inputs:
-            raise ValueError("Qwen processor did not return mm_token_type_ids; M-RoPE positions would be invalid")
-
-        result = {
-            "input_ids": inputs["input_ids"].squeeze(0),
-            "attention_mask": inputs["attention_mask"].squeeze(0),
-            "pixel_values": inputs["pixel_values"],
-            "image_grid_thw": inputs["image_grid_thw"],
-            "mm_token_type_ids": inputs["mm_token_type_ids"].squeeze(0),
-            "gold": gold,
-            "index": row.get("index", idx),
-        }
-        return result
+        root = self.data_root
+        row_root = str(row.get("image_root") or "").strip()
+        if row_root:
+            root = Path(row_root)
+        image_path = Path(str(raw_paths[0]))
+        if not image_path.is_absolute():
+            image_path = root / image_path
+        return image_path
 
 
 class QwenBenchmarkDataset(Dataset):
@@ -343,57 +304,3 @@ class QwenBenchmarkDataset(Dataset):
         }
         digest = hashlib.sha1(json.dumps(key, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         return self.cache_dir / self.spec.name / f"{digest}.pt"
-
-
-class OPDDataset(Dataset):
-    """Vision-OPD-6K dataset."""
-
-    def __init__(
-        self,
-        jsonl_path: str,
-        processor,
-        data_root: str | None = None,
-        max_samples: int | None = None,
-        shuffle: bool = False,
-        seed: int = 42,
-    ):
-        self.processor = processor
-        self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
-
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            self.rows = [json.loads(line) for line in f if line.strip()]
-
-        if shuffle:
-            rng = random.Random(seed)
-            rng.shuffle(self.rows)
-        if max_samples is not None:
-            self.rows = self.rows[:max_samples]
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, idx: int) -> dict:
-        row = self.rows[idx]
-        image_path = self.data_root / row["images"][0]
-        problem = row["problem"]
-        answer = str(row["answer"]).strip()
-
-        prompt = f"USER: <image>\n{problem}\nASSISTANT:"
-        full_text = f"{prompt} {answer}"
-
-        image = Image.open(image_path).convert("RGB")
-        inputs = self.processor(text=full_text, images=image, return_tensors="pt")
-        prompt_inputs = self.processor(text=prompt, images=image, return_tensors="pt")
-
-        image_token_id = getattr(self.processor, "image_token_id", 32000)
-        if image_token_id is None:
-            image_token_id = 32000
-        num_image_in_prompt = (prompt_inputs["input_ids"] == image_token_id).sum().item()
-        prompt_len = prompt_inputs["input_ids"].shape[1] - num_image_in_prompt
-
-        return {
-            "input_ids": inputs["input_ids"].squeeze(0),
-            "pixel_values": inputs["pixel_values"].squeeze(0),
-            "attention_mask": inputs["attention_mask"].squeeze(0),
-            "prompt_len": prompt_len,
-        }

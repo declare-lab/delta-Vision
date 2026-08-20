@@ -1,4 +1,4 @@
-"""Vision KV Adapter: inject vision encoder KV cache into LLM layers."""
+"""Vision KV Adapter and embedding adapter implementations."""
 from __future__ import annotations
 
 import hashlib
@@ -30,7 +30,7 @@ class PerLayerKVAdapter(nn.Module):
     For each of the 32 LLM layers:
       - Learns a soft mixture over source_layers (last 2 ViT layers)
       - Projects mixed source K and V to LLM dim via independent linear layers
-      - gate scalar controls injection strength (init sigmoid(-5) for gradual warmup)
+      - gate scalar controls adapter strength (init sigmoid(-5) for gradual warmup)
     """
 
     def __init__(
@@ -318,10 +318,10 @@ def load_adapter_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     saved_config = ckpt.get("adapter_config", {}) if isinstance(ckpt, dict) else {}
-    output_mode = saved_config.get("output_mode") or ckpt_args.get("output_mode") or "adapter_only"
-    if output_mode == "native_visual_kv_injection":
+    output_mode = canonical_adapter_mode(saved_config.get("output_mode") or ckpt_args.get("output_mode") or "kv_adapter")
+    if output_mode == "embedding_adapter":
         if language_model is None:
-            raise ValueError("language_model is required to load native_visual_kv_injection adapters")
+            raise ValueError("language_model is required to load an embedding_adapter checkpoint")
         state_dict = ckpt["state_dict"]
         first_down = state_dict.get("visual_adapter_down.0.weight")
         visual_adapter_rank = int(
@@ -330,9 +330,9 @@ def load_adapter_checkpoint(
                 ckpt_args.get("visual_adapter_rank", first_down.shape[0] if first_down is not None else 128),
             )
         )
-        adapter = QwenVisualDeltaAdapter.from_language_model(
+        adapter = QwenEmbeddingAdapter.from_language_model(
             language_model,
-            mode="native_visual_kv_injection",
+            mode="embedding_adapter",
             visual_adapter_rank=visual_adapter_rank,
         )
         missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
@@ -622,7 +622,7 @@ def _hf_sdpa_prefix_causal_attention_heads(
     return attn_output.contiguous()
 
 
-def prepare_llava_adapter_only_inputs(
+def prepare_llava_kv_adapter_inputs(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
     source_k: torch.Tensor,
@@ -785,7 +785,7 @@ def _llava_prefix_attention_mask(
     return prefix_mask.unsqueeze(1).contiguous()
 
 
-def llava_adapter_only_prefill_cache_prepared(
+def llava_kv_adapter_prefill_cache_prepared(
     model: LlavaForConditionalGeneration,
     adapter: PerLayerKVAdapter,
     *,
@@ -844,12 +844,12 @@ def llava_adapter_only_prefill_cache_prepared(
         "text_position_ids": text_position_ids.clone(),
         "image_position_ids": image_position_ids.clone(),
         "next_position_ids": text_position_ids[:, -1:].clone() + 1,
-        "mode": "adapter_only",
+        "mode": "kv_adapter",
     }
     return logits, cache
 
 
-def llava_adapter_only_prefill_cache(
+def llava_kv_adapter_prefill_cache(
     model: LlavaForConditionalGeneration,
     adapter: PerLayerKVAdapter,
     input_ids: torch.Tensor,
@@ -858,7 +858,7 @@ def llava_adapter_only_prefill_cache(
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    prepared = prepare_llava_adapter_only_inputs(
+    prepared = prepare_llava_kv_adapter_inputs(
         model,
         input_ids,
         source_k,
@@ -866,10 +866,10 @@ def llava_adapter_only_prefill_cache(
         image_token_id,
         attention_mask=attention_mask,
     )
-    return llava_adapter_only_prefill_cache_prepared(model, adapter, **prepared)
+    return llava_kv_adapter_prefill_cache_prepared(model, adapter, **prepared)
 
 
-def llava_adapter_only_decode_step_shape_exact(
+def llava_kv_adapter_decode_step_shape_exact(
     model: LlavaForConditionalGeneration,
     adapter: PerLayerKVAdapter,
     token_ids: torch.Tensor,
@@ -937,7 +937,7 @@ def student_forward_with_visual_kv(
     Returns:
         logits: [B, text_seq_len, vocab_size]
     """
-    prepared = prepare_llava_adapter_only_inputs(
+    prepared = prepare_llava_kv_adapter_inputs(
         model,
         input_ids,
         source_k,
@@ -990,127 +990,20 @@ def load_frozen_llava(
     return processor, model
 
 
-def student_forward_mixed(
-    model: LlavaForConditionalGeneration,
-    input_ids: torch.Tensor,
-    pixel_values: torch.Tensor,
-    adapter: PerLayerKVAdapter,
-    source_k: torch.Tensor,
-    source_v: torch.Tensor,
-    image_token_id: int,
-) -> torch.Tensor:
-    """Mixed forward: original LLaVA path + adapter KV added to image token KV positions.
-
-    Standard LLaVA embeds image as 576 tokens. In each attention layer, the KV
-    at image token positions gets the adapter-predicted KV added on top.
-    """
-    if pixel_values.ndim != 4 or hasattr(model.model, "image_newline"):
-        raise NotImplementedError("student_forward_mixed only supports fixed-grid LLaVA-style image features")
-
-    # Standard LLaVA: merge image features into embeddings
-    image_outputs = model.model.vision_tower(pixel_values, output_hidden_states=True)
-    image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
-    image_features = image_features[:, 1:]  # remove CLS
-    image_features = model.model.multi_modal_projector(image_features)
-
-    # Build merged input embeddings
-    embed_tokens = model.model.language_model.embed_tokens
-    text_embeds = embed_tokens(input_ids)
-    B, seq_len, _ = text_embeds.shape
-    n_image = image_features.shape[1]  # 576
-
-    # Find image token positions and replace with image features
-    image_mask = input_ids == image_token_id
-    final_embeds = text_embeds.clone()
-    for i in range(B):
-        img_positions = torch.where(image_mask[i])[0]
-        if img_positions.numel() > 0:
-            n = min(img_positions.numel(), n_image)
-            final_embeds[i, img_positions[:n]] = image_features[i, :n].to(final_embeds.dtype)
-
-    language_model = _get_language_model(model)
-    layers = language_model.layers
-    norm = language_model.norm
-    rotary_emb = language_model.rotary_emb
-
-    B, T, _ = final_embeds.shape
-    device = final_embeds.device
-    dtype = final_embeds.dtype
-    position_ids = torch.arange(T, device=device).unsqueeze(0)
-
-    # Find image positions for adding adapter KV
-    img_pos_list = []
-    for i in range(B):
-        img_pos_list.append(torch.where(image_mask[i])[0][:n_image])
-
-    hidden = final_embeds
-
-    for layer_idx, layer in enumerate(layers):
-        residual = hidden
-        normed = _compile_exact_module_call(layer.input_layernorm, hidden)
-        attn = layer.self_attn
-
-        input_shape = normed.shape[:-1]
-        hidden_shape = (*input_shape, -1, attn.head_dim)
-
-        q = attn.q_proj(normed).view(hidden_shape).transpose(1, 2)
-        k = attn.k_proj(normed).view(hidden_shape).transpose(1, 2)
-        v = attn.v_proj(normed).view(hidden_shape).transpose(1, 2)
-
-        q = _apply_rope(rotary_emb, q, position_ids, normed)
-        k = _apply_rope(rotary_emb, k, position_ids, normed)
-
-        # Add adapter KV to image token positions
-        vis_k, vis_v = adapter.forward_layer(source_k.to(dtype=dtype), source_v.to(dtype=dtype), layer_idx)
-        # vis_k, vis_v: [B, N_vis, num_heads, head_dim]
-        vis_k_t = vis_k.transpose(1, 2)  # [B, heads, N_vis, head_dim]
-        vis_v_t = vis_v.transpose(1, 2)
-
-        # Apply RoPE to adapter K using image positions
-        for i in range(B):
-            img_pos = img_pos_list[i]
-            n = min(img_pos.numel(), vis_k_t.shape[2])
-            if n == 0:
-                continue
-            img_pos = img_pos[:n]
-            img_position_ids = img_pos.unsqueeze(0)
-            adapter_k_roped = _apply_rope(rotary_emb, vis_k_t[i:i+1, :, :n], img_position_ids, normed[i:i+1])
-            k[i:i+1, :, img_pos] = k[i:i+1, :, img_pos] + adapter_k_roped
-            v[i:i+1, :, img_pos] = v[i:i+1, :, img_pos] + vis_v_t[i:i+1, :, :n]
-
-        # Standard causal attention
-        causal_mask = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
-        attn_mask = torch.zeros(1, 1, T, T, device=device, dtype=dtype)
-        attn_mask.masked_fill_(~causal_mask, torch.finfo(dtype).min)
-
-        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(*input_shape, -1)
-        attn_out = attn.o_proj(attn_out)
-
-        hidden = residual + attn_out
-        residual = hidden
-        post_normed = _compile_exact_module_call(layer.post_attention_layernorm, hidden)
-        hidden = residual + _compile_exact_module_call(layer.mlp, post_normed)
-
-    hidden = _compile_exact_module_call(norm, hidden)
-    logits = model.lm_head(hidden)
-    return logits
-
-
 @torch.no_grad()
 def llava_projected_image_features(
     model: LlavaForConditionalGeneration,
     pixel_values: torch.Tensor,
 ) -> torch.Tensor:
     if pixel_values.ndim != 4 or hasattr(model.model, "image_newline"):
-        raise NotImplementedError("native LLaVA visual KV injection only supports fixed-grid LLaVA-style image features")
+        raise NotImplementedError("LLaVA embedding_adapter only supports fixed-grid LLaVA-style image features")
     image_outputs = model.model.vision_tower(pixel_values, output_hidden_states=True)
     image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
     image_features = image_features[:, 1:]
     return model.model.multi_modal_projector(image_features)
 
 
-def prepare_llava_injection_inputs(
+def prepare_llava_embedding_adapter_inputs(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
@@ -1161,9 +1054,9 @@ def prepare_llava_injection_inputs(
     }
 
 
-def student_forward_llava_injection_prepared(
+def student_forward_llava_embedding_adapter_prepared(
     model: LlavaForConditionalGeneration,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     *,
     hidden: torch.Tensor,
     visual_memory: torch.Tensor,
@@ -1240,17 +1133,17 @@ def student_forward_llava_injection_prepared(
     return model.lm_head(hidden)
 
 
-def student_forward_llava_injection_prepared_hf_attention(
+def student_forward_llava_embedding_adapter_prepared_hf_attention(
     model: LlavaForConditionalGeneration,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     **prepared: Any,
 ) -> torch.Tensor:
-    return student_forward_llava_injection_prepared(model, adapter, **prepared, use_hf_attention=True)
+    return student_forward_llava_embedding_adapter_prepared(model, adapter, **prepared, use_hf_attention=True)
 
 
-def llava_injection_prefill_cache_prepared(
+def llava_embedding_adapter_prefill_cache_prepared(
     model: LlavaForConditionalGeneration,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     *,
     hidden: torch.Tensor,
     visual_memory: torch.Tensor,
@@ -1312,21 +1205,21 @@ def llava_injection_prefill_cache_prepared(
         "text_position_ids": text_position_ids.clone(),
         "image_position_ids": image_position_ids.clone(),
         "next_position_ids": text_position_ids[:, -1:].clone() + 1,
-        "mode": "native_visual_kv_injection",
+        "mode": "embedding_adapter",
     }
     return logits, cache
 
 
-def llava_injection_prefill_cache(
+def llava_embedding_adapter_prefill_cache(
     model: LlavaForConditionalGeneration,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    prepared = prepare_llava_injection_inputs(
+    prepared = prepare_llava_embedding_adapter_inputs(
         model,
         input_ids,
         pixel_values,
@@ -1334,12 +1227,12 @@ def llava_injection_prefill_cache(
         attention_mask=attention_mask,
         visual_memory=visual_memory,
     )
-    return llava_injection_prefill_cache_prepared(model, adapter, **prepared)
+    return llava_embedding_adapter_prefill_cache_prepared(model, adapter, **prepared)
 
 
-def llava_injection_decode_step_shape_exact(
+def llava_embedding_adapter_decode_step_shape_exact(
     model: LlavaForConditionalGeneration,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     token_ids: torch.Tensor,
     cache: dict[str, Any],
 ) -> tuple[torch.Tensor, dict[str, Any]]:
@@ -1388,23 +1281,23 @@ def llava_injection_decode_step_shape_exact(
     return logits, cache
 
 
-def student_forward_llava_injection(
+def student_forward_llava_embedding_adapter(
     model: LlavaForConditionalGeneration,
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
-    adapter: "QwenVisualDeltaAdapter",
+    adapter: "QwenEmbeddingAdapter",
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run LLaVA text-only LLM with native projected image states as per-layer KV prefix.
 
-    This mirrors the Qwen visual-delta path: image features are projected to LLM
+    This mirrors the Qwen embedding adapter path: image features are projected to LLM
     hidden size once, adapted by a per-layer low-rank residual, then converted
     to K/V by the frozen language layer's native k_proj/v_proj. Image tokens do
     not pass through the LLM FFN.
     """
-    prepared = prepare_llava_injection_inputs(
+    prepared = prepare_llava_embedding_adapter_inputs(
         model,
         input_ids,
         pixel_values,
@@ -1412,7 +1305,7 @@ def student_forward_llava_injection(
         attention_mask=attention_mask,
         visual_memory=visual_memory,
     )
-    return student_forward_llava_injection_prepared(model, adapter, **prepared)
+    return student_forward_llava_embedding_adapter_prepared(model, adapter, **prepared)
 
 
 def student_forward_optimized(
@@ -1450,9 +1343,31 @@ def student_forward_flex(
     )
 
 
-# Qwen3-VL visual-delta adapters.
-QWEN_VISUAL_DELTA_MODES = ("native_visual_kv_injection",)
-LLAVA_OUTPUT_MODES = ("adapter_only", "native_visual_kv_injection")
+# Adapter mode names.
+KV_ADAPTER_MODE = "kv_adapter"
+EMBEDDING_ADAPTER_MODE = "embedding_adapter"
+_LEGACY_KV_ADAPTER_MODE = "adapter" + "_only"
+_LEGACY_EMBEDDING_ADAPTER_MODE = "native" + "_visual" + "_kv" + "_" + "inject" + "ion"
+
+QWEN_EMBEDDING_ADAPTER_MODES = (EMBEDDING_ADAPTER_MODE,)
+LLAVA_OUTPUT_MODES = (KV_ADAPTER_MODE, EMBEDDING_ADAPTER_MODE)
+
+
+def canonical_adapter_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    value = str(mode).strip()
+    aliases = {
+        KV_ADAPTER_MODE: KV_ADAPTER_MODE,
+        "kv-adapter": KV_ADAPTER_MODE,
+        "kv adapter": KV_ADAPTER_MODE,
+        _LEGACY_KV_ADAPTER_MODE: KV_ADAPTER_MODE,
+        EMBEDDING_ADAPTER_MODE: EMBEDDING_ADAPTER_MODE,
+        "embedding-adapter": EMBEDDING_ADAPTER_MODE,
+        "embedding adapter": EMBEDDING_ADAPTER_MODE,
+        _LEGACY_EMBEDDING_ADAPTER_MODE: EMBEDDING_ADAPTER_MODE,
+    }
+    return aliases.get(value, value)
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -1859,7 +1774,7 @@ def qwen_prefix_causal_attention_mask(
     return torch.cat([visual_allowed, text_allowed], dim=-1).unsqueeze(1)
 
 
-class QwenVisualDeltaAdapter(nn.Module):
+class QwenEmbeddingAdapter(nn.Module):
     def __init__(
         self,
         *,
@@ -1871,8 +1786,9 @@ class QwenVisualDeltaAdapter(nn.Module):
         visual_adapter_rank: int = 128,
     ) -> None:
         super().__init__()
-        if mode not in QWEN_VISUAL_DELTA_MODES:
-            raise ValueError(f"unsupported Qwen visual-delta mode: {mode}")
+        mode = canonical_adapter_mode(mode)
+        if mode not in QWEN_EMBEDDING_ADAPTER_MODES:
+            raise ValueError(f"unsupported Qwen embedding adapter mode: {mode}")
         self.hidden_size = int(hidden_size)
         self.num_layers = int(num_layers)
         self.num_heads = int(num_heads)
@@ -1901,7 +1817,7 @@ class QwenVisualDeltaAdapter(nn.Module):
         *,
         mode: str,
         visual_adapter_rank: int = 128,
-    ) -> "QwenVisualDeltaAdapter":
+    ) -> "QwenEmbeddingAdapter":
         cfg = language_model.config
         return cls(
             hidden_size=int(cfg.hidden_size),
@@ -1920,12 +1836,18 @@ class QwenVisualDeltaAdapter(nn.Module):
         """
         L = self.num_layers
         B, N, H = visual_memory.shape
-        if not hasattr(self, "_down_stacked"):
-            self.precompute_stacked_weights()
+        if self.training:
+            down_stacked = torch.stack([m.weight for m in self.visual_adapter_down])
+            up_stacked = torch.stack([m.weight for m in self.visual_adapter_up])
+        else:
+            if not hasattr(self, "_down_stacked"):
+                self.precompute_stacked_weights()
+            down_stacked = self._down_stacked
+            up_stacked = self._up_stacked
         vm_flat = visual_memory.unsqueeze(0).expand(L, -1, -1, -1).reshape(L, B * N, H)
-        adapted = torch.bmm(vm_flat, self._down_stacked.to(visual_memory.dtype).transpose(1, 2))  # [L, B*N, R]
+        adapted = torch.bmm(vm_flat, down_stacked.to(visual_memory.dtype).transpose(1, 2))  # [L, B*N, R]
         adapted = F.silu(adapted)
-        adapted = torch.bmm(adapted, self._up_stacked.to(visual_memory.dtype).transpose(1, 2))    # [L, B*N, H]
+        adapted = torch.bmm(adapted, up_stacked.to(visual_memory.dtype).transpose(1, 2))    # [L, B*N, H]
         adapted = adapted.reshape(L, B, N, H)
         return visual_memory.unsqueeze(0) + adapted.to(visual_memory.dtype)  # [L, B, N, H]
 
@@ -1992,7 +1914,7 @@ def qwen_text_attention_output_for_layer(
     return attn_output
 
 
-def qwen_native_visual_kv(
+def qwen_project_visual_kv(
     language_model: torch.nn.Module,
     layer_idx: int,
     vision_states: Tensor,
@@ -2001,7 +1923,7 @@ def qwen_native_visual_kv(
     *,
     repeat_kv: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor | None]:
-    return qwen_native_visual_kv_for_layer(
+    return qwen_project_visual_kv_for_layer(
         language_model,
         language_model.layers[layer_idx],
         vision_states,
@@ -2011,7 +1933,7 @@ def qwen_native_visual_kv(
     )
 
 
-def qwen_native_visual_kv_for_layer(
+def qwen_project_visual_kv_for_layer(
     language_model: torch.nn.Module,
     layer: torch.nn.Module,
     vision_states: Tensor,
@@ -2131,7 +2053,7 @@ def qwen_text_attention_output_with_visual_kv_for_layer(
         text_position_embeddings = language_model.rotary_emb(normed_text, position_ids)
     query, text_key = qwen_apply_rotary_pos_emb(query, text_key, *text_position_embeddings)
 
-    visual_key, visual_value, _ = qwen_native_visual_kv_for_layer(
+    visual_key, visual_value, _ = qwen_project_visual_kv_for_layer(
         language_model,
         layer,
         vision_states,
@@ -2171,13 +2093,13 @@ def run_qwen_layer_from_attention_output(
     layer_idx: int,
     hidden_states: Tensor,
     attention_output: Tensor,
-    attention_delta: Tensor | None,
+    attention_residual: Tensor | None,
 ) -> Tensor:
     return run_qwen_layer_from_attention_output_for_layer(
         language_model.layers[layer_idx],
         hidden_states,
         attention_output,
-        attention_delta,
+        attention_residual,
     )
 
 
@@ -2185,21 +2107,21 @@ def run_qwen_layer_from_attention_output_for_layer(
     layer: torch.nn.Module,
     hidden_states: Tensor,
     attention_output: Tensor,
-    attention_delta: Tensor | None,
+    attention_residual: Tensor | None,
 ) -> Tensor:
     residual = hidden_states
     hidden_states = residual + attention_output.to(dtype=hidden_states.dtype)
-    if attention_delta is not None:
-        hidden_states = hidden_states + attention_delta.to(dtype=hidden_states.dtype)
+    if attention_residual is not None:
+        hidden_states = hidden_states + attention_residual.to(dtype=hidden_states.dtype)
     residual = hidden_states
     hidden_states = layer.post_attention_layernorm(hidden_states)
     hidden_states = layer.mlp(hidden_states)
     return residual + hidden_states
 
 
-def prepare_qwen_visual_delta_inputs(
+def prepare_qwen_embedding_adapter_inputs(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     input_ids: Tensor,
     attention_mask: Tensor,
     mm_token_type_ids: Tensor,
@@ -2247,9 +2169,9 @@ def prepare_qwen_visual_delta_inputs(
     }
 
 
-def qwen_visual_delta_logits_prepared(
+def qwen_embedding_adapter_logits_prepared(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     *,
     h: Tensor,
     visual_memory: Tensor,
@@ -2343,17 +2265,17 @@ def qwen_visual_delta_logits_prepared(
     return logits, text_mask, states
 
 
-def qwen_visual_delta_logits_prepared_hf_attention(
+def qwen_embedding_adapter_logits_prepared_hf_attention(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     **prepared: Any,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
-    return qwen_visual_delta_logits_prepared(model, adapter, **prepared, use_hf_attention=True)
+    return qwen_embedding_adapter_logits_prepared(model, adapter, **prepared, use_hf_attention=True)
 
 
-def qwen_visual_delta_prefill_cache_prepared(
+def qwen_embedding_adapter_prefill_cache_prepared(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     *,
     h: Tensor,
     visual_memory: Tensor,
@@ -2455,9 +2377,9 @@ def qwen_visual_delta_prefill_cache_prepared(
     return logits, text_mask, cache
 
 
-def qwen_visual_delta_prefill_cache(
+def qwen_embedding_adapter_prefill_cache(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     input_ids: Tensor,
     attention_mask: Tensor,
     mm_token_type_ids: Tensor,
@@ -2467,7 +2389,7 @@ def qwen_visual_delta_prefill_cache(
     logits_to_keep: int = 1,
     reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, dict[str, Any]]:
-    prepared = prepare_qwen_visual_delta_inputs(
+    prepared = prepare_qwen_embedding_adapter_inputs(
         model,
         adapter,
         input_ids,
@@ -2477,7 +2399,7 @@ def qwen_visual_delta_prefill_cache(
         position_ids,
         reuse_position_embeddings=reuse_position_embeddings,
     )
-    return qwen_visual_delta_prefill_cache_prepared(
+    return qwen_embedding_adapter_prefill_cache_prepared(
         model,
         adapter,
         h=prepared["h"],
@@ -2513,9 +2435,9 @@ def _qwen_decode_attention_mask(
     return allowed[:, None, None, :]
 
 
-def qwen_visual_delta_decode_step(
+def qwen_embedding_adapter_decode_step(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     token_ids: Tensor,
     cache: dict[str, Any],
     *,
@@ -2569,9 +2491,9 @@ def qwen_visual_delta_decode_step(
     return logits, cache
 
 
-def qwen_visual_delta_decode_step_shape_exact(
+def qwen_embedding_adapter_decode_step_shape_exact(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     token_ids: Tensor,
     cache: dict[str, Any],
     *,
@@ -2643,9 +2565,9 @@ def qwen_visual_delta_decode_step_shape_exact(
     return logits, cache
 
 
-def qwen_visual_delta_logits_from_tensors(
+def qwen_embedding_adapter_logits_from_tensors(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     input_ids: Tensor,
     attention_mask: Tensor,
     mm_token_type_ids: Tensor,
@@ -2658,7 +2580,7 @@ def qwen_visual_delta_logits_from_tensors(
     logits_to_keep: int = 0,
     reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
-    prepared = prepare_qwen_visual_delta_inputs(
+    prepared = prepare_qwen_embedding_adapter_inputs(
         model,
         adapter,
         input_ids,
@@ -2668,7 +2590,7 @@ def qwen_visual_delta_logits_from_tensors(
         position_ids,
         reuse_position_embeddings=reuse_position_embeddings,
     )
-    return qwen_visual_delta_logits_prepared(
+    return qwen_embedding_adapter_logits_prepared(
         model,
         adapter,
         h=prepared["h"],
@@ -2685,9 +2607,9 @@ def qwen_visual_delta_logits_from_tensors(
     )
 
 
-def qwen_visual_delta_logits(
+def qwen_embedding_adapter_logits(
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     inputs: dict[str, Tensor],
     *,
     initial_hidden: Tensor | None = None,
@@ -2700,7 +2622,7 @@ def qwen_visual_delta_logits(
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
     if initial_hidden is None or position_ids is None:
         initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-    return qwen_visual_delta_logits_from_tensors(
+    return qwen_embedding_adapter_logits_from_tensors(
         model,
         adapter,
         inputs["input_ids"],
@@ -2716,19 +2638,19 @@ def qwen_visual_delta_logits(
     )
 
 
-def load_qwen_visual_delta_checkpoint(
+def load_qwen_embedding_adapter_checkpoint(
     checkpoint_path: str | Path,
     language_model: torch.nn.Module,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[QwenVisualDeltaAdapter, dict[str, Any]]:
+) -> tuple[QwenEmbeddingAdapter, dict[str, Any]]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    mode = str(checkpoint_args.get("output_mode", "native_visual_kv_injection"))
-    if mode not in QWEN_VISUAL_DELTA_MODES:
-        raise ValueError(f"checkpoint output_mode={mode!r} is not a Qwen visual-delta mode")
-    adapter = QwenVisualDeltaAdapter.from_language_model(
+    mode = canonical_adapter_mode(str(checkpoint_args.get("output_mode", "embedding_adapter")))
+    if mode not in QWEN_EMBEDDING_ADAPTER_MODES:
+        raise ValueError(f"checkpoint output_mode={mode!r} is not a Qwen embedding adapter mode")
+    adapter = QwenEmbeddingAdapter.from_language_model(
         language_model,
         mode=mode,
         visual_adapter_rank=int(

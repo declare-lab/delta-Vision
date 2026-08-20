@@ -30,33 +30,34 @@ from src.benchmarks import (
 )
 from src.model import (
     extract_vision_kv,
-    llava_adapter_only_decode_step_shape_exact,
-    llava_adapter_only_prefill_cache,
-    llava_injection_decode_step_shape_exact,
-    llava_injection_prefill_cache,
+    llava_kv_adapter_decode_step_shape_exact,
+    llava_kv_adapter_prefill_cache,
+    llava_embedding_adapter_decode_step_shape_exact,
+    llava_embedding_adapter_prefill_cache,
     load_frozen_llava,
     load_adapter_checkpoint,
     PerLayerKVAdapter,
-    student_forward_llava_injection,
+    student_forward_llava_embedding_adapter,
     student_forward_with_visual_kv,
     teacher_forward,
+    canonical_adapter_mode,
     dtype_from_name,
     build_qwen_initial_context,
     load_or_build_qwen_initial_context,
     load_frozen_qwen3vl,
-    load_qwen_visual_delta_checkpoint,
-    prepare_qwen_visual_delta_inputs,
-    qwen_visual_delta_decode_step,
-    qwen_visual_delta_decode_step_shape_exact,
-    qwen_visual_delta_prefill_cache,
-    qwen_visual_delta_logits,
-    qwen_visual_delta_logits_from_tensors,
-    qwen_visual_delta_logits_prepared,
+    load_qwen_embedding_adapter_checkpoint,
+    prepare_qwen_embedding_adapter_inputs,
+    qwen_embedding_adapter_decode_step,
+    qwen_embedding_adapter_decode_step_shape_exact,
+    qwen_embedding_adapter_prefill_cache,
+    qwen_embedding_adapter_logits,
+    qwen_embedding_adapter_logits_from_tensors,
+    qwen_embedding_adapter_logits_prepared,
 )
-from src.data import MMStarDataset, QwenBenchmarkDataset, QwenMMStarDataset
+from src.data import LlavaBenchmarkDataset, QwenBenchmarkDataset
 
 
-OPTION_LETTERS = ["A", "B", "C", "D"]
+OPTION_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 def extract_option_from_text(text: str) -> str | None:
@@ -77,10 +78,10 @@ def extract_option_from_text(text: str) -> str | None:
     return None
 
 
-def get_option_token_ids(tokenizer) -> dict[str, list[int]]:
+def get_option_token_ids(tokenizer, num_options: int = 4) -> dict[str, list[int]]:
     """Get single-token IDs for common option-letter renderings."""
     result = {}
-    for letter in OPTION_LETTERS:
+    for letter in OPTION_LETTERS[: max(1, min(int(num_options), len(OPTION_LETTERS)))]:
         ids = []
         for text in (letter, f" {letter}"):
             encoded = tokenizer.encode(text, add_special_tokens=False)
@@ -95,7 +96,7 @@ def get_option_token_ids(tokenizer) -> dict[str, list[int]]:
 
 def predict_option(logits: torch.Tensor, option_ids: dict[str, list[int]]) -> str:
     """Predict the most likely option letter from logits."""
-    best_letter = "A"
+    best_letter = next(iter(option_ids), "A")
     best_score = float("-inf")
     for letter, ids in option_ids.items():
         score = max(logits[tid].item() for tid in ids)
@@ -103,6 +104,14 @@ def predict_option(logits: torch.Tensor, option_ids: dict[str, list[int]]) -> st
             best_score = score
             best_letter = letter
     return best_letter
+
+
+def _prediction_from_text(metric: str | None, text: str, choices: list[Any] | None = None) -> str | None:
+    if metric == "multi_choice" or metric is None:
+        return extract_choice(text, choices)
+    if metric in {"mme", "pope_f1"}:
+        return extract_yes_no(text)
+    return None
 
 
 def _eos_token_ids(tokenizer) -> set[int]:
@@ -212,6 +221,8 @@ def generate_teacher_llava(
     attention_mask: torch.Tensor,
     image_sizes=None,
     max_new_tokens: int = 8,
+    early_stop_metric: str | None = None,
+    choices: list[Any] | None = None,
 ) -> tuple[str | None, str]:
     kwargs = {
         "input_ids": input_ids,
@@ -234,7 +245,7 @@ def generate_teacher_llava(
     generated = model.generate(**kwargs)
     new_tokens = generated[0, input_ids.shape[1]:]
     text = processor.tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return extract_option_from_text(text), text
+    return _prediction_from_text(early_stop_metric, text, choices), text
 
 
 @torch.inference_mode()
@@ -248,9 +259,11 @@ def generate_adapter_llava(
     source_v: torch.Tensor | None,
     image_token_id: int,
     attention_mask: torch.Tensor,
-    output_mode: str = "adapter_only",
+    output_mode: str = "kv_adapter",
     max_new_tokens: int = 8,
     adapter_decode_cache: bool = True,
+    early_stop_metric: str | None = None,
+    choices: list[Any] | None = None,
 ) -> tuple[str | None, str]:
     full_ids = input_ids.clone()
     full_mask = attention_mask.clone()
@@ -259,8 +272,8 @@ def generate_adapter_llava(
     logits = None
     decode_cache = None
     if adapter_decode_cache:
-        if output_mode == "native_visual_kv_injection":
-            logits, decode_cache = llava_injection_prefill_cache(
+        if output_mode == "embedding_adapter":
+            logits, decode_cache = llava_embedding_adapter_prefill_cache(
                 model,
                 adapter,
                 full_ids,
@@ -270,7 +283,7 @@ def generate_adapter_llava(
             )
         else:
             assert source_k is not None and source_v is not None
-            logits, decode_cache = llava_adapter_only_prefill_cache(
+            logits, decode_cache = llava_kv_adapter_prefill_cache(
                 model,
                 adapter,
                 full_ids,
@@ -282,8 +295,8 @@ def generate_adapter_llava(
 
     for _ in range(max_new_tokens):
         if logits is None:
-            if output_mode == "native_visual_kv_injection":
-                logits = student_forward_llava_injection(
+            if output_mode == "embedding_adapter":
+                logits = student_forward_llava_embedding_adapter(
                     model,
                     full_ids,
                     pixel_values,
@@ -308,19 +321,20 @@ def generate_adapter_llava(
         token_tensor = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
         full_ids = torch.cat([full_ids, token_tensor], dim=1)
         full_mask = torch.cat([full_mask, torch.ones_like(token_tensor)], dim=1)
-        if next_token in eos_ids:
+        text = processor.tokenizer.decode(generated, skip_special_tokens=True)
+        if next_token in eos_ids or _structured_answer_ready(early_stop_metric, text, choices):
             break
         if adapter_decode_cache:
             assert decode_cache is not None
-            if output_mode == "native_visual_kv_injection":
-                logits, decode_cache = llava_injection_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
+            if output_mode == "embedding_adapter":
+                logits, decode_cache = llava_embedding_adapter_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
             else:
-                logits, decode_cache = llava_adapter_only_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
+                logits, decode_cache = llava_kv_adapter_decode_step_shape_exact(model, adapter, token_tensor, decode_cache)
         else:
             logits = None
 
     text = processor.tokenizer.decode(generated, skip_special_tokens=True)
-    return extract_option_from_text(text), text
+    return _prediction_from_text(early_stop_metric, text, choices), text
 
 
 def load_adapter(checkpoint_path: str, model, device: torch.device) -> tuple[torch.nn.Module, list[int], str]:
@@ -331,7 +345,7 @@ def load_adapter(checkpoint_path: str, model, device: torch.device) -> tuple[tor
         language_model=model.model.language_model,
         dtype=torch.bfloat16,
     )
-    return adapter, source_layers, str(metadata.get("output_mode") or "adapter_only")
+    return adapter, source_layers, str(metadata.get("output_mode") or "kv_adapter")
 
 
 @torch.inference_mode()
@@ -339,30 +353,31 @@ def evaluate_llava_shard(
     model,
     processor,
     adapter: torch.nn.Module,
-    dataset: MMStarDataset,
+    dataset: LlavaBenchmarkDataset,
     device: torch.device,
     image_token_id: int,
     source_layers: list[int],
     log_every: int = 25,
     max_new_tokens: int = 8,
-    eval_mode: str = "generate",
-    output_mode: str = "adapter_only",
+    benchmark: str = "mmstar",
+    measure_prefill: bool = True,
+    output_mode: str = "kv_adapter",
+    structured_answer_early_stop: bool = True,
     adapter_decode_cache: bool = True,
     verify_decode_cache_generation: int = 0,
 ) -> dict:
-    """Evaluate adapter on a shard of MMStar."""
-    option_ids = get_option_token_ids(processor.tokenizer)
+    """Evaluate a LLaVA adapter shard with the shared benchmark registry."""
+    spec = get_benchmark_spec(benchmark)
+    predictions: list[dict[str, Any]] = []
 
-    stats = {
-        "scored": 0,
-        "teacher_correct": 0,
-        "adapter_correct": 0,
-        "adapter_correct_when_teacher_correct": 0,
-        "agree": 0,
-        "teacher_invalid": 0,
-        "adapter_invalid": 0,
-    }
-    predictions = []
+    def timed_value(fn, *, enabled: bool = True):
+        if not enabled:
+            return 0.0, fn()
+        _sync_cuda()
+        start = time.perf_counter()
+        value = fn()
+        _sync_cuda()
+        return time.perf_counter() - start, value
 
     for idx in range(len(dataset)):
         item = dataset[idx]
@@ -372,40 +387,25 @@ def evaluate_llava_shard(
         image_sizes = item.get("image_sizes")
         if image_sizes is not None:
             image_sizes = image_sizes.unsqueeze(0).to(device) if torch.is_tensor(image_sizes) else image_sizes
-        gold = item["gold"]
+        choices = item.get("choices")
+        text_tokens, image_tokens = _llava_token_counts(input_ids, attention_mask, image_token_id)
 
-        if output_mode == "native_visual_kv_injection":
+        if output_mode == "embedding_adapter":
             source_k = source_v = None
+            source_s = 0.0
         else:
-            source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
-        if eval_mode == "logits":
-            teacher_logits = teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes)
-            full_last_idx = int(attention_mask[0].sum().item()) - 1
-            teacher_last = teacher_logits[0, full_last_idx]
+            source_s, source_pair = timed_value(
+                lambda: extract_vision_kv(model, pixel_values, source_layer_indices=source_layers),
+                enabled=measure_prefill,
+            )
+            source_k, source_v = source_pair
 
-            if output_mode == "native_visual_kv_injection":
-                student_logits = student_forward_llava_injection(
-                    model,
-                    input_ids,
-                    pixel_values,
-                    adapter,
-                    image_token_id,
-                    attention_mask=attention_mask,
-                )
-                student_last = student_logits[0, -1]
-            else:
-                assert source_k is not None and source_v is not None
-                student_logits = student_forward_with_visual_kv(
-                    model, input_ids, adapter, source_k, source_v, image_token_id, attention_mask=attention_mask
-                )
-                student_last = student_logits[0, -1]
-
-            teacher_pred = predict_option(teacher_last, option_ids)
-            adapter_pred = predict_option(student_last, option_ids)
-            teacher_text = ""
-            adapter_text = ""
-        elif eval_mode == "generate":
-            teacher_pred, teacher_text = generate_teacher_llava(
+        teacher_prefill_s, _ = _timed_call(
+            lambda: teacher_forward(model, input_ids, pixel_values, attention_mask, image_sizes=image_sizes),
+            enabled=measure_prefill,
+        )
+        teacher_total_s, (_, teacher_text) = timed_value(
+            lambda: generate_teacher_llava(
                 model,
                 processor,
                 input_ids,
@@ -413,8 +413,55 @@ def evaluate_llava_shard(
                 attention_mask,
                 image_sizes=image_sizes,
                 max_new_tokens=max_new_tokens,
+                early_stop_metric=spec.metric,
+                choices=choices,
             )
-            adapter_pred, adapter_text = generate_adapter_llava(
+        )
+
+        def adapter_prefill():
+            if output_mode == "embedding_adapter":
+                if adapter_decode_cache:
+                    return llava_embedding_adapter_prefill_cache(
+                        model,
+                        adapter,
+                        input_ids,
+                        pixel_values,
+                        image_token_id,
+                        attention_mask=attention_mask,
+                    )
+                return student_forward_llava_embedding_adapter(
+                    model,
+                    input_ids,
+                    pixel_values,
+                    adapter,
+                    image_token_id,
+                    attention_mask=attention_mask,
+                )
+            assert source_k is not None and source_v is not None
+            if adapter_decode_cache:
+                return llava_kv_adapter_prefill_cache(
+                    model,
+                    adapter,
+                    input_ids,
+                    source_k,
+                    source_v,
+                    image_token_id,
+                    attention_mask=attention_mask,
+                )
+            return student_forward_with_visual_kv(
+                model,
+                input_ids,
+                adapter,
+                source_k,
+                source_v,
+                image_token_id,
+                attention_mask=attention_mask,
+            )
+
+        adapter_prefill_s, _ = _timed_call(adapter_prefill, enabled=measure_prefill)
+        adapter_prefill_s += source_s
+        adapter_total_s, (_, adapter_text) = timed_value(
+            lambda: generate_adapter_llava(
                 model,
                 processor,
                 adapter,
@@ -427,60 +474,93 @@ def evaluate_llava_shard(
                 output_mode=output_mode,
                 max_new_tokens=max_new_tokens,
                 adapter_decode_cache=adapter_decode_cache,
+                early_stop_metric=spec.metric if structured_answer_early_stop else None,
+                choices=choices,
             )
-            if adapter_decode_cache and idx < int(verify_decode_cache_generation):
-                _, recompute_text = generate_adapter_llava(
-                    model,
-                    processor,
-                    adapter,
-                    input_ids,
-                    pixel_values,
-                    source_k,
-                    source_v,
-                    image_token_id,
-                    attention_mask,
-                    output_mode=output_mode,
-                    max_new_tokens=max_new_tokens,
-                    adapter_decode_cache=False,
+        )
+        adapter_total_s += source_s
+        if adapter_decode_cache and idx < int(verify_decode_cache_generation):
+            _, recompute_text = generate_adapter_llava(
+                model,
+                processor,
+                adapter,
+                input_ids,
+                pixel_values,
+                source_k,
+                source_v,
+                image_token_id,
+                attention_mask,
+                output_mode=output_mode,
+                max_new_tokens=max_new_tokens,
+                adapter_decode_cache=False,
+                early_stop_metric=spec.metric if structured_answer_early_stop else None,
+                choices=choices,
+            )
+            if recompute_text != adapter_text:
+                raise RuntimeError(
+                    "LLaVA decode-cache generation changed decoded text: "
+                    f"dataset_index={idx} recompute={recompute_text!r} cache={adapter_text!r}"
                 )
-                if recompute_text != adapter_text:
-                    raise RuntimeError(
-                        "LLaVA decode-cache generation changed decoded text: "
-                        f"dataset_index={idx} recompute={recompute_text!r} cache={adapter_text!r}"
-                    )
-        else:
-            raise ValueError(f"Unknown eval_mode={eval_mode!r}")
 
-        stats["scored"] += 1
-        stats["teacher_correct"] += int(teacher_pred == gold)
-        stats["adapter_correct"] += int(adapter_pred == gold)
-        stats["agree"] += int(adapter_pred == teacher_pred)
-        stats["teacher_invalid"] += int(teacher_pred is None)
-        stats["adapter_invalid"] += int(adapter_pred is None)
-        stats["adapter_correct_when_teacher_correct"] += int(teacher_pred == gold and adapter_pred == gold)
-
-        predictions.append({
-            "index": item["index"],
-            "gold": gold,
-            "teacher": teacher_pred,
-            "adapter": adapter_pred,
-            "teacher_text": teacher_text,
-            "adapter_text": adapter_text,
-        })
+        teacher_eval = score_prediction(
+            metric=spec.metric,
+            prediction_text=teacher_text,
+            answer=item.get("answer"),
+            answers=item.get("answers"),
+            choices=choices,
+        )
+        adapter_eval = score_prediction(
+            metric=spec.metric,
+            prediction_text=adapter_text,
+            answer=item.get("answer"),
+            answers=item.get("answers"),
+            choices=choices,
+        )
+        predictions.append(
+            {
+                "index": item["index"],
+                "row": item["row"],
+                "teacher_text": teacher_text,
+                "adapter_text": adapter_text,
+                "teacher_eval": teacher_eval,
+                "adapter_eval": adapter_eval,
+                "teacher_total_s": teacher_total_s,
+                "adapter_total_s": adapter_total_s,
+                "teacher_prefill_s": teacher_prefill_s,
+                "adapter_prefill_s": adapter_prefill_s,
+                "text_tokens": text_tokens,
+                "image_tokens": image_tokens,
+                "teacher_kv_cache_mb": None,
+                "adapter_kv_cache_mb": None,
+                "teacher_prefill_flops": None,
+                "adapter_prefill_flops": None,
+            }
+        )
 
         if (idx + 1) % log_every == 0:
-            acc = stats["adapter_correct"] / stats["scored"]
-            print(f"[{idx+1}/{len(dataset)}] adapter_acc={acc:.4f}", flush=True)
+            summary = summarize_benchmark_predictions(
+                benchmark=benchmark,
+                predictions=predictions,
+                output_modes=[output_mode],
+            )
+            teacher_score = summary["teacher"]["score"]
+            adapter_score = summary["adapter"]["score"] if summary["adapter"] else 0.0
+            print(
+                f"[{idx+1}/{len(dataset)}] {spec.display_name} teacher={teacher_score:.4f} "
+                f"adapter={adapter_score:.4f}",
+                flush=True,
+            )
 
-    return {"stats": stats, "predictions": predictions, "output_mode": output_mode}
+    summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[output_mode])
+    return {"summary": summary, "predictions": predictions, "output_mode": output_mode}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Unified benchmark evaluation for LLaVA KV adapters and Qwen3-VL visual-delta adapters.")
+    parser = argparse.ArgumentParser("Unified benchmark evaluation for LLaVA kv_adapter and Qwen3-VL embedding_adapter.")
     parser.add_argument("--model-kind", choices=("llava", "qwen"), default="llava")
     parser.add_argument("--benchmark", default="mmstar", help=f"Benchmark name. Choices: {', '.join(sorted(BENCHMARK_SPECS))}")
     parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
-    parser.add_argument("--data", default="../delta-vision/data/mmstar/mmstar_val.jsonl")
+    parser.add_argument("--data", default=None)
     parser.add_argument("--data-root", default="../delta-vision", help="Root for resolving image paths")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -488,9 +568,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-shards", type=int, default=8)
     parser.add_argument("--shard-id", type=int, default=None, help="If set, only run this shard")
     parser.add_argument("--log-every", type=int, default=25)
-    parser.add_argument("--max-new-tokens", type=int, default=8)
-    parser.add_argument("--eval-mode", choices=("generate", "logits"), default="generate")
-    parser.add_argument("--output-mode", choices=("adapter_only", "native_visual_kv_injection"), default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--output-mode", choices=("kv_adapter", "embedding_adapter"), default=None)
     parser.add_argument("--answer-instruction", default=None)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="auto")
@@ -498,7 +577,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile-adapter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--compile-verify", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compile-verify", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-max-diff", type=float, default=0.0)
     parser.add_argument("--compile-warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--structured-answer-early-stop", action=argparse.BooleanOptionalAction, default=True)
@@ -547,15 +626,24 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.benchmark = canonical_benchmark_name(args.benchmark)
+    spec = get_benchmark_spec(args.benchmark)
+    if args.data is None:
+        args.data = spec.default_data
+    if args.max_new_tokens is None:
+        args.max_new_tokens = spec.max_new_tokens
+    if args.output_mode is not None:
+        args.output_mode = canonical_adapter_mode(args.output_mode)
     return args
 
 
 def run_llava_single_shard(args, shard_id: int, num_shards: int):
     """Run evaluation on a single shard (one GPU)."""
     device = torch.device("cuda:0")
+    dtype = dtype_from_name(args.dtype)
+    configure_torch_runtime()
     processor, model = load_frozen_llava(
         args.model_path,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda:0",
         attn_implementation=args.attn_implementation,
     )
@@ -563,12 +651,13 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
     output_mode = args.output_mode or checkpoint_mode
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
 
-    full_dataset = MMStarDataset(
+    full_dataset = LlavaBenchmarkDataset(
         args.data,
         processor,
+        args.benchmark,
         data_root=args.data_root,
         max_samples=args.max_samples,
-        answer_instruction=args.answer_instruction or get_benchmark_spec("mmstar").answer_instruction,
+        answer_instruction=args.answer_instruction,
     )
     total = len(full_dataset)
     per_shard = (total + num_shards - 1) // num_shards
@@ -588,8 +677,10 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
         source_layers,
         args.log_every,
         args.max_new_tokens,
-        args.eval_mode,
+        args.benchmark,
+        args.measure_prefill,
         output_mode,
+        bool(args.structured_answer_early_stop),
         bool(args.adapter_decode_cache),
         int(args.verify_decode_cache_generation),
     )
@@ -692,7 +783,7 @@ def generate_adapter_qwen(
             prefill_logits = None
             prefill_text_mask = None
         elif adapter_logits_fn is None:
-            logits, text_mask, _ = qwen_visual_delta_logits(
+            logits, text_mask, _ = qwen_embedding_adapter_logits(
                 model,
                 adapter,
                 inputs,
@@ -775,7 +866,7 @@ def generate_adapter_qwen_batch(
             prefill_logits = None
             prefill_text_mask = None
         elif adapter_logits_fn is None:
-            logits, text_mask, _ = qwen_visual_delta_logits(
+            logits, text_mask, _ = qwen_embedding_adapter_logits(
                 model,
                 adapter,
                 step_inputs,
@@ -838,7 +929,7 @@ def generate_adapter_qwen_decode_cache(
     if initial_hidden is None or position_ids is None:
         initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
     if decode_cache is None or prefill_logits is None or prefill_text_mask is None:
-        prefill_logits, prefill_text_mask, decode_cache = qwen_visual_delta_prefill_cache(
+        prefill_logits, prefill_text_mask, decode_cache = qwen_embedding_adapter_prefill_cache(
             model,
             adapter,
             inputs["input_ids"],
@@ -880,7 +971,7 @@ def generate_adapter_qwen_decode_cache(
                 active[row_idx] = False
         if step_idx == max_new_tokens - 1 or not bool(active.any().item()):
             break
-        decode_step = qwen_visual_delta_decode_step_shape_exact if decode_cache_mode == "shape_exact" else qwen_visual_delta_decode_step
+        decode_step = qwen_embedding_adapter_decode_step_shape_exact if decode_cache_mode == "shape_exact" else qwen_embedding_adapter_decode_step
         logits, decode_cache = decode_step(
             model,
             adapter,
@@ -891,85 +982,6 @@ def generate_adapter_qwen_decode_cache(
         )
         text_mask = torch.ones((batch_size, 1), device=logits.device, dtype=torch.bool)
     return [extract_option_from_text(text) for text in texts], texts
-
-
-@torch.inference_mode()
-def evaluate_qwen_shard(
-    model,
-    processor,
-    adapter,
-    dataset: QwenMMStarDataset,
-    device: torch.device,
-    log_every: int,
-    max_new_tokens: int,
-) -> dict:
-    stats = {
-        "scored": 0,
-        "teacher_correct": 0,
-        "adapter_correct": 0,
-        "adapter_correct_when_teacher_correct": 0,
-        "agree": 0,
-        "teacher_invalid": 0,
-        "adapter_invalid": 0,
-    }
-    predictions = []
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        input_ids = item["input_ids"].unsqueeze(0).to(device)
-        attention_mask = item["attention_mask"].unsqueeze(0).to(device)
-        pixel_values = item["pixel_values"].to(device)
-        image_grid_thw = item["image_grid_thw"].to(device)
-        mm_token_type_ids = item["mm_token_type_ids"].unsqueeze(0).to(device)
-        gold = item["gold"]
-
-        teacher_pred, teacher_text = generate_teacher_qwen(
-            model,
-            processor,
-            input_ids,
-            attention_mask,
-            pixel_values,
-            image_grid_thw,
-            mm_token_type_ids,
-            max_new_tokens,
-            early_stop_metric="multi_choice",
-        )
-        adapter_pred, adapter_text = generate_adapter_qwen(
-            model,
-            processor,
-            adapter,
-            input_ids,
-            attention_mask,
-            pixel_values,
-            image_grid_thw,
-            mm_token_type_ids,
-            max_new_tokens,
-        )
-
-        stats["scored"] += 1
-        stats["teacher_correct"] += int(teacher_pred == gold)
-        stats["adapter_correct"] += int(adapter_pred == gold)
-        stats["adapter_correct_when_teacher_correct"] += int(teacher_pred == gold and adapter_pred == gold)
-        stats["agree"] += int(teacher_pred == adapter_pred)
-        stats["teacher_invalid"] += int(teacher_pred is None)
-        stats["adapter_invalid"] += int(adapter_pred is None)
-        predictions.append(
-            {
-                "index": item["index"],
-                "gold": gold,
-                "teacher": teacher_pred,
-                "adapter": adapter_pred,
-                "teacher_text": teacher_text,
-                "adapter_text": adapter_text,
-            }
-        )
-        if (idx + 1) % log_every == 0:
-            n = max(stats["scored"], 1)
-            print(
-                f"[{idx+1}/{len(dataset)}] teacher={stats['teacher_correct']/n:.4f} "
-                f"adapter={stats['adapter_correct']/n:.4f} agreement={stats['agree']/n:.4f}",
-                flush=True,
-            )
-    return {"stats": stats, "predictions": predictions, "output_mode": adapter.mode}
 
 
 def _sync_cuda() -> None:
@@ -1040,7 +1052,7 @@ def build_qwen_adapter_logits_fn(
 
     def direct(inputs, initial_hidden=None, position_ids=None):
         if initial_hidden is None or position_ids is None:
-            logits, text_mask, _ = qwen_visual_delta_logits(
+            logits, text_mask, _ = qwen_embedding_adapter_logits(
                 model,
                 adapter,
                 inputs,
@@ -1051,7 +1063,7 @@ def build_qwen_adapter_logits_fn(
                 logits_to_keep=logits_to_keep,
             )
         else:
-            logits, text_mask, _ = qwen_visual_delta_logits_from_tensors(
+            logits, text_mask, _ = qwen_embedding_adapter_logits_from_tensors(
                 model,
                 adapter,
                 inputs["input_ids"],
@@ -1069,7 +1081,7 @@ def build_qwen_adapter_logits_fn(
         return direct
 
     def prepared_forward(prepared):
-        logits, text_mask, _ = qwen_visual_delta_logits_prepared(
+        logits, text_mask, _ = qwen_embedding_adapter_logits_prepared(
             model,
             adapter,
             h=prepared["h"],
@@ -1096,7 +1108,7 @@ def build_qwen_adapter_logits_fn(
         visual_cos,
         visual_sin,
     ):
-        logits, text_mask_out, _ = qwen_visual_delta_logits_prepared(
+        logits, text_mask_out, _ = qwen_embedding_adapter_logits_prepared(
             model,
             adapter,
             h=h,
@@ -1118,7 +1130,7 @@ def build_qwen_adapter_logits_fn(
         nonlocal verified
         if initial_hidden is None or position_ids is None:
             initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-        prepared = prepare_qwen_visual_delta_inputs(
+        prepared = prepare_qwen_embedding_adapter_inputs(
             model,
             adapter,
             inputs["input_ids"],
@@ -1166,6 +1178,13 @@ def _qwen_token_counts(attention_mask: torch.Tensor, mm_token_type_ids: torch.Te
     visual = int(((mm_token_type_ids == 1) & valid).sum().item())
     text = int(((mm_token_type_ids == 0) & valid).sum().item())
     return text, visual
+
+
+def _llava_token_counts(input_ids: torch.Tensor, attention_mask: torch.Tensor, image_token_id: int) -> tuple[int, int]:
+    valid = attention_mask.bool()
+    visual = int(((input_ids == int(image_token_id)) & valid).sum().item())
+    text = int(valid.sum().item()) - visual
+    return max(text, 0), visual
 
 
 def _visual_adapter_rank(adapter) -> int:
@@ -1236,7 +1255,7 @@ def _save_teacher_cache(path: Path | None, meta: dict[str, Any], entries: list[d
     print(f"Saved teacher cache {path}", flush=True)
 
 
-def summarize_qwen_benchmark_predictions(
+def summarize_benchmark_predictions(
     *,
     benchmark: str,
     predictions: list[dict[str, Any]],
@@ -1315,6 +1334,15 @@ def summarize_qwen_benchmark_predictions(
     if spec.metric == "pope_f1" and adapter:
         summary["pope_f1"] = adapter.get("f1", 0.0)
     return summary
+
+
+def summarize_qwen_benchmark_predictions(
+    *,
+    benchmark: str,
+    predictions: list[dict[str, Any]],
+    output_modes: list[str] | None = None,
+) -> dict[str, Any]:
+    return summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=output_modes)
 
 
 @torch.inference_mode()
@@ -1449,7 +1477,7 @@ def evaluate_qwen_benchmark_shard(
                 dtype=dtype,
             )
             if adapter_decode_cache:
-                logits, text_mask, decode_cache = qwen_visual_delta_prefill_cache(
+                logits, text_mask, decode_cache = qwen_embedding_adapter_prefill_cache(
                     model,
                     adapter,
                     inputs["input_ids"],
@@ -1461,7 +1489,7 @@ def evaluate_qwen_benchmark_shard(
                 )
                 return logits, text_mask, initial_hidden, position_ids, decode_cache
             if adapter_logits_fn is None:
-                logits, text_mask, _ = qwen_visual_delta_logits(
+                logits, text_mask, _ = qwen_embedding_adapter_logits(
                     model,
                     adapter,
                     dict(inputs),
@@ -1644,7 +1672,7 @@ def evaluate_qwen_benchmark_shard(
             }
         )
         if (idx + 1) % log_every == 0:
-            summary = summarize_qwen_benchmark_predictions(
+            summary = summarize_benchmark_predictions(
                 benchmark=benchmark,
                 predictions=predictions,
                 output_modes=[adapter.mode],
@@ -1657,7 +1685,7 @@ def evaluate_qwen_benchmark_shard(
                 flush=True,
             )
 
-    summary = summarize_qwen_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[adapter.mode])
+    summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[adapter.mode])
     if teacher_cache_entries is None and teacher_cache_meta is not None and len(teacher_cache_to_write) == len(dataset):
         _save_teacher_cache(teacher_cache_path, teacher_cache_meta, teacher_cache_to_write)
     return {"summary": summary, "predictions": predictions, "output_mode": adapter.mode}
@@ -1774,7 +1802,7 @@ def evaluate_qwen_benchmark_shard_batched(
                 dtype=dtype,
             )
             if adapter_decode_cache:
-                logits, text_mask, decode_cache = qwen_visual_delta_prefill_cache(
+                logits, text_mask, decode_cache = qwen_embedding_adapter_prefill_cache(
                     model,
                     adapter,
                     batch_inputs["input_ids"],
@@ -1786,7 +1814,7 @@ def evaluate_qwen_benchmark_shard_batched(
                 )
                 return logits, text_mask, initial_hidden, position_ids, decode_cache
             if adapter_logits_fn is None:
-                logits, text_mask, _ = qwen_visual_delta_logits(
+                logits, text_mask, _ = qwen_embedding_adapter_logits(
                     model,
                     adapter,
                     dict(batch_inputs),
@@ -1980,7 +2008,7 @@ def evaluate_qwen_benchmark_shard_batched(
             )
             processed += 1
         if processed % log_every == 0 or processed == len(dataset):
-            summary = summarize_qwen_benchmark_predictions(
+            summary = summarize_benchmark_predictions(
                 benchmark=benchmark,
                 predictions=predictions,
                 output_modes=[adapter.mode],
@@ -1993,7 +2021,7 @@ def evaluate_qwen_benchmark_shard_batched(
                 flush=True,
             )
 
-    summary = summarize_qwen_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[adapter.mode])
+    summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[adapter.mode])
     if teacher_cache_to_write and all(entry is not None for entry in teacher_cache_to_write):
         _save_teacher_cache(teacher_cache_path, teacher_cache_meta, [entry for entry in teacher_cache_to_write if entry is not None])
     return {"summary": summary, "predictions": predictions, "output_mode": adapter.mode}
@@ -2004,7 +2032,7 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
     dtype = dtype_from_name(args.dtype)
     configure_torch_runtime()
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
-    adapter, meta = load_qwen_visual_delta_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
+    adapter, meta = load_qwen_embedding_adapter_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
     if meta["missing"] or meta["unexpected"]:
         print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
     adapter_logits_fn = build_qwen_adapter_logits_fn(
@@ -2152,7 +2180,7 @@ def merge_benchmark_shards(output_dir: str, num_shards: int, benchmark: str) -> 
         if data.get("output_mode"):
             output_modes.append(str(data["output_mode"]))
 
-    merged = summarize_qwen_benchmark_predictions(
+    merged = summarize_benchmark_predictions(
         benchmark=benchmark,
         predictions=all_predictions,
         output_modes=output_modes,
@@ -2207,12 +2235,7 @@ def main() -> None:
         else:
             run_llava_single_shard(args, args.shard_id, args.num_shards)
     else:
-        if args.model_kind == "qwen":
-            merge_benchmark_shards(args.output_dir, args.num_shards, args.benchmark)
-        elif args.benchmark == "mmstar":
-            merge_shards(args.output_dir, args.num_shards)
-        else:
-            raise ValueError(f"Generic benchmark merge is only implemented for Qwen, got model_kind={args.model_kind}")
+        merge_benchmark_shards(args.output_dir, args.num_shards, args.benchmark)
 
 
 if __name__ == "__main__":

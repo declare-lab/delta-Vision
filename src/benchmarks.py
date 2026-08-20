@@ -176,15 +176,23 @@ def _stringify(value: Any) -> str:
     return str(value).strip()
 
 
+def _choice_list(choices: Any) -> list[Any] | None:
+    if choices is None:
+        return None
+    if isinstance(choices, dict):
+        return [choices[key] for key in sorted(choices) if _stringify(choices[key])]
+    if isinstance(choices, (list, tuple)):
+        return list(choices)
+    return None
+
+
 def build_benchmark_prompt(row: dict[str, Any], spec: BenchmarkSpec, answer_instruction: str | None = None) -> str:
     question = _stringify(row.get("question"))
     hint = _stringify(row.get("hint"))
     if hint:
         question = f"{hint}\n{question}" if question else hint
 
-    choices = row.get("choices") or []
-    if isinstance(choices, dict):
-        choices = [choices[key] for key in sorted(choices) if _stringify(choices[key])]
+    choices = _choice_list(row.get("choices")) or []
     if choices and not _question_has_lettered_choices(question, len(choices)):
         lines = [question]
         for idx, choice in enumerate(choices):
@@ -235,6 +243,7 @@ def _choice_letters(num_choices: int) -> list[str]:
 
 
 def canonical_choice(value: Any, choices: list[Any] | None = None) -> str | None:
+    choices = _choice_list(choices)
     if value is None:
         return None
     if isinstance(value, int):
@@ -257,6 +266,7 @@ def canonical_choice(value: Any, choices: list[Any] | None = None) -> str | None
 
 
 def extract_choice(text: str, choices: list[Any] | None = None) -> str | None:
+    choices = _choice_list(choices)
     num_choices = len(choices or []) or 6
     letters = _choice_letters(num_choices)
     clean = text.strip()
@@ -306,6 +316,7 @@ def score_prediction(
     answers: Any = None,
     choices: list[Any] | None = None,
 ) -> dict[str, Any]:
+    choices = _choice_list(choices)
     if metric == "multi_choice":
         pred = extract_choice(prediction_text, choices)
         gold = canonical_choice(answer, choices)

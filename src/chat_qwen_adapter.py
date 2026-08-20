@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,37 +10,33 @@ import torch
 from PIL import Image
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 from src.eval_benchmarks import configure_torch_runtime, generate_adapter_qwen, generate_teacher_qwen
 from src.model import (
     dtype_from_name,
     load_frozen_qwen3vl,
-    load_qwen_visual_delta_checkpoint,
+    load_qwen_embedding_adapter_checkpoint,
 )
 
 
 DEFAULT_MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
-DEFAULT_CKPT = (
-    ROOT_DIR
-    / "artifacts/experiments/qwen_topk1024_freezeqkv"
-    / "qwen_opd_rollout2k_injection_2000step_20260816_043953"
-    / "checkpoints/qwen_visual_delta_step1500.pt"
-)
+DEFAULT_CKPT = os.environ.get("QWEN_EMBEDDING_ADAPTER_CKPT", "")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Interactive Qwen3-VL visual-delta adapter chat.")
+    parser = argparse.ArgumentParser("Interactive Qwen3-VL embedding_adapter chat.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
-    parser.add_argument("--checkpoint", default=str(DEFAULT_CKPT))
+    parser.add_argument("--checkpoint", default=DEFAULT_CKPT, help="Qwen embedding_adapter checkpoint path. Can also set QWEN_EMBEDDING_ADAPTER_CKPT.")
     parser.add_argument("--image", default=None, help="Initial image path. You can also set it with /image in chat.")
     parser.add_argument("--mode", choices=("adapter", "teacher", "both"), default="both")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--history", action=argparse.BooleanOptionalAction, default=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.checkpoint:
+        raise SystemExit("set --checkpoint or QWEN_EMBEDDING_ADAPTER_CKPT")
+    return args
 
 
 def resolve_path(path: str | Path) -> Path:
@@ -161,7 +157,7 @@ def main() -> None:
     print(f"Loading model: {model_path}", flush=True)
     processor, model = load_frozen_qwen3vl(model_path, dtype, device, args.attn_implementation)
     print(f"Loading adapter: {checkpoint}", flush=True)
-    adapter, meta = load_qwen_visual_delta_checkpoint(checkpoint, model.model.language_model, device, dtype)
+    adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
     print(
         f"Loaded adapter mode={adapter.mode} step={meta.get('global_step')} missing={len(meta['missing'])} unexpected={len(meta['unexpected'])}",
         flush=True,

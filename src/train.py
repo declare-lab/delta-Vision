@@ -1,4 +1,4 @@
-"""Unified trainer for LLaVA KV adapters and Qwen3-VL visual-delta adapters."""
+"""Unified trainer for LLaVA kv_adapter and Qwen3-VL embedding_adapter."""
 from __future__ import annotations
 
 import argparse
@@ -18,13 +18,14 @@ from PIL import Image
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, DistributedSampler
 
-from src.data import OPDDataset, VQADataset, collate_fn
+from src.data import VQADataset, collate_fn
 from src.model import (
     LLAVA_OUTPUT_MODES,
     PerLayerKVAdapter,
-    QWEN_VISUAL_DELTA_MODES,
-    QwenVisualDeltaAdapter,
+    QWEN_EMBEDDING_ADAPTER_MODES,
+    QwenEmbeddingAdapter,
     build_qwen_initial_context,
+    canonical_adapter_mode,
     dtype_from_name,
     extract_vision_kv,
     gather_batched_positions,
@@ -34,9 +35,9 @@ from src.model import (
     prepare_qwen3vl_batch_inputs,
     qwen3vl_text_ids_and_answer_mask,
     qwen_position_ids,
-    qwen_visual_delta_logits,
+    qwen_embedding_adapter_logits,
     resolve_row_image_paths,
-    student_forward_llava_injection,
+    student_forward_llava_embedding_adapter,
     student_forward_with_visual_kv,
     teacher_forward,
 )
@@ -105,7 +106,7 @@ class JsonlDataset:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Unified trainer for LLaVA KV adapters and Qwen3-VL visual-delta adapters.")
+    parser = argparse.ArgumentParser("Unified trainer for LLaVA kv_adapter and Qwen3-VL embedding_adapter.")
     parser.add_argument("--model-kind", choices=("llava", "qwen"), default="llava")
 
     parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
@@ -150,14 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-layers", default="22,23", help="Comma-separated ViT layer indices")
     parser.add_argument("--bottleneck-dim", type=int, default=0)
     parser.add_argument("--concat-source", action="store_true")
-    parser.add_argument("--dataset-type", default="vqa", choices=("vqa", "opd"))
 
-    parser.add_argument("--output-mode", choices=tuple(sorted(set(LLAVA_OUTPUT_MODES + QWEN_VISUAL_DELTA_MODES))), default=None)
+    parser.add_argument("--output-mode", choices=tuple(sorted(set(LLAVA_OUTPUT_MODES + QWEN_EMBEDDING_ADAPTER_MODES))), default=None)
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
-    parser.add_argument("--supervision-loss", choices=("distill", "opd", "ce"), default="distill")
-    parser.add_argument("--opd-rollout-max-new-tokens", type=int, default=32)
+    parser.add_argument("--supervision-loss", choices=("distill", "ce"), default="distill")
     parser.add_argument("--lambda-logit", type=float, default=4.0)
-    parser.add_argument("--lambda-trajectory", type=float, default=1.0)
+    parser.add_argument("--lambda-trajectory", type=float, default=0.5)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
     parser.add_argument("--loss-normalization", choices=("token", "sample"), default="token")
     parser.add_argument("--trajectory-layers", default="4,8,12,16,20,24,28,32,36")
@@ -460,94 +459,6 @@ def qwen_last_token_logits(logits: Tensor, text_mask: Tensor) -> Tensor:
     return logits[batch_idx, last_idx]
 
 
-def qwen_append_generated_text_tokens(inputs: dict[str, Tensor], generated_ids: list[int]) -> dict[str, Tensor]:
-    if inputs["input_ids"].shape[0] != 1:
-        raise ValueError("qwen_append_generated_text_tokens expects a single-row Qwen input")
-    if not generated_ids:
-        raise ValueError("cannot append an empty OPD rollout")
-    token_tensor = torch.tensor([generated_ids], device=inputs["input_ids"].device, dtype=inputs["input_ids"].dtype)
-    out = dict(inputs)
-    out["input_ids"] = torch.cat([inputs["input_ids"], token_tensor], dim=1)
-    out["attention_mask"] = torch.cat([inputs["attention_mask"], torch.ones_like(token_tensor)], dim=1)
-    out["mm_token_type_ids"] = torch.cat([inputs["mm_token_type_ids"], torch.zeros_like(token_tensor)], dim=1)
-    return out
-
-
-@torch.no_grad()
-def qwen_student_rollout_token_ids(
-    model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
-    prompt_inputs: dict[str, Tensor],
-    tokenizer: Any,
-    *,
-    max_new_tokens: int,
-) -> list[int]:
-    if prompt_inputs["input_ids"].shape[0] != 1:
-        raise ValueError("OPD rollout currently expects single-row Qwen inputs")
-    eos_ids = qwen_eos_token_ids(tokenizer)
-    fallback_id = tokenizer.eos_token_id
-    if isinstance(fallback_id, list):
-        fallback_id = fallback_id[0] if fallback_id else None
-    if fallback_id is None:
-        fallback_id = tokenizer.pad_token_id
-    if max_new_tokens <= 0:
-        return [int(fallback_id)] if fallback_id is not None else []
-
-    full_ids = prompt_inputs["input_ids"].clone()
-    full_mask = prompt_inputs["attention_mask"].clone()
-    full_mm_ids = prompt_inputs["mm_token_type_ids"].clone()
-    inputs = {
-        "input_ids": full_ids,
-        "attention_mask": full_mask,
-        "pixel_values": prompt_inputs["pixel_values"],
-        "image_grid_thw": prompt_inputs["image_grid_thw"],
-        "mm_token_type_ids": full_mm_ids,
-    }
-    initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
-    token_embeddings = model.model.get_input_embeddings()
-    last_pos_idx = full_mask.long().sum(dim=1).sub(1).view(1, -1, 1).expand(position_ids.shape[0], -1, 1)
-    token_position_ids = position_ids.gather(2, last_pos_idx)
-
-    generated: list[int] = []
-    for _ in range(int(max_new_tokens)):
-        logits, text_mask, _ = qwen_visual_delta_logits(
-            model,
-            adapter,
-            inputs,
-            initial_hidden=initial_hidden,
-            position_ids=position_ids,
-            collect_states=False,
-            compact_no_padding=True,
-            logits_to_keep=1,
-        )
-        next_token = int(torch.argmax(qwen_last_token_logits(logits, text_mask), dim=-1).item())
-        generated.append(next_token)
-        if next_token in eos_ids:
-            break
-
-        token = torch.tensor([[next_token]], dtype=full_ids.dtype, device=full_ids.device)
-        full_ids = torch.cat([full_ids, token], dim=1)
-        full_mask = torch.cat([full_mask, torch.ones_like(token)], dim=1)
-        full_mm_ids = torch.cat([full_mm_ids, torch.zeros_like(token)], dim=1)
-        initial_hidden = torch.cat(
-            [initial_hidden, token_embeddings(token).to(device=initial_hidden.device, dtype=initial_hidden.dtype)],
-            dim=1,
-        )
-        token_position_ids = token_position_ids + 1
-        position_ids = torch.cat([position_ids, token_position_ids], dim=2)
-        inputs = {
-            "input_ids": full_ids,
-            "attention_mask": full_mask,
-            "pixel_values": prompt_inputs["pixel_values"],
-            "image_grid_thw": prompt_inputs["image_grid_thw"],
-            "mm_token_type_ids": full_mm_ids,
-        }
-
-    if not generated and fallback_id is not None:
-        generated.append(int(fallback_id))
-    return generated
-
-
 def image_pixel_area(row: dict[str, Any], image_root: Path | None) -> int:
     paths = resolve_row_image_paths(row, image_root)
     total = 0
@@ -622,7 +533,7 @@ def build_training_order(args: argparse.Namespace, dataset: JsonlDataset, world_
     return order
 
 
-def save_checkpoint(adapter: QwenVisualDeltaAdapter, output_path: Path, args: argparse.Namespace, global_step: int) -> None:
+def save_checkpoint(adapter: QwenEmbeddingAdapter, output_path: Path, args: argparse.Namespace, global_step: int) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -630,7 +541,7 @@ def save_checkpoint(adapter: QwenVisualDeltaAdapter, output_path: Path, args: ar
             "args": vars(args),
             "global_step": int(global_step),
             "adapter_config": {
-                "type": "qwen_visual_delta",
+                "type": "qwen_embedding_adapter",
                 "output_mode": args.output_mode,
                 "visual_adapter_rank": args.visual_adapter_rank,
             },
@@ -639,7 +550,7 @@ def save_checkpoint(adapter: QwenVisualDeltaAdapter, output_path: Path, args: ar
     )
 
 
-def trainable_parameters_for_mode(adapter: QwenVisualDeltaAdapter) -> list[nn.Parameter]:
+def trainable_parameters_for_mode(adapter: QwenEmbeddingAdapter) -> list[nn.Parameter]:
     for param in adapter.parameters():
         param.requires_grad_(False)
     for name, param in adapter.named_parameters():
@@ -651,15 +562,15 @@ def trainable_parameters_for_mode(adapter: QwenVisualDeltaAdapter) -> list[nn.Pa
 def compute_qwen_loss_for_prepared_inputs(
     args: argparse.Namespace,
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     inputs: dict[str, Tensor],
     text_ids: Tensor,
     answer_mask: Tensor,
     num_layers: int,
 ) -> tuple[torch.Tensor, dict[str, float], Tensor, Tensor, Tensor]:
-    loss_mode = "distill" if args.supervision_loss == "opd" else str(args.supervision_loss)
+    loss_mode = str(args.supervision_loss)
     if loss_mode == "ce":
-        student_logits, student_text_mask, _ = qwen_visual_delta_logits(
+        student_logits, student_text_mask, _ = qwen_embedding_adapter_logits(
             model,
             adapter,
             inputs,
@@ -710,7 +621,7 @@ def compute_qwen_loss_for_prepared_inputs(
             else:
                 initial_hidden, _ = build_qwen_initial_context(model, inputs)
 
-    student_logits, student_text_mask, student_states = qwen_visual_delta_logits(
+    student_logits, student_text_mask, student_states = qwen_embedding_adapter_logits(
         model,
         adapter,
         inputs,
@@ -807,106 +718,16 @@ def add_qwen_source_metrics(
         metrics[f"source_loss_weighted_{group_name}"] = float((group_loss_sum / max(1, len(rows))).detach())
 
 
-def compute_qwen_opd_loss_for_rows(
-    args: argparse.Namespace,
-    processor: Any,
-    model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
-    rows: list[dict[str, Any]],
-    device: torch.device,
-    num_layers: int,
-) -> tuple[torch.Tensor, dict[str, float | int | str]]:
-    image_root = Path(args.image_root) if str(args.image_root).strip() else None
-    row_losses: list[Tensor] = []
-    metric_sums: dict[str, float] = {}
-    row_supervision: list[Tensor] = []
-    row_answer_counts: list[Tensor] = []
-    rollout_token_counts: list[int] = []
-    empty_text = 0
-    eos_hits = 0
-    eos_ids = qwen_eos_token_ids(processor.tokenizer)
-    pad_id = int(processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id)
-    image_paths: list[str] = []
-
-    for row in rows:
-        prompt_inputs, _, _, prompt_images = prepare_qwen3vl_batch_inputs(
-            processor,
-            [row],
-            image_root,
-            device,
-            include_answers=False,
-        )
-        generated_ids = qwen_student_rollout_token_ids(
-            model,
-            adapter,
-            prompt_inputs,
-            processor.tokenizer,
-            max_new_tokens=args.opd_rollout_max_new_tokens,
-        )
-        if not generated_ids:
-            raise RuntimeError("OPD rollout produced no token ids")
-        rollout_token_counts.append(len(generated_ids))
-        eos_hits += int(generated_ids[-1] in eos_ids)
-        decoded = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        empty_text += int(not decoded)
-        full_inputs = qwen_append_generated_text_tokens(prompt_inputs, generated_ids)
-        text_ids, answer_mask, _ = qwen3vl_text_ids_and_answer_mask(
-            full_inputs["input_ids"],
-            full_inputs["attention_mask"],
-            full_inputs["mm_token_type_ids"],
-            [len(generated_ids)],
-            pad_id,
-        )
-        row_loss, row_metrics, per_sample_supervision, answer_counts, _ = compute_qwen_loss_for_prepared_inputs(
-            args,
-            model,
-            adapter,
-            full_inputs,
-            text_ids,
-            answer_mask,
-            num_layers,
-        )
-        row_losses.append(row_loss)
-        row_supervision.append(per_sample_supervision.detach())
-        row_answer_counts.append(answer_counts.detach())
-        image_paths.extend(prompt_images)
-        for key, value in row_metrics.items():
-            metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-
-    loss = torch.stack(row_losses).mean()
-    metrics: dict[str, float | int | str] = {
-        key: value / max(1, len(row_losses))
-        for key, value in metric_sums.items()
-    }
-    metrics["loss"] = float(loss.detach())
-    metrics["opd_rollout_tokens"] = float(sum(rollout_token_counts)) / max(1, len(rollout_token_counts))
-    metrics["opd_empty_text_rate"] = float(empty_text) / max(1, len(rollout_token_counts))
-    metrics["opd_eos_rate"] = float(eos_hits) / max(1, len(rollout_token_counts))
-    metrics["image"] = image_paths[0] if image_paths else ""
-    metrics["batch_size"] = int(len(rows))
-    metrics["supervision_loss"] = "opd"
-    add_qwen_source_metrics(
-        metrics,
-        rows,
-        torch.cat(row_supervision).to(device=loss.device),
-        torch.cat(row_answer_counts).to(device=loss.device),
-    )
-    return loss, metrics
-
-
 def compute_loss_for_rows(
     args: argparse.Namespace,
     processor: Any,
     model: torch.nn.Module,
-    adapter: QwenVisualDeltaAdapter,
+    adapter: QwenEmbeddingAdapter,
     rows: list[dict[str, Any]],
     device: torch.device,
     dtype: torch.dtype,
     num_layers: int,
 ) -> tuple[torch.Tensor, dict[str, float | int | str]]:
-    if args.supervision_loss == "opd":
-        return compute_qwen_opd_loss_for_rows(args, processor, model, adapter, rows, device, num_layers)
-
     inputs, text_ids, answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
         processor,
         rows,
@@ -959,9 +780,9 @@ def run_llava(args: argparse.Namespace) -> None:
     head_dim = language_model.config.hidden_size // language_model.config.num_attention_heads
     if is_main:
         print(f"LLM: {num_llm_layers} layers, {num_heads} heads, head_dim={head_dim}")
-    if args.output_mode == "native_visual_kv_injection":
+    if args.output_mode == "embedding_adapter":
         adapter_config = {
-            "adapter_type": "native_visual_kv_injection",
+            "adapter_type": "embedding_adapter",
             "hidden_size": int(language_model.config.hidden_size),
             "num_llm_layers": num_llm_layers,
             "num_heads": int(language_model.config.num_attention_heads),
@@ -969,9 +790,9 @@ def run_llava(args: argparse.Namespace) -> None:
             "visual_adapter_rank": args.visual_adapter_rank,
             "output_mode": args.output_mode,
         }
-        adapter = QwenVisualDeltaAdapter.from_language_model(
+        adapter = QwenEmbeddingAdapter.from_language_model(
             language_model,
-            mode="native_visual_kv_injection",
+            mode="embedding_adapter",
             visual_adapter_rank=args.visual_adapter_rank,
         )
     else:
@@ -1018,7 +839,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     if args.init_checkpoint:
         ckpt = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
-        missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=args.output_mode != "native_visual_kv_injection")
+        missing, unexpected = adapter.load_state_dict(ckpt["state_dict"], strict=args.output_mode != "embedding_adapter")
         if is_main:
             print(f"Loaded init checkpoint: {args.init_checkpoint} missing={list(missing)} unexpected={list(unexpected)}")
 
@@ -1041,8 +862,7 @@ def run_llava(args: argparse.Namespace) -> None:
         progress = (step_idx - warmup_steps) / max(args.max_steps - warmup_steps, 1)
         return min_lr + (args.lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
-    DatasetCls = OPDDataset if args.dataset_type == "opd" else VQADataset
-    dataset = DatasetCls(
+    dataset = VQADataset(
         args.data,
         processor,
         data_root=args.data_root,
@@ -1063,7 +883,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     metrics_path = Path(args.output_dir) / "train_metrics.jsonl"
     step = 0
-    use_native_visual_kv = args.output_mode == "native_visual_kv_injection"
+    use_embedding_adapter = args.output_mode == "embedding_adapter"
 
     for epoch in range(100):
         sampler.set_epoch(epoch)
@@ -1081,12 +901,12 @@ def run_llava(args: argparse.Namespace) -> None:
                 image_sizes = batch.get("image_sizes")
                 if isinstance(pixel_values, list):
                     # Variable crops: process per-sample
-                    source_k_list = [] if not use_native_visual_kv else None
-                    source_v_list = [] if not use_native_visual_kv else None
+                    source_k_list = [] if not use_embedding_adapter else None
+                    source_v_list = [] if not use_embedding_adapter else None
                     teacher_logits_list = []
                     for i in range(B):
                         pv_i = pixel_values[i].unsqueeze(0).to(device)
-                        if not use_native_visual_kv:
+                        if not use_embedding_adapter:
                             sk, sv = extract_vision_kv(model, pv_i, source_layer_indices=source_layers)
                             source_k_list.append(sk)
                             source_v_list.append(sv)
@@ -1103,7 +923,7 @@ def run_llava(args: argparse.Namespace) -> None:
                 else:
                     if image_sizes is not None and torch.is_tensor(image_sizes):
                         image_sizes = image_sizes.to(device)
-                    if use_native_visual_kv:
+                    if use_embedding_adapter:
                         source_k = source_v = None
                     else:
                         source_k, source_v = extract_vision_kv(model, pixel_values, source_layer_indices=source_layers)
@@ -1119,8 +939,8 @@ def run_llava(args: argparse.Namespace) -> None:
                 else:
                     single_pixel_values = pixel_values[i:i+1]
 
-                if use_native_visual_kv:
-                    student_logits = student_forward_llava_injection(
+                if use_embedding_adapter:
+                    student_logits = student_forward_llava_embedding_adapter(
                         model,
                         single_ids,
                         single_pixel_values,
@@ -1261,7 +1081,7 @@ def run_qwen(args: argparse.Namespace) -> None:
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
     language_model = model.model.language_model
     num_layers = len(language_model.layers)
-    adapter = QwenVisualDeltaAdapter.from_language_model(
+    adapter = QwenEmbeddingAdapter.from_language_model(
         language_model,
         mode=args.output_mode,
         visual_adapter_rank=args.visual_adapter_rank,
@@ -1320,7 +1140,7 @@ def run_qwen(args: argparse.Namespace) -> None:
 
     if is_rank0():
         print(
-            f"qwen visual-delta train mode={args.output_mode} world_size={world_size} "
+            f"qwen embedding adapter train mode={args.output_mode} world_size={world_size} "
             f"micro_batch={args.micro_batch_size_per_gpu} grad_accum={args.gradient_accumulation_steps} "
             f"max_steps={args.max_steps} trainable={trainable_count/1e6:.2f}M "
             f"lr={args.lr} scheduler={args.lr_scheduler} warmup={args.warmup_ratio} "
@@ -1389,12 +1209,12 @@ def run_qwen(args: argparse.Namespace) -> None:
         if global_step % args.save_every == 0:
             engine.save_checkpoint(str(output_dir / "optimizer"), tag=f"step{global_step}")
             if is_rank0():
-                save_checkpoint(engine.module, output_dir / f"qwen_visual_delta_step{global_step}.pt", args, global_step)
+                save_checkpoint(engine.module, output_dir / f"qwen_embedding_adapter_step{global_step}.pt", args, global_step)
 
     engine.save_checkpoint(str(output_dir / "optimizer"), tag="final")
     if is_rank0():
-        save_checkpoint(engine.module, output_dir / f"qwen_visual_delta_step{global_step}.pt", args, global_step)
-        save_checkpoint(engine.module, output_dir / "qwen_visual_delta_final.pt", args, global_step)
+        save_checkpoint(engine.module, output_dir / f"qwen_embedding_adapter_step{global_step}.pt", args, global_step)
+        save_checkpoint(engine.module, output_dir / "qwen_embedding_adapter_final.pt", args, global_step)
     distributed_barrier(device)
     if distributed_is_initialized():
         dist.destroy_process_group()
@@ -1406,11 +1226,13 @@ def run_qwen(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.output_mode is not None:
+        args.output_mode = canonical_adapter_mode(args.output_mode)
     if args.model_kind == "qwen":
         if args.output_mode is None:
-            args.output_mode = "native_visual_kv_injection"
-        if args.output_mode not in QWEN_VISUAL_DELTA_MODES:
-            raise ValueError(f"Qwen only supports output_mode in {QWEN_VISUAL_DELTA_MODES}, got {args.output_mode!r}")
+            args.output_mode = "embedding_adapter"
+        if args.output_mode not in QWEN_EMBEDDING_ADAPTER_MODES:
+            raise ValueError(f"Qwen only supports output_mode in {QWEN_EMBEDDING_ADAPTER_MODES}, got {args.output_mode!r}")
         if args.lr_scheduler is None:
             args.lr_scheduler = "constant"
         if args.warmup_ratio is None:
@@ -1422,7 +1244,7 @@ def main() -> None:
     if args.warmup_ratio is None:
         args.warmup_ratio = 0.2
     if args.output_mode is None:
-        args.output_mode = "adapter_only"
+        args.output_mode = "kv_adapter"
     if args.output_mode not in LLAVA_OUTPUT_MODES:
         raise ValueError(f"LLaVA only supports output_mode in {LLAVA_OUTPUT_MODES}, got {args.output_mode!r}")
     if not args.init_checkpoint:
