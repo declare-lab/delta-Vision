@@ -11,3 +11,6 @@ wandb/
 *.pt
 *.pyc
 __pycache__/
+
+# Local baseline artifacts
+baselines/
