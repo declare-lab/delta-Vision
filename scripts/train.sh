@@ -27,7 +27,7 @@ Common:
   MAX_STEPS=12000
   SAVE_EVERY=1000
 
-Qwen defaults train embedding_adapter with token-mean KL and lambda_trajectory=0.5.
+Qwen defaults train embedding_adapter with token-mean KL and joint-attention supervision.
 Set OUTPUT_MODE=recurrent_embedding_adapter for the recurrent embedding adapter.
 LLaVA defaults train kv_adapter.
 EOF
@@ -75,8 +75,8 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
   LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-token}
   SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
-  LAMBDA_LOGIT=${LAMBDA_LOGIT:-4.0}
-  LAMBDA_TRAJECTORY=${LAMBDA_TRAJECTORY:-0.5}
+  LAMBDA_LOGIT=${LAMBDA_LOGIT:-2.0}
+  LAMBDA_JOINT_ATTENTION=${LAMBDA_JOINT_ATTENTION:-1.0}
   KL_TOPK=${KL_TOPK:-1024}
   LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
   VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
@@ -119,7 +119,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
   echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
   echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
-  echo "lambda_logit=$LAMBDA_LOGIT lambda_trajectory=$LAMBDA_TRAJECTORY lambda_kv_mse=$LAMBDA_KV_MSE"
+  echo "lambda_logit=$LAMBDA_LOGIT lambda_joint_attention=$LAMBDA_JOINT_ATTENTION lambda_kv_mse=$LAMBDA_KV_MSE"
   echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
 
   CMD=(
@@ -143,7 +143,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     --min-lr-ratio "$MIN_LR_RATIO"
     --weight-decay "${WEIGHT_DECAY:-0.01}" --temperature "${TEMPERATURE:-2.0}"
     --kl-topk "$KL_TOPK"
-    --lambda-trajectory "$LAMBDA_TRAJECTORY" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
+    --lambda-joint-attention "$LAMBDA_JOINT_ATTENTION" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
     --loss-normalization "$LOSS_NORMALIZATION"
     --supervision-loss "$SUPERVISION_LOSS"
     --output-mode "$OUTPUT_MODE"
@@ -151,7 +151,6 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     --batch-sampling "${BATCH_SAMPLING:-pixel_bucket}"
     --pixel-bucket-size "${PIXEL_BUCKET_SIZE:-512}"
     --pixel-area-cache "$PIXEL_AREA_CACHE"
-    --trajectory-layers "${TRAJECTORY_LAYERS:-4,8,12,16,20,24,28,32,36}"
     --deepspeed-config "$DS_CONFIG"
     --dtype "$DTYPE"
     --attn-implementation "$ATTN_IMPL"

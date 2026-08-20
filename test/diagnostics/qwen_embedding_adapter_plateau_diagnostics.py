@@ -31,6 +31,8 @@ from src.model import (  # noqa: E402
     load_qwen_embedding_adapter_checkpoint,
     prepare_qwen3vl_batch_inputs,
     prepare_qwen_embedding_adapter_inputs,
+    canonical_adapter_mode,
+    is_embedding_adapter_mode,
     qwen_lm_head_logits,
     qwen_position_ids,
 )
@@ -138,6 +140,56 @@ def tensor_norm_stats(name: str, tensor: Tensor, mask: Tensor | None = None) -> 
         active = mask.to(device=norms.device, dtype=torch.bool)
     stats = masked_stats(norms, active)
     return {"name": name, **stats}
+
+
+def masked_feature_mse(pred: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    per_token = (pred.float() - target.float()).pow(2).mean(dim=-1)
+    valid = mask.to(device=per_token.device, dtype=per_token.dtype)
+    return (per_token * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def masked_cosine_gap(pred: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    pred_f = pred.float()
+    target_f = target.float()
+    per_token = 1.0 - F.cosine_similarity(pred_f, target_f, dim=-1)
+    valid = mask.to(device=per_token.device, dtype=per_token.dtype)
+    return (per_token * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def vision_memory_alignment_rows(
+    *,
+    all_visual_memories: Tensor,
+    teacher_hidden_states: tuple[Tensor, ...],
+    image_pos: Tensor,
+    image_mask: Tensor,
+    normalization: str,
+) -> list[dict[str, float | int]]:
+    rows: list[dict[str, float | int]] = []
+    num_layers = int(all_visual_memories.shape[0])
+    for layer_idx in range(num_layers):
+        state_idx = min(layer_idx, len(teacher_hidden_states) - 1)
+        pred = all_visual_memories[layer_idx]
+        target = gather_batched_positions(teacher_hidden_states[state_idx].detach(), image_pos, image_mask).to(dtype=pred.dtype)
+        mse = masked_feature_mse(pred, target, image_mask)
+        direction = masked_directional_mse(pred, target, image_mask, normalization=normalization)
+        cosine_gap = masked_cosine_gap(pred, target, image_mask)
+        pred_norms = pred.detach().float().pow(2).mean(dim=-1).sqrt()
+        target_norms = target.detach().float().pow(2).mean(dim=-1).sqrt()
+        valid = image_mask.bool()
+        norm_gap = (pred_norms - target_norms).abs()[valid].mean() if int(valid.sum().item()) else pred_norms.new_zeros(())
+        rows.append(
+            {
+                "layer": layer_idx,
+                "teacher_hidden_state": state_idx,
+                "mse": scalar(mse),
+                "directional_mse": scalar(direction),
+                "cosine_gap": scalar(cosine_gap),
+                "pred_norm": scalar(pred_norms[valid].mean() if int(valid.sum().item()) else pred_norms.new_zeros(())),
+                "teacher_norm": scalar(target_norms[valid].mean() if int(valid.sum().item()) else target_norms.new_zeros(())),
+                "norm_gap": scalar(norm_gap),
+            }
+        )
+    return rows
 
 
 def gate_rows(adapter: torch.nn.Module) -> list[dict[str, float | str]]:
@@ -302,6 +354,7 @@ def adapter_diagnostics(
     topk: int,
     trajectory_layers: set[int],
     oracle_modes: list[str],
+    intervention_modes: list[str],
     normalization: str,
     timing_runs: int,
 ) -> dict[str, Any]:
@@ -377,6 +430,13 @@ def adapter_diagnostics(
             )
 
         all_adapter_memories = adapter.all_visual_memories_batched(prepared["visual_memory"])
+        vision_alignment_rows = vision_memory_alignment_rows(
+            all_visual_memories=all_adapter_memories,
+            teacher_hidden_states=teacher.hidden_states,
+            image_pos=image_pos,
+            image_mask=image_mask,
+            normalization=normalization,
+        )
         visual_delta = all_adapter_memories - prepared["visual_memory"].unsqueeze(0)
         adapter_visual_rows = []
         for layer_idx in range(adapter.num_layers):
@@ -398,6 +458,7 @@ def adapter_diagnostics(
             }
         ]
         oracle_layer_rows = []
+        intervention_rows = []
         timing_rows = []
         if timing_runs > 0:
             from src.model import qwen_embedding_adapter_logits_prepared
@@ -499,6 +560,60 @@ def adapter_diagnostics(
                     }
                 )
 
+        if intervention_modes:
+            teacher_input_memories = build_oracle_memories(
+                "teacher_layer_input",
+                prepared=prepared,
+                teacher_hidden_states=teacher.hidden_states,
+                position_ids=position_ids,
+                inputs=inputs,
+                adapter=adapter,
+            )
+            for mode in intervention_modes:
+                mode = mode.strip()
+                if not mode:
+                    continue
+                if mode not in {"replace_layer", "prefix_teacher", "suffix_teacher"}:
+                    raise ValueError(f"unknown intervention mode: {mode}")
+                for layer_idx in range(num_layers):
+                    mixed_memories = all_adapter_memories.clone()
+                    if mode == "replace_layer":
+                        mixed_memories[layer_idx] = teacher_input_memories[layer_idx]
+                    elif mode == "prefix_teacher":
+                        mixed_memories[: layer_idx + 1] = teacher_input_memories[: layer_idx + 1]
+                    else:
+                        mixed_memories[layer_idx:] = teacher_input_memories[layer_idx:]
+                    intervention_logits, _, _ = oracle_logits_from_visual_memories(
+                        model,
+                        adapter,
+                        prepared,
+                        mixed_memories,
+                        collect_state_indices=set(),
+                    )
+                    intervention_token_kl, intervention_token_mask = per_token_topk_kl(
+                        intervention_logits,
+                        teacher_logits,
+                        text_ids,
+                        answer_mask,
+                        temperature=temperature,
+                        topk=topk,
+                    )
+                    intervention_kl = (
+                        masked_token_mean(intervention_token_kl, intervention_token_mask)
+                        if normalization == "token"
+                        else masked_sample_mean(intervention_token_kl, intervention_token_mask)
+                    )
+                    intervention_rows.append(
+                        {
+                            "mode": mode,
+                            "layer": layer_idx,
+                            "kl": scalar(intervention_kl),
+                            "token_kl_mean": scalar(masked_token_mean(intervention_token_kl, intervention_token_mask)),
+                            "sample_kl_mean": scalar(masked_sample_mean(intervention_token_kl, intervention_token_mask)),
+                            "top1_agreement": top1_agreement(intervention_logits, teacher_logits, intervention_token_mask),
+                        }
+                    )
+
         token_summary = masked_stats(token_kl, token_mask)
         per_sample = []
         valid = token_mask.to(dtype=token_kl.dtype)
@@ -526,15 +641,22 @@ def adapter_diagnostics(
                 "normalization": normalization,
                 "temperature": float(temperature),
                 "topk": int(topk),
-                "visual_update_mode": str(getattr(adapter, "visual_update_mode", "static")),
+                "adapter_mode": str(getattr(adapter, "mode", "")),
                 "adapter_kl": scalar(normed_kl),
                 "adapter_token_kl": token_summary,
                 "adapter_top1_agreement": top1_agreement(student_logits, teacher_logits, token_mask),
+                "vision_memory_mse_mean": sum(float(row["mse"]) for row in vision_alignment_rows) / max(1, len(vision_alignment_rows)),
+                "vision_memory_directional_mse_mean": sum(float(row["directional_mse"]) for row in vision_alignment_rows)
+                / max(1, len(vision_alignment_rows)),
+                "vision_memory_cosine_gap_mean": sum(float(row["cosine_gap"]) for row in vision_alignment_rows)
+                / max(1, len(vision_alignment_rows)),
                 "has_gate": bool(gate_rows(adapter)),
             },
             "oracle_rows": oracle_rows,
             "layer_rows": layer_rows + oracle_layer_rows,
             "visual_rows": adapter_visual_rows,
+            "vision_alignment_rows": vision_alignment_rows,
+            "intervention_rows": intervention_rows,
             "norm_rows": norm_rows,
             "gate_rows": gate_rows(adapter),
             "timing_rows": timing_rows,
@@ -558,6 +680,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Qwen embedding_adapter plateau diagnostics")
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output-mode", default="", help="Optional adapter mode override, e.g. recurrent_embedding_adapter.")
     parser.add_argument("--data", required=True)
     parser.add_argument("--image-root", default="")
     parser.add_argument("--output-dir", default=str(ROOT / "test/results/qwen_plateau_diagnostics"))
@@ -574,6 +697,11 @@ def parse_args() -> argparse.Namespace:
         "--oracle-modes",
         default="adapter,recurrent_adapter,initial,teacher_layer_input,teacher_layer_output",
         help="Comma-separated modes: adapter, recurrent_adapter, initial, teacher_layer_input, teacher_layer_output.",
+    )
+    parser.add_argument(
+        "--intervention-modes",
+        default="",
+        help="Optional comma-separated layer intervention modes: replace_layer,prefix_teacher,suffix_teacher.",
     )
     parser.add_argument("--timing-runs", type=int, default=0, help="Optional timing runs for static src vs test-only recurrent adapter.")
     return parser.parse_args()
@@ -593,6 +721,11 @@ def main() -> None:
         pass
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
     adapter, meta = load_qwen_embedding_adapter_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
+    if args.output_mode:
+        output_mode = canonical_adapter_mode(args.output_mode)
+        if not is_embedding_adapter_mode(output_mode):
+            raise ValueError(f"unsupported Qwen embedding adapter output mode: {args.output_mode!r}")
+        adapter.mode = str(output_mode)
     adapter.eval()
     rows = read_jsonl_rows(Path(args.data), start_index=args.start_index, count=args.batch_size)
     inputs, text_ids, answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
@@ -607,6 +740,7 @@ def main() -> None:
     num_layers = len(model.model.language_model.layers)
     trajectory_layers = parse_trajectory_layers(args.trajectory_layers, num_layers)
     oracle_modes = [mode.strip() for mode in args.oracle_modes.split(",") if mode.strip()]
+    intervention_modes = [mode.strip() for mode in args.intervention_modes.split(",") if mode.strip()]
     diagnostics = adapter_diagnostics(
         model,
         adapter,
@@ -617,6 +751,7 @@ def main() -> None:
         topk=int(args.kl_topk),
         trajectory_layers=trajectory_layers,
         oracle_modes=oracle_modes,
+        intervention_modes=intervention_modes,
         normalization=str(args.loss_normalization),
         timing_runs=int(args.timing_runs),
     )
@@ -631,6 +766,8 @@ def main() -> None:
     write_csv(output_dir / "oracle.csv", diagnostics["oracle_rows"])
     write_csv(output_dir / "trajectory_by_layer.csv", diagnostics["layer_rows"])
     write_csv(output_dir / "adapter_visual_norms.csv", diagnostics["visual_rows"])
+    write_csv(output_dir / "vision_memory_alignment.csv", diagnostics["vision_alignment_rows"])
+    write_csv(output_dir / "intervention_by_layer.csv", diagnostics["intervention_rows"])
     write_csv(output_dir / "norms.csv", diagnostics["norm_rows"])
     write_csv(output_dir / "gates.csv", diagnostics["gate_rows"])
     write_csv(output_dir / "timing.csv", diagnostics["timing_rows"])
