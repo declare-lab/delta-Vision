@@ -1,6 +1,7 @@
 __pycache__/
 test/results/*
 !test/results/.gitignore
+test/
 artifacts/
 *.pyc
 .venv/

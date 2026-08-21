@@ -2283,13 +2283,13 @@ def main() -> None:
             if args.metric_table:
                 run_qwen_metric_table(args)
             elif int(args.sample_count) > 1 or int(args.batch_size) > 1:
-                args.sample_jsonl = args.sample_jsonl or "../delta-vision/data/mmstar/mmstar_val.jsonl"
+                args.sample_jsonl = args.sample_jsonl or "data/benchmarks/mmstar/mmstar_val.jsonl"
                 run_qwen3vl_batch_prefill(args)
             else:
-                args.sample_jsonl = args.sample_jsonl or "../delta-vision/data/mmstar/mmstar_val.jsonl"
+                args.sample_jsonl = args.sample_jsonl or "data/benchmarks/mmstar/mmstar_val.jsonl"
                 run_qwen3vl(args)
         elif model_kind == "llava":
-            args.sample_jsonl = args.sample_jsonl or "../delta-vision/data/mmstar/mmstar_val.jsonl"
+            args.sample_jsonl = args.sample_jsonl or "data/benchmarks/mmstar/mmstar_val.jsonl"
             run_llava(args)
         else:
             raise ValueError(f"unsupported model kind: {model_kind}")

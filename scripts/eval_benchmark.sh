@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-DATA_ROOT=${DATA_ROOT:-/lustre-data/leijingdi/code/delta-vision}
+DATA_ROOT=${DATA_ROOT:-$ROOT_DIR}
+MODEL_ROOT=${MODEL_ROOT:-/lustre-data/leijingdi/code/delta-vision}
 PY=${PY:-$ROOT_DIR/.venv/bin/python}
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
@@ -100,7 +101,7 @@ Options:
   --model-kind llava|qwen  Model family. Can also set MODEL_KIND.
   --benchmark NAME         Single benchmark name.
   --benchmarks LIST        Comma/space-separated benchmark names, or all.
-  --model-path PATH        Base model path. Relative paths resolve under DATA_ROOT.
+  --model-path PATH        Base model path. Relative paths resolve under MODEL_ROOT.
   --data PATH              Override benchmark JSONL path. Use only for single eval.
   --checkpoint PATH        Adapter checkpoint path. Use only for single eval.
   --output-mode MODE       Override checkpoint output mode, e.g. recurrent_embedding_adapter.
@@ -356,7 +357,7 @@ if [[ "$MODEL_PATH" != /* ]]; then
   if [[ -e "$ROOT_DIR/$MODEL_PATH" ]]; then
     MODEL_PATH="$ROOT_DIR/$MODEL_PATH"
   else
-    MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+    MODEL_PATH="$MODEL_ROOT/$MODEL_PATH"
   fi
 fi
 if [[ "$DATA" != /* ]]; then
@@ -449,6 +450,7 @@ echo "=== Unified VLM adapter benchmark eval ==="
 echo "root=$ROOT_DIR"
 echo "model_kind=$MODEL_KIND"
 echo "data_root=$DATA_ROOT"
+echo "model_root=$MODEL_ROOT"
 echo "model_path=$MODEL_PATH"
 echo "checkpoint=$CKPT"
 echo "output=$OUT_DIR"

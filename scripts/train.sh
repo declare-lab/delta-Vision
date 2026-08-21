@@ -10,6 +10,7 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 MODEL_KIND=${MODEL_KIND:-qwen}
 MODEL_KIND="$(printf '%s' "$MODEL_KIND" | tr '[:upper:]' '[:lower:]')"
 DATA_ROOT=${DATA_ROOT:-/lustre-data/leijingdi/code/delta-vision}
+IMAGE_ROOT=${IMAGE_ROOT:-$ROOT_DIR/data/train/pixmo}
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
@@ -37,7 +38,7 @@ fi
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
-export DELTA_VISION_IMAGE_ROOT="$DATA_ROOT"
+export DELTA_VISION_IMAGE_ROOT="$IMAGE_ROOT"
 
 if [[ "$MODEL_KIND" == "qwen" ]]; then
   OUTPUT_MODE=${OUTPUT_MODE:-embedding_adapter}
@@ -52,9 +53,9 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
 
   MODEL_PATH=${MODEL_PATH:-models/Qwen3-VL-4B-Instruct}
-  DATA=${DATA:-artifacts/data_quality/pixmo_ama_full_valid.clean.jsonl}
+  DATA=${DATA:-data/train/pixmo/pixmo_ama_full_valid.clean.jsonl}
   DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2_coeff.json}
-  PIXEL_AREA_CACHE=${PIXEL_AREA_CACHE:-$ROOT_DIR/artifacts/cache/pixmo_ama_full_valid.clean.pixel_areas.json}
+  PIXEL_AREA_CACHE=${PIXEL_AREA_CACHE:-$ROOT_DIR/data/train/pixmo/pixmo_ama_full_valid.clean.jsonl.pixel_areas.json}
 
   NPROC_PER_NODE=${NPROC_PER_NODE:-8}
   MASTER_PORT=${MASTER_PORT:-29540}
@@ -109,6 +110,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   echo "=== Qwen3-VL embedding_adapter train ==="
   echo "root=$ROOT_DIR"
   echo "data_root=$DATA_ROOT"
+  echo "image_root=$IMAGE_ROOT"
   echo "run_name=$RUN_NAME"
   echo "output_dir=$OUTPUT_DIR"
   echo "metrics=$METRICS_JSONL"
@@ -128,7 +130,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     -m src.train
     --model-kind qwen
     --data "$DATA"
-    --image-root "$DATA_ROOT"
+    --image-root "$IMAGE_ROOT"
     --model-path "$MODEL_PATH"
     --output-dir "$OUTPUT_DIR"
     --metrics-jsonl "$METRICS_JSONL"
@@ -140,7 +142,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     --warmup-ratio "$WARMUP_RATIO"
     --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO"
     --min-lr-ratio "$MIN_LR_RATIO"
-    --weight-decay "${WEIGHT_DECAY:-0.01}" --temperature "${TEMPERATURE:-2.0}"
+    --weight-decay "${WEIGHT_DECAY:-0.0}" --temperature "${TEMPERATURE:-2.0}"
     --kl-topk "$KL_TOPK"
     --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
     --loss-normalization "$LOSS_NORMALIZATION"

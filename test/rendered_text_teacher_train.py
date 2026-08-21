@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
 from typing import Any
 
+import deepspeed
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from PIL import Image
 from torch import Tensor
 
 from src.model import (
@@ -28,9 +30,8 @@ from src.model import (
     load_frozen_qwen3vl,
     prepare_qwen3vl_batch_inputs,
     qwen_embedding_adapter_logits,
-    resolve_row_image_paths,
 )
-from src.train import SimpleEngine, lr_multiplier, save_checkpoint, set_engine_lr, trainable_parameters_for_mode
+from src.train import lr_multiplier, optimizer_param_groups, save_checkpoint, set_engine_lr, trainable_parameters_for_mode
 
 
 class JsonlRows:
@@ -82,37 +83,85 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--log-every", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--micro-batch-size-per-gpu", "--batch-size", dest="micro_batch_size_per_gpu", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--required-world-size", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--require-answer-visible", action="store_true")
-    parser.add_argument("--max-context-chars", type=int, default=60000)
+    parser.add_argument("--max-context-chars", type=int, default=0, help="0 means no teacher text truncation.")
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default="constant")
     parser.add_argument("--warmup-ratio", type=float, default=0.0)
     parser.add_argument("--warmup-start-lr-ratio", type=float, default=0.0)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--kl-topk", type=int, default=1024)
-    parser.add_argument("--lambda-logit", type=float, default=2.0)
-    parser.add_argument("--lambda-ce", type=float, default=0.0)
+    parser.add_argument("--reverse-kl-weight", type=float, default=0.0)
+    parser.add_argument("--first-token-weight", type=float, default=1.0)
+    parser.add_argument("--lambda-logit", type=float, default=1.0)
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--output-mode", default="embedding_adapter")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--deepspeed-config", default="configs/ds_zero2_coeff.json")
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=-1)
+    parser.add_argument("--metrics-jsonl", default="")
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="vision-kv-inject")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default="")
+    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="disabled")
     parser.add_argument("--seed", type=int, default=49)
     return parser.parse_args()
+
+
+def distributed_is_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_rank0() -> bool:
+    return not distributed_is_initialized() or dist.get_rank() == 0
+
+
+def reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str, float]:
+    if not distributed_is_initialized():
+        return metrics
+    keys = sorted(metrics)
+    values = torch.tensor([float(metrics[key]) for key in keys], device=device, dtype=torch.float32)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values /= float(dist.get_world_size())
+    return {key: float(value.item()) for key, value in zip(keys, values)}
+
+
+RENDERED_PAGE_INSTRUCTION = "Read the ordered page images and answer using only their text."
+ANSWER_INSTRUCTION = "Answer directly with a short phrase."
+
+
+def cleaned_rendered_question(row: dict[str, Any]) -> str:
+    question = str(row.get("raw_question") or row.get("question") or row.get("rendered_question") or "").strip()
+    prefixes = (
+        RENDERED_PAGE_INSTRUCTION,
+        "The attached page images are consecutive pages in order.",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if question.startswith(prefix):
+                question = question[len(prefix) :].lstrip("\n ").strip()
+                changed = True
+    return question
 
 
 def text_teacher_prompt(processor: Any, row: dict[str, Any], max_context_chars: int) -> str:
     context = str(row["text_context"]).strip()
     if max_context_chars > 0 and len(context) > max_context_chars:
         context = context[:max_context_chars]
-    question = str(row.get("question") or row.get("rendered_question") or "").strip()
-    question = question.replace("The attached page images are consecutive pages in order.\n", "").strip()
-    text = f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer directly with a short phrase."
+    question = cleaned_rendered_question(row)
+    text = f"Context:\n{context}\n\nQuestion:\n{question}\n\n{ANSWER_INSTRUCTION}"
     messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -155,8 +204,8 @@ def student_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for row in rows:
         copy = dict(row)
-        if "rendered_question" in copy:
-            copy["question"] = copy["rendered_question"]
+        question = cleaned_rendered_question(copy)
+        copy["question"] = f"{RENDERED_PAGE_INSTRUCTION}\n{question}\n{ANSWER_INSTRUCTION}"
         result.append(copy)
     return result
 
@@ -170,8 +219,11 @@ def masked_unaligned_topk_kl(
     *,
     temperature: float,
     topk: int,
+    reverse_kl_weight: float = 0.0,
+    first_token_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     losses: list[Tensor] = []
+    weights: list[Tensor] = []
     counts: list[int] = []
     for batch_idx in range(student_logits.shape[0]):
         s_mask = student_answer_mask[batch_idx, 1:].bool()
@@ -201,39 +253,55 @@ def masked_unaligned_topk_kl(
             F.softmax(t_gathered, dim=-1),
             reduction="none",
         ).sum(dim=-1)
-        losses.append(kl * (float(temperature) * float(temperature)))
+        token_loss = kl * (float(temperature) * float(temperature))
+        if float(reverse_kl_weight) > 0.0:
+            reverse_kl = F.kl_div(
+                F.log_softmax(t_gathered, dim=-1),
+                F.softmax(s_gathered, dim=-1),
+                reduction="none",
+            ).sum(dim=-1)
+            token_loss = token_loss + float(reverse_kl_weight) * reverse_kl * (float(temperature) * float(temperature))
+        token_weight = torch.ones_like(token_loss, dtype=torch.float32)
+        if token_weight.numel() > 0 and float(first_token_weight) != 1.0:
+            token_weight[0] = float(first_token_weight)
+        losses.append(token_loss)
+        weights.append(token_weight)
     answer_counts = torch.tensor(counts, device=student_logits.device, dtype=torch.float32)
     if not losses:
         return student_logits.new_zeros(()), answer_counts
-    return torch.cat(losses).mean().to(dtype=student_logits.dtype), answer_counts
-
-
-def masked_unaligned_ce(
-    student_logits: Tensor,
-    student_ids: Tensor,
-    student_answer_mask: Tensor,
-) -> Tensor:
-    shift_mask = student_answer_mask[:, 1:].bool()
-    if int(shift_mask.sum().item()) == 0:
-        return student_logits.new_zeros(())
-    logits = student_logits[:, :-1][shift_mask].float()
-    targets = student_ids[:, 1:][shift_mask].long()
-    return F.cross_entropy(logits, targets).to(dtype=student_logits.dtype)
+    flat_losses = torch.cat(losses)
+    flat_weights = torch.cat(weights).to(device=flat_losses.device, dtype=torch.float32)
+    return (flat_losses.float() * flat_weights).sum().div(flat_weights.sum().clamp_min(1.0)).to(dtype=student_logits.dtype), answer_counts
 
 
 def main() -> None:
     args = parse_args()
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
+    if distributed:
+        torch.cuda.set_device(local_rank)
+        deepspeed.init_distributed(dist_backend="nccl")
+        if args.required_world_size > 1 and dist.get_world_size() != args.required_world_size:
+            raise RuntimeError(f"expected {args.required_world_size} ranks, got {dist.get_world_size()}")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device(args.device)
+    rank = dist.get_rank() if distributed_is_initialized() else 0
+    world_size = dist.get_world_size() if distributed_is_initialized() else 1
+
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    device = torch.device(args.device)
     dtype = dtype_from_name(args.dtype)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+    if is_rank0():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+    if distributed_is_initialized():
+        dist.barrier()
 
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
     language_model = model.model.language_model
@@ -250,9 +318,23 @@ def main() -> None:
 
     trainable = trainable_parameters_for_mode(adapter)
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
-    engine = SimpleEngine(adapter, optimizer, args.grad_clip)
+    if distributed:
+        ds_config = json.loads(Path(args.deepspeed_config).read_text(encoding="utf-8"))
+        ds_config["train_micro_batch_size_per_gpu"] = int(args.micro_batch_size_per_gpu)
+        ds_config["gradient_accumulation_steps"] = int(args.gradient_accumulation_steps)
+        ds_config["gradient_clipping"] = float(args.grad_clip)
+        engine, _, _, _ = deepspeed.initialize(
+            model=adapter,
+            model_parameters=trainable,
+            optimizer=optimizer,
+            config=ds_config,
+        )
+    else:
+        from src.train import SimpleEngine
+
+        engine = SimpleEngine(adapter, optimizer, args.grad_clip)
     engine.train()
-    base_lrs = [float(group.get("lr", args.lr)) for group in optimizer.param_groups]
+    base_lrs = [float(group.get("lr", args.lr)) for group in optimizer_param_groups(engine)]
 
     data = JsonlRows(
         args.data,
@@ -262,77 +344,126 @@ def main() -> None:
         seed=args.seed,
     )
     image_root = Path(args.image_root) if str(args.image_root).strip() else None
-    metrics_path = output_dir / "train_metrics.jsonl"
-    print(
-        f"rendered text-teacher experiment rows={len(data)} batch={args.batch_size} "
-        f"steps={args.max_steps} trainable={sum(p.numel() for p in trainable)/1e6:.2f}M",
-        flush=True,
-    )
+    metrics_path = Path(args.metrics_jsonl) if str(args.metrics_jsonl).strip() else output_dir / "train_metrics.jsonl"
+    if is_rank0():
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"rendered text-teacher KL-only train rows={len(data)} world_size={world_size} "
+            f"micro_batch={args.micro_batch_size_per_gpu} grad_accum={args.gradient_accumulation_steps} "
+            f"global_batch={world_size * args.micro_batch_size_per_gpu * args.gradient_accumulation_steps} "
+            f"steps={args.max_steps} trainable={sum(p.numel() for p in trainable)/1e6:.2f}M",
+            flush=True,
+        )
+
+    wandb_run = None
+    if args.wandb and args.wandb_mode != "disabled" and is_rank0():
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name or output_dir.parent.name,
+            mode=args.wandb_mode,
+            config={
+                **vars(args),
+                "dataset_size": len(data),
+                "world_size": world_size,
+                "global_batch": world_size * args.micro_batch_size_per_gpu * args.gradient_accumulation_steps,
+            },
+        )
 
     for step in range(1, int(args.max_steps) + 1):
         start_s = time.perf_counter()
         current_lr = set_engine_lr(engine, base_lrs, lr_multiplier(args, step - 1))
-        rows = data.batch((step - 1) * int(args.batch_size), int(args.batch_size))
+        accum: dict[str, float] = {"logit_kl": 0.0, "loss": 0.0, "answer_tokens": 0.0}
+        image_paths: list[str] = []
+        for micro_idx in range(int(args.gradient_accumulation_steps)):
+            sample_base = (
+                (step - 1) * int(args.gradient_accumulation_steps) * world_size * int(args.micro_batch_size_per_gpu)
+                + micro_idx * world_size * int(args.micro_batch_size_per_gpu)
+                + rank * int(args.micro_batch_size_per_gpu)
+            )
+            rows = data.batch(sample_base, int(args.micro_batch_size_per_gpu))
+            teacher_inputs, _, teacher_answer_mask = prepare_text_teacher_inputs(
+                processor,
+                rows,
+                device,
+                max_context_chars=args.max_context_chars,
+            )
+            student_inputs, student_ids, student_answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
+                processor,
+                student_rows(rows),
+                image_root,
+                device,
+                include_answers=True,
+            )
+            assert student_ids is not None and student_answer_mask is not None
 
-        teacher_inputs, _, teacher_answer_mask = prepare_text_teacher_inputs(
-            processor,
-            rows,
-            device,
-            max_context_chars=args.max_context_chars,
-        )
-        student_inputs, student_ids, student_answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
-            processor,
-            student_rows(rows),
-            image_root,
-            device,
-            include_answers=True,
-        )
-        assert student_ids is not None and student_answer_mask is not None
+            with torch.no_grad():
+                teacher = model(**teacher_inputs, return_dict=True, use_cache=False)
+                teacher_logits = teacher.logits.detach()
+            student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
 
-        with torch.no_grad():
-            teacher = model(**teacher_inputs, return_dict=True, use_cache=False)
-            teacher_logits = teacher.logits.detach()
-        student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
-
-        kl, answer_counts = masked_unaligned_topk_kl(
-            student_logits,
-            teacher_logits,
-            student_ids,
-            student_answer_mask,
-            teacher_answer_mask,
-            temperature=args.temperature,
-            topk=args.kl_topk,
-        )
-        ce = masked_unaligned_ce(student_logits, student_ids, student_answer_mask)
-        loss = float(args.lambda_logit) * kl + float(args.lambda_ce) * ce
-        engine.backward(loss)
+            kl, answer_counts = masked_unaligned_topk_kl(
+                student_logits,
+                teacher_logits,
+                student_ids,
+                student_answer_mask,
+                teacher_answer_mask,
+                temperature=args.temperature,
+                topk=args.kl_topk,
+                reverse_kl_weight=args.reverse_kl_weight,
+                first_token_weight=args.first_token_weight,
+            )
+            loss = float(args.lambda_logit) * kl / float(args.gradient_accumulation_steps)
+            engine.backward(loss)
+            accum["logit_kl"] += float(kl.detach()) / float(args.gradient_accumulation_steps)
+            accum["loss"] += float((float(args.lambda_logit) * kl).detach()) / float(args.gradient_accumulation_steps)
+            accum["answer_tokens"] += float(answer_counts.mean().item()) / float(args.gradient_accumulation_steps)
         engine.step()
 
         if step % int(args.log_every) == 0 or step == 1:
+            accum["lr"] = float(current_lr)
+            accum["sec_per_step"] = time.perf_counter() - start_s
+            reduced = reduce_metrics(accum, device)
             payload = {
                 "step": step,
-                "loss": float(loss.detach()),
-                "logit_kl": float(kl.detach()),
-                "ce": float(ce.detach()),
-                "lr": float(current_lr),
-                "answer_tokens": float(answer_counts.mean().item()),
-                "sec_per_step": time.perf_counter() - start_s,
+                **reduced,
+                "global_batch": int(world_size * args.micro_batch_size_per_gpu * args.gradient_accumulation_steps),
                 "image": image_paths[0] if image_paths else "",
-                "source": str(rows[0].get("source", "")),
             }
-            with metrics_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            print(
-                f"step={step} loss={payload['loss']:.6f} kl={payload['logit_kl']:.6f} "
-                f"ce={payload['ce']:.6f} answer_tokens={payload['answer_tokens']:.1f} "
-                f"lr={payload['lr']:.3e}",
-                flush=True,
-            )
+            if is_rank0():
+                with metrics_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                print(
+                    f"step={step} loss={payload['loss']:.6f} kl={payload['logit_kl']:.6f} "
+                    f"answer_tokens={payload['answer_tokens']:.1f} lr={payload['lr']:.3e} "
+                    f"global_batch={payload['global_batch']}",
+                    flush=True,
+                )
+                if wandb_run is not None:
+                    import wandb
+
+                    wandb.log({f"train/{k}": v for k, v in payload.items() if isinstance(v, (int, float))}, step=step)
 
         if step % int(args.save_every) == 0:
-            save_checkpoint(adapter, output_dir / f"qwen_rendered_text_teacher_step{step}.pt", args, step)
+            if hasattr(engine, "save_checkpoint"):
+                engine.save_checkpoint(str(output_dir / "optimizer"), tag=f"step{step}")
+            if is_rank0():
+                save_checkpoint(engine.module, output_dir / f"qwen_rendered_text_teacher_step{step}.pt", args, step)
+                save_checkpoint(engine.module, output_dir / f"qwen_embedding_adapter_step{step}.pt", args, step)
 
-    save_checkpoint(adapter, output_dir / "qwen_rendered_text_teacher_final.pt", args, int(args.max_steps))
+    if hasattr(engine, "save_checkpoint"):
+        engine.save_checkpoint(str(output_dir / "optimizer"), tag="final")
+    if is_rank0():
+        save_checkpoint(engine.module, output_dir / "qwen_rendered_text_teacher_final.pt", args, int(args.max_steps))
+        save_checkpoint(engine.module, output_dir / "qwen_embedding_adapter_final.pt", args, int(args.max_steps))
+    if wandb_run is not None:
+        import wandb
+
+        wandb.finish()
+    if distributed_is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         name="mmstar",
         display_name="MMStar",
         metric="multi_choice",
-        default_data="data/mmstar/mmstar_val.jsonl",
+        default_data="data/benchmarks/mmstar/mmstar_val.jsonl",
         answer_instruction="Answer directly with only the letter of the correct option.",
         max_new_tokens=8,
     ),

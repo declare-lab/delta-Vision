@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=None)
     parser.add_argument("--warmup-start-lr-ratio", type=float, default=0.0)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--kl-topk", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=2.0)
 
@@ -701,7 +701,7 @@ def run_llava(args: argparse.Namespace) -> None:
         if is_main:
             print(f"Loaded init checkpoint: {args.init_checkpoint} missing={list(missing)} unexpected={list(unexpected)}")
 
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
     with open(args.deepspeed_config, "r", encoding="utf-8") as f:
         ds_config = json.load(f)
     ds_config["train_micro_batch_size_per_gpu"] = args.batch_size
