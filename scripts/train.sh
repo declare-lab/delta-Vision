@@ -27,7 +27,7 @@ Common:
   MAX_STEPS=12000
   SAVE_EVERY=1000
 
-Qwen defaults train embedding_adapter with token-mean KL and joint-attention supervision.
+Qwen defaults train embedding_adapter with token-mean KL distillation.
 Set OUTPUT_MODE=recurrent_embedding_adapter for the recurrent embedding adapter.
 LLaVA defaults train kv_adapter.
 EOF
@@ -76,7 +76,6 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-token}
   SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
   LAMBDA_LOGIT=${LAMBDA_LOGIT:-2.0}
-  LAMBDA_JOINT_ATTENTION=${LAMBDA_JOINT_ATTENTION:-1.0}
   KL_TOPK=${KL_TOPK:-1024}
   LAMBDA_KV_MSE=${LAMBDA_KV_MSE:-0.0}
   VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
@@ -119,7 +118,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
   echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
   echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
-  echo "lambda_logit=$LAMBDA_LOGIT lambda_joint_attention=$LAMBDA_JOINT_ATTENTION lambda_kv_mse=$LAMBDA_KV_MSE"
+  echo "lambda_logit=$LAMBDA_LOGIT lambda_kv_mse=$LAMBDA_KV_MSE"
   echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
 
   CMD=(
@@ -143,7 +142,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     --min-lr-ratio "$MIN_LR_RATIO"
     --weight-decay "${WEIGHT_DECAY:-0.01}" --temperature "${TEMPERATURE:-2.0}"
     --kl-topk "$KL_TOPK"
-    --lambda-joint-attention "$LAMBDA_JOINT_ATTENTION" --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
+    --lambda-logit "$LAMBDA_LOGIT" --lambda-kv-mse "$LAMBDA_KV_MSE"
     --loss-normalization "$LOSS_NORMALIZATION"
     --supervision-loss "$SUPERVISION_LOSS"
     --output-mode "$OUTPUT_MODE"
@@ -234,7 +233,7 @@ else
   exit 1
 fi
 
-if [[ "${WANDB:-0}" == "1" ]]; then
+if [[ "${WANDB:-1}" == "1" ]]; then
   CMD+=(
     --wandb
     --wandb-project "${WANDB_PROJECT:-vision-kv-inject}"

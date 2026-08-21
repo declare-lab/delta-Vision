@@ -34,14 +34,10 @@ from src.model import (
     load_frozen_llava,
     load_frozen_qwen3vl,
     prepare_qwen3vl_batch_inputs,
-    prepare_qwen_embedding_adapter_inputs,
     qwen3vl_text_ids_and_answer_mask,
     qwen_position_ids,
     qwen_embedding_adapter_logits,
-    qwen_lm_head_logits,
-    qwen_text_attention_output_with_visual_kv,
     resolve_row_image_paths,
-    run_qwen_layer_from_attention_output,
     student_forward_llava_embedding_adapter,
     student_forward_with_visual_kv,
     teacher_forward,
@@ -150,7 +146,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--supervision-loss", choices=("distill", "ce"), default="distill")
     parser.add_argument("--lambda-logit", type=float, default=2.0)
-    parser.add_argument("--lambda-joint-attention", type=float, default=1.0)
     parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
     parser.add_argument("--loss-normalization", choices=("token", "sample"), default="token")
     parser.add_argument("--micro-batch-size-per-gpu", type=int, default=4)
@@ -276,26 +271,6 @@ def set_engine_lr(engine: object, base_lrs: list[float], multiplier: float) -> f
     for group, base_lr in zip(groups, base_lrs, strict=False):
         group["lr"] = float(base_lr) * float(multiplier)
     return float(groups[0].get("lr", 0.0))
-
-
-def masked_nmse(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    *,
-    normalization: str = "token",
-) -> torch.Tensor:
-    valid = mask.to(device=pred.device, dtype=torch.float32).unsqueeze(-1)
-    sq_error = (pred.float() - target.float()).pow(2) * valid
-    target_sq = target.float().pow(2) * valid
-    if normalization == "sample":
-        numerator = sq_error.sum(dim=(1, 2))
-        denominator = target_sq.sum(dim=(1, 2)).clamp_min(1e-6)
-        has_valid = mask.to(device=pred.device, dtype=torch.bool).sum(dim=1) > 0
-        if int(has_valid.sum().item()) == 0:
-            return pred.new_zeros(())
-        return (numerator[has_valid] / denominator[has_valid]).mean().to(dtype=pred.dtype)
-    return (sq_error.sum() / target_sq.sum().clamp_min(1e-6)).to(dtype=pred.dtype)
 
 
 def masked_topk_kl_stats(
@@ -509,58 +484,6 @@ def trainable_parameters_for_mode(adapter: QwenEmbeddingAdapter) -> list[nn.Para
     return [param for param in adapter.parameters() if param.requires_grad]
 
 
-def qwen_embedding_adapter_logits_and_joint_attention_loss(
-    args: argparse.Namespace,
-    model: torch.nn.Module,
-    adapter: QwenEmbeddingAdapter,
-    prepared: dict[str, Tensor],
-    teacher_hidden_states: tuple[Tensor, ...],
-    image_positions: Tensor,
-    image_mask: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    language_model = model.model.language_model
-    h = prepared["h"]
-    all_visual_memories = adapter.all_visual_memories_batched(prepared["visual_memory"])
-    joint_terms: list[Tensor] = []
-    for layer_idx in range(int(adapter.num_layers)):
-        joint_attention = qwen_text_attention_output_with_visual_kv(
-            language_model,
-            layer_idx,
-            h,
-            prepared["text_position_ids"],
-            all_visual_memories[layer_idx],
-            prepared["visual_position_ids"],
-            prefix_attention_mask=prepared["prefix_attention_mask"],
-        )
-        with torch.no_grad():
-            target_visual_h = gather_batched_positions(
-                teacher_hidden_states[layer_idx].detach(),
-                image_positions,
-                image_mask,
-            ).to(dtype=h.dtype)
-            target_joint_attention = qwen_text_attention_output_with_visual_kv(
-                language_model,
-                layer_idx,
-                h.detach(),
-                prepared["text_position_ids"],
-                target_visual_h,
-                prepared["visual_position_ids"],
-                prefix_attention_mask=prepared["prefix_attention_mask"],
-            ).detach()
-        joint_terms.append(
-            masked_nmse(
-                joint_attention,
-                target_joint_attention,
-                prepared["text_mask"],
-                normalization=args.loss_normalization,
-            )
-        )
-        h = run_qwen_layer_from_attention_output(language_model, layer_idx, h, joint_attention, None)
-    logits = qwen_lm_head_logits(model, language_model, h, prepared["text_mask"])
-    joint_attention_loss = torch.stack(joint_terms).mean() if joint_terms else logits.new_zeros(())
-    return logits, prepared["text_mask"], joint_attention_loss
-
-
 def compute_qwen_loss_for_prepared_inputs(
     args: argparse.Namespace,
     model: torch.nn.Module,
@@ -588,7 +511,6 @@ def compute_qwen_loss_for_prepared_inputs(
             "loss": float(ce.detach()),
             "ce": float(ce.detach()),
             "logit_kl": 0.0,
-            "joint_attention": 0.0,
             "kv_mse": 0.0,
             "visual_mass": 0.0,
             "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
@@ -596,14 +518,12 @@ def compute_qwen_loss_for_prepared_inputs(
         }
         return ce, metrics, per_sample_supervision, answer_counts, student_text_mask
 
-    need_joint_attention = loss_mode == "distill" and float(args.lambda_joint_attention) != 0.0
     teacher_logits: Tensor | None = None
     full_position_ids: Tensor | None = None
     initial_hidden: Tensor | None = None
-    teacher_hidden_states: tuple[Tensor, ...] | None = None
     if loss_mode == "distill":
         with torch.no_grad():
-            teacher = model(**inputs, output_hidden_states=need_joint_attention, return_dict=True, use_cache=False)
+            teacher = model(**inputs, return_dict=True, use_cache=False)
             full_position_ids = qwen_position_ids(model, inputs)
             text_positions, _, _, text_mask, _, _ = get_qwen_text_image_positions(
                 inputs["input_ids"],
@@ -612,53 +532,24 @@ def compute_qwen_loss_for_prepared_inputs(
                 full_position_ids,
             )
             teacher_logits = gather_batched_positions(teacher.logits.detach(), text_positions, text_mask)
-            if need_joint_attention:
-                teacher_hidden_states = tuple(state.detach() for state in teacher.hidden_states)
-                initial_hidden = teacher.hidden_states[0].detach()
-            else:
-                initial_hidden, _ = build_qwen_initial_context(model, inputs)
+            initial_hidden, _ = build_qwen_initial_context(model, inputs)
 
     if teacher_logits is None or full_position_ids is None:
         raise RuntimeError("distillation requires teacher logits and position ids")
-    _, image_positions, _, text_mask, image_mask, _ = get_qwen_text_image_positions(
+    _, _, _, text_mask, _, _ = get_qwen_text_image_positions(
         inputs["input_ids"],
         inputs["attention_mask"],
         inputs["mm_token_type_ids"],
         full_position_ids,
     )
-    joint_attention = teacher_logits.new_zeros(())
-    if need_joint_attention:
-        if teacher_hidden_states is None:
-            raise RuntimeError("joint attention loss requires teacher hidden states")
-        if initial_hidden is None:
-            raise RuntimeError("joint attention loss requires initial hidden states")
-        prepared = prepare_qwen_embedding_adapter_inputs(
-            model,
-            adapter,
-            inputs["input_ids"],
-            inputs["attention_mask"],
-            inputs["mm_token_type_ids"],
-            initial_hidden,
-            full_position_ids,
-        )
-        student_logits, student_text_mask, joint_attention = qwen_embedding_adapter_logits_and_joint_attention_loss(
-            args,
-            model,
-            adapter,
-            prepared,
-            teacher_hidden_states,
-            image_positions,
-            image_mask,
-        )
-    else:
-        student_logits, student_text_mask, _ = qwen_embedding_adapter_logits(
-            model,
-            adapter,
-            inputs,
-            initial_hidden=initial_hidden,
-            position_ids=full_position_ids,
-            collect_states=False,
-        )
+    student_logits, student_text_mask, _ = qwen_embedding_adapter_logits(
+        model,
+        adapter,
+        inputs,
+        initial_hidden=initial_hidden,
+        position_ids=full_position_ids,
+        collect_states=False,
+    )
     if student_text_mask.shape != text_mask.shape:
         raise RuntimeError("student/teacher text masks differ")
 
@@ -672,13 +563,12 @@ def compute_qwen_loss_for_prepared_inputs(
         normalization=args.loss_normalization,
     )
     kv_mse = student_logits.new_zeros(())
-    loss = args.lambda_logit * logit_kl + args.lambda_joint_attention * joint_attention + args.lambda_kv_mse * kv_mse
+    loss = args.lambda_logit * logit_kl + args.lambda_kv_mse * kv_mse
 
     metrics = {
         "loss": float(loss.detach()),
         "ce": 0.0,
         "logit_kl": float(logit_kl.detach()),
-        "joint_attention": float(joint_attention.detach()),
         "kv_mse": float(kv_mse.detach()),
         "visual_mass": 0.0,
         "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
@@ -1155,7 +1045,6 @@ def run_qwen(args: argparse.Namespace) -> None:
                 "step": int(global_step),
                 **reduced,
                 "lambda_logit": float(args.lambda_logit),
-                "lambda_joint_attention": float(args.lambda_joint_attention),
                 "lambda_kv_mse": float(args.lambda_kv_mse),
                 "global_batch": int(world_size * args.gradient_accumulation_steps * args.micro_batch_size_per_gpu),
             }
@@ -1167,7 +1056,6 @@ def run_qwen(args: argparse.Namespace) -> None:
                     f"step={global_step} loss={float(payload['loss']):.6f} "
                     f"ce={float(payload.get('ce', 0.0)):.6f} "
                     f"logit_kl={float(payload['logit_kl']):.6f} "
-                    f"joint_attention={float(payload['joint_attention']):.6f} "
                     f"kv_mse={float(payload['kv_mse']):.6f} visual_mass={float(payload['visual_mass']):.6f} "
                     f"lr={float(payload['lr']):.3e} global_batch={payload['global_batch']}",
                     flush=True,

@@ -79,7 +79,6 @@ Properties:
 - Adapter output: trainable adapter visual memory for language-model layers.
 - Base model: frozen.
 - Default loss normalization: token mean.
-- Default joint-attention loss weight: `lambda_joint_attention=1.0`, supervised on every language-model layer.
 - Checkpoints are saved as `qwen_embedding_adapter_stepN.pt` and
   `qwen_embedding_adapter_final.pt`.
 
@@ -95,7 +94,6 @@ Useful Qwen defaults:
 OUTPUT_MODE=embedding_adapter
 LOSS_NORMALIZATION=token
 LAMBDA_LOGIT=2.0
-LAMBDA_JOINT_ATTENTION=1.0
 LAMBDA_KV_MSE=0.0
 KL_TOPK=1024
 MAX_STEPS=500
