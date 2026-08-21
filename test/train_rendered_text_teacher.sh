@@ -43,7 +43,7 @@ CMD=(
   --lambda-logit "${LAMBDA_LOGIT:-1.0}"
   --visual-adapter-rank "${VISUAL_ADAPTER_RANK:-128}"
   --max-context-chars "${MAX_CONTEXT_CHARS:-0}"
-  --deepspeed-config "${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2_coeff.json}"
+  --deepspeed-config "${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}"
 )
 
 if [[ -n "${INIT_CHECKPOINT:-}" ]]; then

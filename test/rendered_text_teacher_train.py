@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--deepspeed-config", default="configs/ds_zero2_coeff.json")
+    parser.add_argument("--deepspeed-config", default="configs/ds_zero2.json")
     parser.add_argument("--local_rank", "--local-rank", type=int, default=-1)
     parser.add_argument("--metrics-jsonl", default="")
     parser.add_argument("--wandb", action="store_true")

@@ -54,7 +54,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
 
   MODEL_PATH=${MODEL_PATH:-models/Qwen3-VL-4B-Instruct}
   DATA=${DATA:-data/train/pixmo/pixmo_ama_full_valid.clean.jsonl}
-  DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2_coeff.json}
+  DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}
   PIXEL_AREA_CACHE=${PIXEL_AREA_CACHE:-$ROOT_DIR/data/train/pixmo/pixmo_ama_full_valid.clean.jsonl.pixel_areas.json}
 
   NPROC_PER_NODE=${NPROC_PER_NODE:-8}
