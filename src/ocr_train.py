@@ -1,4 +1,4 @@
-"""Train Qwen3-VL embedding adapter with text-context teacher and rendered-image student.
+"""Train Qwen3-VL embedding adapter for rendered-text OCR distillation.
 
 This is an experimental entrypoint kept outside the main trainer on purpose.
 It expects paired rendered-text rows with:
@@ -74,9 +74,9 @@ class JsonlRows:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser("Rendered text-context teacher -> rendered-image adapter student experiment.")
+    parser = argparse.ArgumentParser("OCR/rendered-text teacher -> rendered-image adapter student training.")
     parser.add_argument("--model-path", default="/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct")
-    parser.add_argument("--data", default="data/rendered_context_qa_eval_v1/paired.jsonl")
+    parser.add_argument("--data", default="data/train/rendered_text_copy_2048/paired_train.jsonl")
     parser.add_argument("--image-root", default="")
     parser.add_argument("--output-dir", default="artifacts/experiments/test_rendered_text_teacher")
     parser.add_argument("--init-checkpoint", default="")

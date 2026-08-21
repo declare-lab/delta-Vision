@@ -89,17 +89,6 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         default_data="data/benchmarks/textvqa/validation.jsonl",
         answer_instruction="Answer with only one word or a short phrase. Do not explain your answer.",
     ),
-    "vizwiz": BenchmarkSpec(
-        name="vizwiz",
-        display_name="VizWiz",
-        metric="vqa",
-        default_data="data/benchmarks/vizwiz/val.jsonl",
-        answer_instruction=(
-            "Answer the visual question with only one word or a short phrase. "
-            "Do not explain your answer and do not use a full sentence. "
-            "If the question cannot be answered from the image, answer exactly: unanswerable."
-        ),
-    ),
     "realworldqa": BenchmarkSpec(
         name="realworldqa",
         display_name="RealWorldQA",
@@ -208,8 +197,6 @@ def build_benchmark_prompt(row: dict[str, Any], spec: BenchmarkSpec, answer_inst
         question = "\n".join(lines)
 
     instruction = spec.answer_instruction if answer_instruction is None else answer_instruction.strip()
-    if spec.name == "vizwiz" and answer_instruction is None:
-        return f"{instruction}\n\nQuestion: {question}\nShort answer:"
     if instruction:
         question = f"{question}\n{instruction}"
     return question
@@ -398,7 +385,7 @@ def normalize_answer(text: Any) -> str:
 
 
 def normalize_vqa_answer(text: Any) -> str:
-    """EvalAI-style answer normalization used by VQAv2/TextVQA/VizWiz."""
+    """EvalAI-style answer normalization used by VQAv2/TextVQA."""
     out = _stringify(text).lower().replace(",", "").replace("?", "").replace("'s", " 's")
     out = out.replace("\n", " ").replace("\t", " ").strip()
     for punct in _VQA_PUNCTUATIONS:

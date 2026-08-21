@@ -9,9 +9,19 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
+if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
+  unset NCCL_NET
+  unset NCCL_IB_DISABLE
+  unset NCCL_SOCKET_IFNAME
+  unset GLOO_SOCKET_IFNAME
+  unset TORCH_NCCL_ASYNC_ERROR_HANDLING
+fi
+
 MODEL_PATH=${MODEL_PATH:-/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct}
-DATA=${DATA:-$ROOT_DIR/data/train/rendered_text/paired_train.jsonl}
-OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/test_rendered_text_teacher}
+OCR_CONTEXT_TOKENS=${OCR_CONTEXT_TOKENS:-2048}
+DATA=${DATA:-$ROOT_DIR/data/train/rendered_text_copy_${OCR_CONTEXT_TOKENS}/paired_train.jsonl}
+RUN_NAME=${RUN_NAME:-ocr_train_copy_${OCR_CONTEXT_TOKENS}_kl_ds8_mb4_src_sched3125_$(date +%Y%m%d_%H%M%S)}
+OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/$RUN_NAME}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 MASTER_PORT=${MASTER_PORT:-29551}
 REQUIRED_WORLD_SIZE=${REQUIRED_WORLD_SIZE:-$NPROC_PER_NODE}
@@ -20,7 +30,7 @@ CMD=(
   "$PY" -m torch.distributed.run
   --nproc_per_node "$NPROC_PER_NODE"
   --master_port "$MASTER_PORT"
-  test/rendered_text_teacher_train.py
+  -m src.ocr_train
   --model-path "$MODEL_PATH"
   --data "$DATA"
   --output-dir "$OUTPUT_DIR"

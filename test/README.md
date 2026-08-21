@@ -53,5 +53,6 @@ BATCH_SIZE=1
 MAX_STEPS=100
 MAX_CONTEXT_CHARS=0
 LAMBDA_LOGIT=2.0
+LAMBDA_CE=0.0          # optional answer-token CE mixed into the KL loss
 REQUIRE_ANSWER_VISIBLE=1
 ```
