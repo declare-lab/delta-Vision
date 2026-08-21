@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+DATA_ROOT_EXPLICIT=${DATA_ROOT+x}
 DATA_ROOT=${DATA_ROOT:-$ROOT_DIR}
 MODEL_ROOT=${MODEL_ROOT:-/lustre-data/leijingdi/code/delta-vision}
 PY=${PY:-$ROOT_DIR/.venv/bin/python}
@@ -366,6 +367,9 @@ if [[ "$DATA" != /* ]]; then
   else
     DATA="$DATA_ROOT/$DATA"
   fi
+fi
+if [[ -z "$DATA_ROOT_EXPLICIT" && "$DATA" == "$ROOT_DIR"/data/benchmarks/* ]]; then
+  DATA_ROOT="$(dirname "$DATA")"
 fi
 
 if [[ -z "${CKPT:-}" && -n "${CHECKPOINT:-}" ]]; then

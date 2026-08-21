@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 import string
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,21 +80,25 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         display_name="VQA-v2",
         metric="vqa",
         default_data="data/benchmarks/vqav2/validation.jsonl",
-        answer_instruction="Answer directly with a short phrase.",
+        answer_instruction="Answer with only one word or a short phrase. Do not explain your answer.",
     ),
     "textvqa": BenchmarkSpec(
         name="textvqa",
         display_name="TextVQA",
         metric="vqa",
         default_data="data/benchmarks/textvqa/validation.jsonl",
-        answer_instruction="Answer directly with a short phrase.",
+        answer_instruction="Answer with only one word or a short phrase. Do not explain your answer.",
     ),
     "vizwiz": BenchmarkSpec(
         name="vizwiz",
         display_name="VizWiz",
         metric="vqa",
         default_data="data/benchmarks/vizwiz/val.jsonl",
-        answer_instruction="Answer directly with a short phrase.",
+        answer_instruction=(
+            "Answer the visual question with only one word or a short phrase. "
+            "Do not explain your answer and do not use a full sentence. "
+            "If the question cannot be answered from the image, answer exactly: unanswerable."
+        ),
     ),
     "realworldqa": BenchmarkSpec(
         name="realworldqa",
@@ -204,6 +208,8 @@ def build_benchmark_prompt(row: dict[str, Any], spec: BenchmarkSpec, answer_inst
         question = "\n".join(lines)
 
     instruction = spec.answer_instruction if answer_instruction is None else answer_instruction.strip()
+    if spec.name == "vizwiz" and answer_instruction is None:
+        return f"{instruction}\n\nQuestion: {question}\nShort answer:"
     if instruction:
         question = f"{question}\n{instruction}"
     return question
@@ -220,6 +226,167 @@ def _question_has_lettered_choices(question: str, num_choices: int) -> bool:
 
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
 _ARTICLES = {"a", "an", "the"}
+_VQA_NUMBER_MAP = {
+    "none": "0",
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+}
+_VQA_CONTRACTIONS = {
+    "aint": "ain't",
+    "arent": "aren't",
+    "cant": "can't",
+    "couldve": "could've",
+    "couldnt": "couldn't",
+    "couldn'tve": "couldn't've",
+    "couldnt've": "couldn't've",
+    "didnt": "didn't",
+    "doesnt": "doesn't",
+    "dont": "don't",
+    "hadnt": "hadn't",
+    "hadnt've": "hadn't've",
+    "hadn'tve": "hadn't've",
+    "hasnt": "hasn't",
+    "havent": "haven't",
+    "hed": "he'd",
+    "hed've": "he'd've",
+    "he'dve": "he'd've",
+    "hes": "he's",
+    "howd": "how'd",
+    "howll": "how'll",
+    "hows": "how's",
+    "Id've": "I'd've",
+    "I'dve": "I'd've",
+    "Im": "I'm",
+    "Ive": "I've",
+    "isnt": "isn't",
+    "itd": "it'd",
+    "itd've": "it'd've",
+    "it'dve": "it'd've",
+    "itll": "it'll",
+    "let's": "let's",
+    "maam": "ma'am",
+    "mightnt": "mightn't",
+    "mightnt've": "mightn't've",
+    "mightn'tve": "mightn't've",
+    "mightve": "might've",
+    "mustnt": "mustn't",
+    "mustve": "must've",
+    "neednt": "needn't",
+    "notve": "not've",
+    "oclock": "o'clock",
+    "oughtnt": "oughtn't",
+    "ow's'at": "'ow's'at",
+    "'ows'at": "'ow's'at",
+    "'ow'sat": "'ow's'at",
+    "shant": "shan't",
+    "shed've": "she'd've",
+    "she'dve": "she'd've",
+    "she's": "she's",
+    "shouldve": "should've",
+    "shouldnt": "shouldn't",
+    "shouldnt've": "shouldn't've",
+    "shouldn'tve": "shouldn't've",
+    "somebody'd": "somebodyd",
+    "somebodyd've": "somebody'd've",
+    "somebody'dve": "somebody'd've",
+    "somebodyll": "somebody'll",
+    "somebodys": "somebody's",
+    "someoned": "someone'd",
+    "someoned've": "someone'd've",
+    "someone'dve": "someone'd've",
+    "someonell": "someone'll",
+    "someones": "someone's",
+    "somethingd": "something'd",
+    "somethingd've": "something'd've",
+    "something'dve": "something'd've",
+    "somethingll": "something'll",
+    "thats": "that's",
+    "thered": "there'd",
+    "thered've": "there'd've",
+    "there'dve": "there'd've",
+    "therere": "there're",
+    "theres": "there's",
+    "theyd": "they'd",
+    "theyd've": "they'd've",
+    "they'dve": "they'd've",
+    "theyll": "they'll",
+    "theyre": "they're",
+    "theyve": "they've",
+    "twas": "'twas",
+    "wasnt": "wasn't",
+    "wed've": "we'd've",
+    "we'dve": "we'd've",
+    "weve": "we've",
+    "werent": "weren't",
+    "whatll": "what'll",
+    "whatre": "what're",
+    "whats": "what's",
+    "whatve": "what've",
+    "whens": "when's",
+    "whered": "where'd",
+    "wheres": "where's",
+    "whereve": "where've",
+    "whod": "who'd",
+    "whod've": "who'd've",
+    "who'dve": "who'd've",
+    "wholl": "who'll",
+    "whos": "who's",
+    "whove": "who've",
+    "whyll": "why'll",
+    "whyre": "why're",
+    "whys": "why's",
+    "wont": "won't",
+    "wouldve": "would've",
+    "wouldnt": "wouldn't",
+    "wouldnt've": "wouldn't've",
+    "wouldn'tve": "wouldn't've",
+    "yall": "y'all",
+    "yall'll": "y'all'll",
+    "y'allll": "y'all'll",
+    "yall'd've": "y'all'd've",
+    "y'alld've": "y'all'd've",
+    "y'all'dve": "y'all'd've",
+    "youd": "you'd",
+    "youd've": "you'd've",
+    "you'dve": "you'd've",
+    "youll": "you'll",
+    "youre": "you're",
+    "youve": "you've",
+}
+_VQA_PERIOD_STRIP = re.compile(r"(?!<=\d)(\.)(?!\d)")
+_VQA_COMMA_STRIP = re.compile(r"(?<=\d)(\,)+(?=\d)")
+_VQA_PUNCTUATIONS = [
+    ";",
+    r"/",
+    "[",
+    "]",
+    '"',
+    "{",
+    "}",
+    "(",
+    ")",
+    "=",
+    "+",
+    "\\",
+    "_",
+    "-",
+    ">",
+    "<",
+    "@",
+    "`",
+    ",",
+    "?",
+    "!",
+]
 
 
 def normalize_answer(text: Any) -> str:
@@ -228,6 +395,37 @@ def normalize_answer(text: Any) -> str:
     text = text.translate(_PUNCT_TABLE)
     words = [word for word in text.split() if word not in _ARTICLES]
     return " ".join(words)
+
+
+def normalize_vqa_answer(text: Any) -> str:
+    """EvalAI-style answer normalization used by VQAv2/TextVQA/VizWiz."""
+    out = _stringify(text).lower().replace(",", "").replace("?", "").replace("'s", " 's")
+    out = out.replace("\n", " ").replace("\t", " ").strip()
+    for punct in _VQA_PUNCTUATIONS:
+        if (punct + " " in out or " " + punct in out) or re.search(_VQA_COMMA_STRIP, out):
+            out = out.replace(punct, "")
+        else:
+            out = out.replace(punct, " ")
+    out = _VQA_PERIOD_STRIP.sub("", out)
+    words = []
+    for word in out.lower().split():
+        word = _VQA_NUMBER_MAP.get(word, word)
+        if word not in _ARTICLES:
+            words.append(_VQA_CONTRACTIONS.get(word, word))
+    return " ".join(words)
+
+
+def vqa_consensus_score(prediction: Any, answers: list[Any]) -> float:
+    pred_norm = normalize_vqa_answer(prediction)
+    gold_norms = [normalize_vqa_answer(value) for value in answers if _stringify(value)]
+    if not gold_norms:
+        return 0.0
+    scores = []
+    for idx, _ in enumerate(gold_norms):
+        other_answers = gold_norms[:idx] + gold_norms[idx + 1 :]
+        matches = sum(1 for value in other_answers if value == pred_norm)
+        scores.append(min(1.0, float(matches) / 3.0))
+    return sum(scores) / max(len(scores), 1)
 
 
 def extract_yes_no(text: str) -> str | None:
@@ -344,10 +542,10 @@ def score_prediction(
     pred_norm = normalize_answer(prediction_text)
     if metric == "vqa":
         gold_values = _answer_list(None, answers) if answers is not None else _answer_list(answer)
-        counts = Counter(normalize_answer(value) for value in gold_values)
-        score = min(1.0, counts.get(pred_norm, 0) / 3.0) if counts else 0.0
-        gold = normalize_answer(answer if answer is not None else (gold_values[0] if gold_values else ""))
-        return {"prediction": pred_norm, "gold": gold, "score": score, "invalid": not bool(pred_norm)}
+        pred_vqa = normalize_vqa_answer(prediction_text)
+        score = vqa_consensus_score(prediction_text, gold_values)
+        gold = normalize_vqa_answer(answer if answer is not None else (gold_values[0] if gold_values else ""))
+        return {"prediction": pred_vqa, "gold": gold, "score": score, "invalid": not bool(pred_vqa)}
 
     gold_values = _answer_list(answer, answers)
     gold_norms = [normalize_answer(value) for value in gold_values]
