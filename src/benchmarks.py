@@ -103,9 +103,9 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
     "realworldqa": BenchmarkSpec(
         name="realworldqa",
         display_name="RealWorldQA",
-        metric="multi_choice",
+        metric="realworldqa",
         default_data="data/benchmarks/realworldqa/test.jsonl",
-        answer_instruction="Answer directly with only the letter of the correct option.",
+        answer_instruction="Answer directly with the final answer only.",
         max_new_tokens=8,
     ),
     "rendered-context-qa": BenchmarkSpec(
@@ -491,6 +491,79 @@ def extract_choice(text: str, choices: list[Any] | None = None) -> str | None:
     return None
 
 
+def _realworldqa_choices_from_question(question: Any) -> list[str]:
+    found: dict[str, str] = {}
+    for letter, text in re.findall(r"(?m)^\s*([A-D])[\.\):：、]\s*(.+?)\s*$", _stringify(question)):
+        found[letter.upper()] = text.strip()
+    return [found[letter] for letter in "ABCD" if letter in found]
+
+
+def score_realworldqa_prediction(
+    prediction_text: str,
+    answer: Any,
+    choices: list[Any] | None = None,
+    question: Any = None,
+) -> dict[str, Any]:
+    choices = _choice_list(choices) or _realworldqa_choices_from_question(question)
+    pred_text = _stringify(prediction_text)
+    gold_text = _stringify(answer)
+
+    if choices:
+        pred_letter = extract_choice(pred_text, choices)
+        gold_letter = canonical_choice(gold_text, choices)
+        if pred_letter and gold_letter:
+            return {
+                "prediction": pred_letter,
+                "gold": gold_letter,
+                "score": float(pred_letter == gold_letter),
+                "invalid": False,
+            }
+        if pred_letter:
+            idx = ord(pred_letter) - ord("A")
+            if 0 <= idx < len(choices):
+                pred_norm = normalize_answer(choices[idx])
+                gold_norm = normalize_answer(gold_text)
+                return {
+                    "prediction": pred_letter,
+                    "gold": gold_norm,
+                    "score": float(bool(gold_norm) and pred_norm == gold_norm),
+                    "invalid": False,
+                }
+        pred_norm = normalize_answer(pred_text)
+        gold_norm = normalize_answer(gold_text)
+        return {
+            "prediction": pred_norm,
+            "gold": gold_norm,
+            "score": float(bool(pred_norm) and bool(gold_norm) and (pred_norm == gold_norm or gold_norm in pred_norm)),
+            "invalid": not bool(pred_norm),
+        }
+
+    gold_head = gold_text.strip().upper()[:1]
+    if gold_head in {"A", "B", "C", "D", "Y", "N"} and len(gold_text.strip()) <= 3:
+        pred_head = pred_text.strip().upper()[:1]
+        if gold_head in {"Y", "N"}:
+            pred_yes_no = extract_yes_no(pred_text)
+            if pred_yes_no == "yes":
+                pred_head = "Y"
+            elif pred_yes_no == "no":
+                pred_head = "N"
+        return {
+            "prediction": pred_head or None,
+            "gold": gold_head,
+            "score": float(bool(pred_head) and pred_head == gold_head),
+            "invalid": not bool(pred_head),
+        }
+
+    pred_norm = normalize_answer(pred_text)
+    gold_norm = normalize_answer(gold_text)
+    return {
+        "prediction": pred_norm,
+        "gold": gold_norm,
+        "score": float(bool(pred_norm) and bool(gold_norm) and (pred_norm == gold_norm or gold_norm in pred_norm)),
+        "invalid": not bool(pred_norm),
+    }
+
+
 def _answer_list(answer: Any, answers: Any = None) -> list[Any]:
     values: list[Any] = []
     if answers is not None:
@@ -517,8 +590,17 @@ def score_prediction(
     answer: Any,
     answers: Any = None,
     choices: list[Any] | None = None,
+    question: Any = None,
 ) -> dict[str, Any]:
     choices = _choice_list(choices)
+    if metric == "realworldqa":
+        return score_realworldqa_prediction(
+            prediction_text=prediction_text,
+            answer=answer,
+            choices=choices,
+            question=question,
+        )
+
     if metric == "multi_choice":
         pred = extract_choice(prediction_text, choices)
         gold = canonical_choice(answer, choices)

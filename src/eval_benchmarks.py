@@ -509,6 +509,7 @@ def evaluate_llava_shard(
             answer=item.get("answer"),
             answers=item.get("answers"),
             choices=choices,
+            question=item.get("question") or item.get("row", {}).get("question"),
         )
         adapter_eval = score_prediction(
             metric=spec.metric,
@@ -516,6 +517,7 @@ def evaluate_llava_shard(
             answer=item.get("answer"),
             answers=item.get("answers"),
             choices=choices,
+            question=item.get("question") or item.get("row", {}).get("question"),
         )
         predictions.append(
             {
@@ -1617,6 +1619,7 @@ def evaluate_qwen_benchmark_shard(
             answer=item.get("answer"),
             answers=item.get("answers"),
             choices=item.get("choices"),
+            question=item.get("question") or item.get("row", {}).get("question"),
         )
         adapter_eval = score_prediction(
             metric=spec.metric,
@@ -1624,6 +1627,7 @@ def evaluate_qwen_benchmark_shard(
             answer=item.get("answer"),
             answers=item.get("answers"),
             choices=item.get("choices"),
+            question=item.get("question") or item.get("row", {}).get("question"),
         )
         teacher_kv = estimate_qwen_kv_cache_mb(
             language_config,
@@ -1952,6 +1956,7 @@ def evaluate_qwen_benchmark_shard_batched(
                 answer=item.get("answer"),
                 answers=item.get("answers"),
                 choices=item.get("choices"),
+                question=item.get("question") or item.get("row", {}).get("question"),
             )
             adapter_eval = score_prediction(
                 metric=spec.metric,
@@ -1959,6 +1964,7 @@ def evaluate_qwen_benchmark_shard_batched(
                 answer=item.get("answer"),
                 answers=item.get("answers"),
                 choices=item.get("choices"),
+                question=item.get("question") or item.get("row", {}).get("question"),
             )
             teacher_kv = estimate_qwen_kv_cache_mb(
                 language_config,
