@@ -191,7 +191,7 @@ scripts/eval_benchmark.sh
 Supported benchmark names:
 
 ```text
-mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, textvqa, vizwiz, ocrbench
+mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, textvqa, vizwiz, realworldqa
 ```
 
 Single Qwen benchmark:
