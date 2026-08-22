@@ -191,8 +191,36 @@ scripts/eval_benchmark.sh
 Supported benchmark names:
 
 ```text
-mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, textvqa, vizwiz, realworldqa
+mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, textvqa, realworldqa, perceptionbench
 ```
+
+PerceptionBench expects a converted JSONL file at
+`data/benchmarks/perceptionbench/test.jsonl`.
+Each item should follow the shared VQA schema with `image` or `images`, `question`,
+and `answer`, `answers`, or `choices`.
+
+PerceptionBench uses an OpenAI-compatible LLM judge. Run it with the same
+benchmark entrypoint:
+
+```bash
+LLM_JUDGE_BASE_URL=http://127.0.0.1:8001/v1 \
+LLM_JUDGE_MODEL=qwen3.5-4b-judge \
+MODEL_KIND=qwen \
+scripts/eval_benchmark.sh perceptionbench --teacher-only --model-path /path/to/qwen3-vl-model
+```
+
+PerceptionBench local evaluation note:
+
+- Official judge configuration uses `MAX_TOKENS=65536` with `gpt-oss-120b`.
+- Local runs use `/lustre-data/leijingdi/models/Qwen3.5-4B` as the judge.
+- For `Qwen3-VL-4B-Instruct`, full PerceptionBench with `MAX_NEW_TOKENS=128`
+  took about 30-31 minutes wall time on 8 GPUs: about 23 minutes for answer
+  generation plus about 7.5 minutes for batched judging.
+- The local `Qwen3.5-4B` judge score from that run was `0.156` on 3000 samples
+  (`468/3000`, invalid rate `0.0`). This is not directly comparable to the
+  official `gpt-oss-120b` judge score.
+- PerceptionBench uses the same benchmark entrypoint as the other benchmarks:
+  `scripts/eval_benchmark.sh perceptionbench`.
 
 Single Qwen benchmark:
 
@@ -317,17 +345,6 @@ scripts/train.sh          Unified training wrapper.
 scripts/eval_benchmark.sh Unified benchmark evaluation wrapper.
 ```
 
-Diagnostic experiments:
-
-```text
-test/diagnostics/         Diagnostic experiment scripts.
-test/configs/             Diagnostic experiment configs.
-test/results/             Diagnostic outputs, ignored by git.
-```
-
-Keep exploratory diagnostics under `test/`. Do not mix temporary experiment code or results into
-`src/`, `scripts/`, or `artifacts/`.
-
 ## Current Compatibility Policy
 
 - New code should use `kv_adapter` for the LLaVA KV adapter.
@@ -335,3 +352,73 @@ Keep exploratory diagnostics under `test/`. Do not mix temporary experiment code
 - Legacy checkpoint names with `qwen_visual_delta_*` are still resolved by the eval wrapper for
   compatibility, but new checkpoints should use `qwen_embedding_adapter_*`.
 - `eval-mode=logits` has been removed.
+
+## OCR Training And Evaluation
+
+OCR adapter training uses the Qwen3-VL path and DeepSpeed ZeRO-2 by default:
+
+```bash
+scripts/ocr_train.sh
+```
+
+Default training inputs and hyperparameters:
+
+```text
+MODEL_PATH=/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct
+OCR_DATASET=ocr_overlap_allcopy_only_1024
+DATA=data/train/$OCR_DATASET/paired_train.jsonl
+NPROC_PER_NODE=8
+MICRO_BATCH_SIZE_PER_GPU=1
+GRADIENT_ACCUMULATION_STEPS=4
+MAX_STEPS=1824
+SAVE_EVERY=500
+LR=5e-5
+LR_SCHEDULER=cosine
+WARMUP_RATIO=0.05
+DS_CONFIG=configs/ds_zero2.json
+WANDB_MODE=online
+```
+
+To resume or initialize from an adapter checkpoint:
+
+```bash
+INIT_CHECKPOINT=/path/to/qwen_embedding_adapter_stepXXXX.pt scripts/ocr_train.sh
+```
+
+OCR copy-style evaluation uses `scripts/ocr_eval.sh`:
+
+```bash
+CHECKPOINT=/path/to/qwen_embedding_adapter_stepXXXX.pt scripts/ocr_eval.sh
+```
+
+Default OCR eval inputs:
+
+```text
+OCR_DATASET=ocr_overlap_allcopy_only_1024
+DATA=data/train/$OCR_DATASET/paired_eval.jsonl
+IMAGE_ROOT=data/train/rendered_text
+MAX_SAMPLES=1000
+MAX_NEW_TOKENS=1024
+```
+
+Without `CHECKPOINT`, `ocr_eval.sh` runs teacher-only paths by passing
+`--no-eval-adapter`.
+
+Rendered-context QA evaluation uses the normal benchmark wrapper through
+`scripts/ocr_qa_eval.sh`:
+
+```bash
+RUN_DIR=/path/to/run/checkpoints scripts/ocr_qa_eval.sh
+```
+
+Defaults:
+
+```text
+BENCHMARK=rendered-context-qa
+DATA=data/benchmarks/rendered_qa_300_msmarco/msmarco_200_400_span_100.jsonl
+STEP=500
+MAX_SAMPLES=100
+MAX_NEW_TOKENS=512
+NUM_SHARDS=8
+COMPILE_ADAPTER=0
+```

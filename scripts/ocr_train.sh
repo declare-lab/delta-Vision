@@ -18,9 +18,9 @@ if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
 fi
 
 MODEL_PATH=${MODEL_PATH:-/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct}
-OCR_CONTEXT_TOKENS=${OCR_CONTEXT_TOKENS:-2048}
-DATA=${DATA:-$ROOT_DIR/data/train/rendered_text_copy_${OCR_CONTEXT_TOKENS}/paired_train.jsonl}
-RUN_NAME=${RUN_NAME:-ocr_train_copy_${OCR_CONTEXT_TOKENS}_kl_ds8_mb4_src_sched3125_$(date +%Y%m%d_%H%M%S)}
+OCR_DATASET=${OCR_DATASET:-ocr_overlap_allcopy_only_1024}
+DATA=${DATA:-$ROOT_DIR/data/train/$OCR_DATASET/paired_train.jsonl}
+RUN_NAME=${RUN_NAME:-ocr_train_${OCR_DATASET}_kl_ds8_mb1_ga4_epoch1_$(date +%Y%m%d_%H%M%S)}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/experiments/$RUN_NAME}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 MASTER_PORT=${MASTER_PORT:-29551}
@@ -36,19 +36,17 @@ CMD=(
   --output-dir "$OUTPUT_DIR"
   --dtype "${DTYPE:-bfloat16}"
   --attn-implementation "${ATTN_IMPL:-flash_attention_2}"
-  --micro-batch-size-per-gpu "${MICRO_BATCH_SIZE_PER_GPU:-4}"
-  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-1}"
+  --micro-batch-size-per-gpu "${MICRO_BATCH_SIZE_PER_GPU:-1}"
+  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}"
   --required-world-size "$REQUIRED_WORLD_SIZE"
-  --max-steps "${MAX_STEPS:-3125}"
+  --max-steps "${MAX_STEPS:-1824}"
   --save-every "${SAVE_EVERY:-500}"
   --log-every "${LOG_EVERY:-5}"
   --lr "${LR:-5e-5}"
   --lr-scheduler "${LR_SCHEDULER:-cosine}"
-  --warmup-ratio "${WARMUP_RATIO:-0.03}"
+  --warmup-ratio "${WARMUP_RATIO:-0.05}"
   --min-lr-ratio "${MIN_LR_RATIO:-0.1}"
   --kl-topk "${KL_TOPK:-1024}"
-  --reverse-kl-weight "${REVERSE_KL_WEIGHT:-0.0}"
-  --first-token-weight "${FIRST_TOKEN_WEIGHT:-1.0}"
   --temperature "${TEMPERATURE:-2.0}"
   --lambda-logit "${LAMBDA_LOGIT:-1.0}"
   --lambda-ce "${LAMBDA_CE:-0.0}"

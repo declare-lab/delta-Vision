@@ -97,6 +97,14 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         answer_instruction="Answer directly with the final answer only.",
         max_new_tokens=8,
     ),
+    "perceptionbench": BenchmarkSpec(
+        name="perceptionbench",
+        display_name="PerceptionBench",
+        metric="llm_judge",
+        default_data="data/benchmarks/perceptionbench/test.jsonl",
+        answer_instruction="Answer directly with only the final answer. Do not explain your answer.",
+        max_new_tokens=128,
+    ),
     "rendered-context-qa": BenchmarkSpec(
         name="rendered-context-qa",
         display_name="RenderedContextQA",
@@ -127,6 +135,9 @@ def canonical_benchmark_name(name: str) -> str:
         "real-world-qa": "realworldqa",
         "real-worldqa": "realworldqa",
         "rwqa": "realworldqa",
+        "perception": "perceptionbench",
+        "perception-bench": "perceptionbench",
+        "perception-benchmark": "perceptionbench",
         "rendered_context_qa": "rendered-context-qa",
         "rendered-qa": "rendered-context-qa",
         "context-qa": "rendered-context-qa",
@@ -459,16 +470,20 @@ def extract_choice(text: str, choices: list[Any] | None = None) -> str | None:
     num_choices = len(choices or []) or 6
     letters = _choice_letters(num_choices)
     clean = text.strip()
-    upper = clean.upper()
+    candidates = [clean]
+    if "</think>" in clean:
+        candidates.insert(0, clean.rsplit("</think>", 1)[-1].strip())
     patterns = [
         r"(?:ANSWER|OPTION|CHOICE|答案|选项)\s*(?:IS|是|:|：)?\s*[\(\[]?\s*([A-Z])(?:\b|[\)\]\.。,:：])",
         r"^[\s\(\[]*([A-Z])(?:[\)\]\.。,:：\s]|$)",
         r"(?<![A-Z])([A-Z])(?![A-Z])",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, upper)
-        if match and match.group(1) in letters:
-            return match.group(1)
+    for candidate in candidates:
+        upper = candidate.upper()
+        for pattern in patterns:
+            match = re.search(pattern, upper)
+            if match and match.group(1) in letters:
+                return match.group(1)
     if choices:
         norm = normalize_answer(clean)
         for idx, choice in enumerate(choices):
@@ -615,6 +630,11 @@ def score_prediction(
         score = vqa_consensus_score(prediction_text, gold_values)
         gold = normalize_vqa_answer(answer if answer is not None else (gold_values[0] if gold_values else ""))
         return {"prediction": pred_vqa, "gold": gold, "score": score, "invalid": not bool(pred_vqa)}
+
+    if metric == "llm_judge":
+        pred = _stringify(prediction_text)
+        gold = _stringify(answer if answer is not None else (answers[0] if isinstance(answers, list) and answers else ""))
+        return {"prediction": pred, "gold": gold, "score": 0.0, "invalid": not bool(pred), "needs_judge": True}
 
     gold_values = _answer_list(answer, answers)
     gold_norms = [normalize_answer(value) for value in gold_values]

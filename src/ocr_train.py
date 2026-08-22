@@ -98,10 +98,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--kl-topk", type=int, default=1024)
-    parser.add_argument("--reverse-kl-weight", type=float, default=0.0)
-    parser.add_argument("--first-token-weight", type=float, default=1.0)
     parser.add_argument("--lambda-logit", type=float, default=1.0)
-    parser.add_argument("--lambda-ce", type=float, default=0.0, help="Optional student CE on answer tokens; 0 keeps KL-only behavior.")
+    parser.add_argument("--lambda-ce", type=float, default=0.0, help="Optional student CE on all answer tokens; 0 keeps KL-only behavior.")
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--output-mode", default="embedding_adapter")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
@@ -139,11 +137,17 @@ def reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str,
 
 RENDERED_PAGE_INSTRUCTION = "Read the ordered page images and answer using only their text."
 ANSWER_INSTRUCTION = "Answer directly with a short phrase."
+QA_IMAGE_INSTRUCTION = "Use the image text to answer the question."
+QA_FINAL_ANSWER_INSTRUCTION = "Return only the final answer, with no explanation."
 COPY_TRANSCRIPTION_INSTRUCTION = "Transcribe all visible text in the image exactly. Preserve line breaks."
 
 
 def is_copy_transcription(row: dict[str, Any]) -> bool:
-    return str(row.get("task_type") or "").strip() == "copy_transcription"
+    return str(row.get("task_type") or "").strip() in {"copy", "copy_transcription"}
+
+
+def is_qa(row: dict[str, Any]) -> bool:
+    return str(row.get("task_type") or "").strip() == "qa" or not is_copy_transcription(row)
 
 
 def cleaned_rendered_question(row: dict[str, Any]) -> str:
@@ -171,7 +175,7 @@ def text_teacher_prompt(processor: Any, row: dict[str, Any], max_context_chars: 
         instruction = question or COPY_TRANSCRIPTION_INSTRUCTION
         text = f"Text:\n{context}\n\n{instruction}"
     else:
-        text = f"Context:\n{context}\n\nQuestion:\n{question}\n\n{ANSWER_INSTRUCTION}"
+        text = f"Context:\n{context}\n\nQuestion:\n{question}\n\n{QA_FINAL_ANSWER_INSTRUCTION}"
     messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
     return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
@@ -218,7 +222,7 @@ def student_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if is_copy_transcription(copy):
             copy["question"] = question or COPY_TRANSCRIPTION_INSTRUCTION
         else:
-            copy["question"] = f"{RENDERED_PAGE_INSTRUCTION}\n{question}\n{ANSWER_INSTRUCTION}"
+            copy["question"] = f"{QA_IMAGE_INSTRUCTION}\n{QA_FINAL_ANSWER_INSTRUCTION}\n\nQuestion: {question}"
         result.append(copy)
     return result
 
@@ -232,11 +236,8 @@ def masked_unaligned_topk_kl(
     *,
     temperature: float,
     topk: int,
-    reverse_kl_weight: float = 0.0,
-    first_token_weight: float = 1.0,
 ) -> tuple[Tensor, Tensor]:
     losses: list[Tensor] = []
-    weights: list[Tensor] = []
     counts: list[int] = []
     for batch_idx in range(student_logits.shape[0]):
         s_mask = student_answer_mask[batch_idx, 1:].bool()
@@ -267,24 +268,35 @@ def masked_unaligned_topk_kl(
             reduction="none",
         ).sum(dim=-1)
         token_loss = kl * (float(temperature) * float(temperature))
-        if float(reverse_kl_weight) > 0.0:
-            reverse_kl = F.kl_div(
-                F.log_softmax(t_gathered, dim=-1),
-                F.softmax(s_gathered, dim=-1),
-                reduction="none",
-            ).sum(dim=-1)
-            token_loss = token_loss + float(reverse_kl_weight) * reverse_kl * (float(temperature) * float(temperature))
-        token_weight = torch.ones_like(token_loss, dtype=torch.float32)
-        if token_weight.numel() > 0 and float(first_token_weight) != 1.0:
-            token_weight[0] = float(first_token_weight)
         losses.append(token_loss)
-        weights.append(token_weight)
     answer_counts = torch.tensor(counts, device=student_logits.device, dtype=torch.float32)
     if not losses:
         return student_logits.new_zeros(()), answer_counts
     flat_losses = torch.cat(losses)
-    flat_weights = torch.cat(weights).to(device=flat_losses.device, dtype=torch.float32)
-    return (flat_losses.float() * flat_weights).sum().div(flat_weights.sum().clamp_min(1.0)).to(dtype=student_logits.dtype), answer_counts
+    return flat_losses.float().mean().to(dtype=student_logits.dtype), answer_counts
+
+
+def masked_unaligned_student_answer_ce(
+    student_logits: Tensor,
+    student_ids: Tensor,
+    student_answer_mask: Tensor,
+    teacher_answer_mask: Tensor,
+) -> Tensor:
+    losses: list[Tensor] = []
+    for batch_idx in range(student_logits.shape[0]):
+        s_mask = student_answer_mask[batch_idx, 1:].bool()
+        t_mask = teacher_answer_mask[batch_idx, 1:].bool()
+        s = student_logits[batch_idx, :-1][s_mask]
+        targets = student_ids[batch_idx, 1:][s_mask]
+        count = min(int(s.shape[0]), int(t_mask.sum().item()), int(targets.shape[0]))
+        if count <= 0:
+            continue
+        s = s[-count:].float()
+        targets = targets[-count:].long()
+        losses.append(F.cross_entropy(s, targets, reduction="none"))
+    if not losses:
+        return student_logits.new_zeros((), dtype=torch.float32)
+    return torch.cat(losses).mean()
 
 
 def masked_unaligned_answer_diagnostics(
@@ -294,7 +306,6 @@ def masked_unaligned_answer_diagnostics(
     student_answer_mask: Tensor,
     teacher_answer_mask: Tensor,
 ) -> dict[str, Tensor]:
-    student_ce_losses: list[Tensor] = []
     teacher_ce_losses: list[Tensor] = []
     student_correct: list[Tensor] = []
     teacher_correct: list[Tensor] = []
@@ -313,23 +324,20 @@ def masked_unaligned_answer_diagnostics(
         targets = targets[-count:].long()
         s_top1 = s.argmax(dim=-1)
         t_top1 = t.argmax(dim=-1)
-        student_ce_losses.append(F.cross_entropy(s, targets, reduction="none"))
         teacher_ce_losses.append(F.cross_entropy(t, targets, reduction="none"))
         student_correct.append(s_top1.eq(targets).float())
         teacher_correct.append(t_top1.eq(targets).float())
         top1_agree.append(s_top1.eq(t_top1).float())
 
-    if not student_ce_losses:
+    if not teacher_ce_losses:
         zero = student_logits.new_zeros((), dtype=torch.float32)
         return {
-            "student_ce": zero,
             "teacher_ce": zero,
             "student_target_acc": zero,
             "teacher_target_acc": zero,
             "top1_agreement": zero,
         }
     return {
-        "student_ce": torch.cat(student_ce_losses).mean(),
         "teacher_ce": torch.cat(teacher_ce_losses).mean(),
         "student_target_acc": torch.cat(student_correct).mean(),
         "teacher_target_acc": torch.cat(teacher_correct).mean(),
@@ -411,7 +419,7 @@ def main() -> None:
     if is_rank0():
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         print(
-            f"rendered text-teacher KL-only train rows={len(data)} world_size={world_size} "
+            f"rendered text-teacher train rows={len(data)} world_size={world_size} "
             f"micro_batch={args.micro_batch_size_per_gpu} grad_accum={args.gradient_accumulation_steps} "
             f"global_batch={world_size * args.micro_batch_size_per_gpu * args.gradient_accumulation_steps} "
             f"steps={args.max_steps} trainable={sum(p.numel() for p in trainable)/1e6:.2f}M",
@@ -484,8 +492,6 @@ def main() -> None:
                 teacher_answer_mask,
                 temperature=args.temperature,
                 topk=args.kl_topk,
-                reverse_kl_weight=args.reverse_kl_weight,
-                first_token_weight=args.first_token_weight,
             )
             diagnostics = masked_unaligned_answer_diagnostics(
                 student_logits,
@@ -494,12 +500,17 @@ def main() -> None:
                 student_answer_mask,
                 teacher_answer_mask,
             )
-            ce = diagnostics["student_ce"].to(dtype=student_logits.dtype)
+            ce = masked_unaligned_student_answer_ce(
+                student_logits,
+                student_ids,
+                student_answer_mask,
+                teacher_answer_mask,
+            ).to(dtype=student_logits.dtype)
             unscaled_loss = float(args.lambda_logit) * kl + float(args.lambda_ce) * ce
             loss = unscaled_loss / float(args.gradient_accumulation_steps)
             engine.backward(loss)
             accum["logit_kl"] += float(kl.detach()) / float(args.gradient_accumulation_steps)
-            accum["student_ce"] += float(diagnostics["student_ce"].detach()) / float(args.gradient_accumulation_steps)
+            accum["student_ce"] += float(ce.detach()) / float(args.gradient_accumulation_steps)
             accum["teacher_ce"] += float(diagnostics["teacher_ce"].detach()) / float(args.gradient_accumulation_steps)
             accum["student_target_acc"] += float(diagnostics["student_target_acc"].detach()) / float(args.gradient_accumulation_steps)
             accum["teacher_target_acc"] += float(diagnostics["teacher_target_acc"].detach()) / float(args.gradient_accumulation_steps)

@@ -10,9 +10,9 @@ export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 MODEL_PATH=${MODEL_PATH:-/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct}
-OCR_CONTEXT_TOKENS=${OCR_CONTEXT_TOKENS:-2048}
-DATA=${DATA:-$ROOT_DIR/data/train/rendered_text_copy_${OCR_CONTEXT_TOKENS}/paired_eval.jsonl}
-IMAGE_ROOT=${IMAGE_ROOT:-$ROOT_DIR/data/train/rendered_text_copy_${OCR_CONTEXT_TOKENS}}
+OCR_DATASET=${OCR_DATASET:-ocr_overlap_allcopy_only_1024}
+DATA=${DATA:-$ROOT_DIR/data/train/$OCR_DATASET/paired_eval.jsonl}
+IMAGE_ROOT=${IMAGE_ROOT:-$ROOT_DIR/data/train/rendered_text}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/eval/ocr_eval}
 
 CMD=(
@@ -24,7 +24,7 @@ CMD=(
   --dtype "${DTYPE:-bfloat16}"
   --attn-implementation "${ATTN_IMPL:-flash_attention_2}"
   --max-samples "${MAX_SAMPLES:-1000}"
-  --max-new-tokens "${MAX_NEW_TOKENS:-360}"
+  --max-new-tokens "${MAX_NEW_TOKENS:-1024}"
   --log-every "${LOG_EVERY:-25}"
   --adapter-decode-cache-mode "${ADAPTER_DECODE_CACHE_MODE:-shape_exact}"
 )

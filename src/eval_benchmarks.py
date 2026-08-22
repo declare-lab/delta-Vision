@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
@@ -60,6 +63,35 @@ from src.data import LlavaBenchmarkDataset, QwenBenchmarkDataset
 
 OPTION_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
+PERCEPTIONBENCH_JUDGE_TEMPLATE = """Please act as a professional teacher and grade the student's answer. Below are the question, the student's answer, and the reference answer. Based on the question and the reference answer, analyze the student's answer and judge whether it correctly answers the question.
+
+Return your judgment in the following format. The first field [reason] gives the reason for your judgment; the second field [judge] gives your verdict as a single boolean, i.e., True or False. Make sure your output ends with True or False.
+[reason]
+<a brief justification of no more than 100 tokens>
+[judge]
+False
+
+Notice:
+0. Compare the reference answer and student's answer, focusing especially on the content after summarizing phrases such as "Final answer:".
+1. If the question contains multiple sub-questions, judge correct only when all sub-questions are consistent.
+2. For multiple-answer questions, the student's answer must contain all correct answers without extra ones.
+3. If equivalent after simplification, provide the simplification process.
+4. For numerical answers, integers or values with at most 4 significant figures must match exactly; values with more than 4 significant figures must match within 4 significant figures. Convert units when needed.
+5. For English writing questions, if the student does not answer in English, judge it incorrect.
+6. For physics, chemistry, and biology questions, if the reference answer contains a technical term, the student's answer must contain that exact term; synonyms are not accepted.
+7. When the question asks to explain a term, redundant explanation is not penalized, but missing key points are incorrect.
+8. For multiple-choice questions, judge incorrect whenever the selected option differs from the reference answer.
+
+Now you may begin grading.
+========== [Question] ==========
+{problem}
+========== [Student Answer] ==========
+{assistant_answer}
+========== [Reference Answer] ==========
+{reference_answer}
+========== [Your Judgment] ==========
+"""
+
 
 def extract_option_from_text(text: str) -> str | None:
     """Extract an A/B/C/D answer from generated text."""
@@ -105,6 +137,166 @@ def predict_option(logits: torch.Tensor, option_ids: dict[str, list[int]]) -> st
             best_score = score
             best_letter = letter
     return best_letter
+
+
+def _openai_chat_completion(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float = 0.3,
+    max_tokens: int = 512,
+    max_retries: int = 3,
+) -> str:
+    base_url = base_url.rstrip("/")
+    url = f"{base_url}/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=float(os.getenv("LLM_JUDGE_TIMEOUT", "900"))) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            return str(body["choices"][0]["message"]["content"])
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            time.sleep(min(2**attempt, 8))
+    raise RuntimeError(f"judge request failed after {max_retries + 1} attempts: {last_error}") from last_error
+
+
+def _decode_llm_judge(text: str) -> tuple[bool, str]:
+    clean = str(text).strip()
+    reason = clean
+    if "[reason]" in clean and "[judge]" in clean:
+        reason = clean.split("[judge]")[0].split("[reason]")[-1].strip()
+        verdict = clean.split("[judge]")[-1].strip()
+    else:
+        verdict = clean
+    return ("true" in verdict.lower()), reason[:500]
+
+
+def maybe_llm_judge_eval(
+    *,
+    metric: str,
+    eval_item: dict[str, Any],
+    row: dict[str, Any],
+    prediction_text: str,
+    answer: Any,
+    force: bool = False,
+    base_url_override: str | None = None,
+) -> dict[str, Any]:
+    if metric != "llm_judge" or not eval_item.get("needs_judge"):
+        return eval_item
+    if not force and os.getenv("LLM_JUDGE_DURING_GENERATION", "0") != "1":
+        return eval_item
+    base_url = base_url_override or os.getenv("LLM_JUDGE_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    judge_model = os.getenv("LLM_JUDGE_MODEL") or os.getenv("JUDGE_MODEL")
+    api_key = os.getenv("LLM_JUDGE_API_KEY") or os.getenv("OPENAI_API_KEY") or "EMPTY"
+    if not base_url or not judge_model:
+        eval_item = dict(eval_item)
+        eval_item.update({"score": 0.0, "invalid": True, "judge_error": "LLM_JUDGE_BASE_URL and LLM_JUDGE_MODEL are required"})
+        return eval_item
+    question = str(row.get("problem") or row.get("question") or "")
+    reference = str(answer if answer is not None else row.get("answer", "")).strip()
+    prompt = PERCEPTIONBENCH_JUDGE_TEMPLATE.format(
+        problem=question,
+        assistant_answer=str(prediction_text).strip(),
+        reference_answer=reference,
+    )
+    try:
+        response = _openai_chat_completion(
+            base_url=base_url,
+            api_key=api_key,
+            model=judge_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=float(os.getenv("LLM_JUDGE_TEMPERATURE", "0.3")),
+            max_tokens=int(os.getenv("LLM_JUDGE_MAX_TOKENS", "512")),
+            max_retries=int(os.getenv("LLM_JUDGE_MAX_RETRIES", "3")),
+        )
+        ok, reason = _decode_llm_judge(response)
+        eval_item = dict(eval_item)
+        eval_item.update({"score": float(ok), "invalid": False, "judge_reason": reason, "judge_model": judge_model})
+        return eval_item
+    except Exception as exc:
+        eval_item = dict(eval_item)
+        eval_item.update({"score": 0.0, "invalid": True, "judge_error": str(exc), "judge_model": judge_model})
+        return eval_item
+
+
+def apply_deferred_llm_judge(
+    *,
+    benchmark: str,
+    predictions: list[dict[str, Any]],
+    log_every: int = 25,
+) -> None:
+    spec = get_benchmark_spec(benchmark)
+    if spec.metric != "llm_judge":
+        return
+
+    pending: list[tuple[dict[str, Any], str, str]] = []
+    for item in predictions:
+        teacher_eval = item.get("teacher_eval") or {}
+        adapter_eval = item.get("adapter_eval") or {}
+        if teacher_eval.get("needs_judge"):
+            pending.append((item, "teacher_eval", "teacher_text"))
+        if adapter_eval.get("needs_judge"):
+            pending.append((item, "adapter_eval", "adapter_text"))
+
+    total = len(pending)
+    if not total:
+        return
+
+    base_urls_text = os.getenv("LLM_JUDGE_BASE_URLS", "")
+    base_urls = [url.strip() for url in base_urls_text.split(",") if url.strip()]
+    if not base_urls:
+        single_url = os.getenv("LLM_JUDGE_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        base_urls = [single_url] if single_url else []
+    workers = int(os.getenv("LLM_JUDGE_WORKERS", str(max(1, len(base_urls)))))
+    workers = max(1, workers)
+    print(f"Running deferred LLM judge for {total} {spec.display_name} predictions with {workers} workers", flush=True)
+
+    def judge_one(idx_and_pending: tuple[int, tuple[dict[str, Any], str, str]]) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        idx, (item, eval_key, text_key) = idx_and_pending
+        base_url = base_urls[(idx - 1) % len(base_urls)] if base_urls else None
+        result = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=item[eval_key],
+            row=item.get("row", {}),
+            prediction_text=str(item.get(text_key) or ""),
+            answer=item.get("row", {}).get("answer") or item[eval_key].get("gold"),
+            force=True,
+            base_url_override=base_url,
+        )
+        return item, eval_key, result
+
+    completed = 0
+    if workers == 1:
+        for idx_and_pending in enumerate(pending, start=1):
+            item, eval_key, result = judge_one(idx_and_pending)
+            item[eval_key] = result
+            completed += 1
+            if completed % max(1, int(log_every)) == 0 or completed == total:
+                print(f"[judge {completed}/{total}] {spec.display_name}", flush=True)
+        return
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(judge_one, item) for item in enumerate(pending, start=1)]
+        for future in concurrent.futures.as_completed(futures):
+            item, eval_key, result = future.result()
+            item[eval_key] = result
+            completed += 1
+            if completed % max(1, int(log_every)) == 0 or completed == total:
+                print(f"[judge {completed}/{total}] {spec.display_name}", flush=True)
 
 
 def _prediction_from_text(metric: str | None, text: str, choices: list[Any] | None = None) -> str | None:
@@ -511,6 +703,13 @@ def evaluate_llava_shard(
             choices=choices,
             question=item.get("question") or item.get("row", {}).get("question"),
         )
+        teacher_eval = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=teacher_eval,
+            row=item.get("row", {}),
+            prediction_text=teacher_text,
+            answer=item.get("answer"),
+        )
         adapter_eval = score_prediction(
             metric=spec.metric,
             prediction_text=adapter_text,
@@ -518,6 +717,13 @@ def evaluate_llava_shard(
             answers=item.get("answers"),
             choices=choices,
             question=item.get("question") or item.get("row", {}).get("question"),
+        )
+        adapter_eval = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=adapter_eval,
+            row=item.get("row", {}),
+            prediction_text=adapter_text,
+            answer=item.get("answer"),
         )
         predictions.append(
             {
@@ -565,7 +771,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
     parser.add_argument("--data", default=None)
     parser.add_argument("--data-root", default="../delta-vision", help="Root for resolving image paths")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--num-shards", type=int, default=8)
@@ -577,6 +783,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="auto")
     parser.add_argument("--measure-prefill", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--teacher-only", action="store_true", help="Evaluate only the frozen/base model; does not require --checkpoint.")
     parser.add_argument("--compile-adapter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
@@ -650,6 +857,10 @@ def run_llava_single_shard(args, shard_id: int, num_shards: int):
         device="cuda:0",
         attn_implementation=args.attn_implementation,
     )
+    if args.teacher_only:
+        raise ValueError("--teacher-only is currently implemented for model-kind=qwen")
+    if args.checkpoint is None:
+        raise ValueError("--checkpoint is required unless --teacher-only is set")
     adapter, source_layers, checkpoint_mode = load_adapter(args.checkpoint, model, device)
     output_mode = args.output_mode or checkpoint_mode
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
@@ -1621,6 +1832,13 @@ def evaluate_qwen_benchmark_shard(
             choices=item.get("choices"),
             question=item.get("question") or item.get("row", {}).get("question"),
         )
+        teacher_eval = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=teacher_eval,
+            row=item.get("row", {}),
+            prediction_text=teacher_text,
+            answer=item.get("answer"),
+        )
         adapter_eval = score_prediction(
             metric=spec.metric,
             prediction_text=adapter_text,
@@ -1628,6 +1846,13 @@ def evaluate_qwen_benchmark_shard(
             answers=item.get("answers"),
             choices=item.get("choices"),
             question=item.get("question") or item.get("row", {}).get("question"),
+        )
+        adapter_eval = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=adapter_eval,
+            row=item.get("row", {}),
+            prediction_text=adapter_text,
+            answer=item.get("answer"),
         )
         teacher_kv = estimate_qwen_kv_cache_mb(
             language_config,
@@ -1958,6 +2183,13 @@ def evaluate_qwen_benchmark_shard_batched(
                 choices=item.get("choices"),
                 question=item.get("question") or item.get("row", {}).get("question"),
             )
+            teacher_eval = maybe_llm_judge_eval(
+                metric=spec.metric,
+                eval_item=teacher_eval,
+                row=item.get("row", {}),
+                prediction_text=teacher_text,
+                answer=item.get("answer"),
+            )
             adapter_eval = score_prediction(
                 metric=spec.metric,
                 prediction_text=adapter_text,
@@ -1965,6 +2197,13 @@ def evaluate_qwen_benchmark_shard_batched(
                 answers=item.get("answers"),
                 choices=item.get("choices"),
                 question=item.get("question") or item.get("row", {}).get("question"),
+            )
+            adapter_eval = maybe_llm_judge_eval(
+                metric=spec.metric,
+                eval_item=adapter_eval,
+                row=item.get("row", {}),
+                prediction_text=adapter_text,
+                answer=item.get("answer"),
             )
             teacher_kv = estimate_qwen_kv_cache_mb(
                 language_config,
@@ -2034,11 +2273,138 @@ def evaluate_qwen_benchmark_shard_batched(
     return {"summary": summary, "predictions": predictions, "output_mode": adapter.mode}
 
 
+@torch.inference_mode()
+def evaluate_qwen_teacher_shard(
+    model,
+    processor,
+    dataset: QwenBenchmarkDataset,
+    device: torch.device,
+    log_every: int,
+    max_new_tokens: int,
+    benchmark: str,
+    measure_prefill: bool,
+    dtype: torch.dtype,
+    last_logits_only: bool = True,
+) -> dict:
+    spec = get_benchmark_spec(benchmark)
+    language_config = model.model.language_model.config
+    predictions: list[dict[str, Any]] = []
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        inputs = {
+            "input_ids": item["input_ids"].unsqueeze(0).to(device),
+            "attention_mask": item["attention_mask"].unsqueeze(0).to(device),
+            "pixel_values": item["pixel_values"].to(device),
+            "image_grid_thw": item["image_grid_thw"].to(device),
+            "mm_token_type_ids": item["mm_token_type_ids"].unsqueeze(0).to(device),
+        }
+        text_tokens, image_tokens = _qwen_token_counts(inputs["attention_mask"], inputs["mm_token_type_ids"])
+        teacher_prefill_s, _ = _timed_call(
+            lambda: model(**inputs, logits_to_keep=1 if last_logits_only else 0).logits,
+            enabled=measure_prefill,
+        )
+        teacher_total_s, (_, teacher_text) = _timed_call(
+            lambda: generate_teacher_qwen(
+                model,
+                processor,
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["pixel_values"],
+                inputs["image_grid_thw"],
+                inputs["mm_token_type_ids"],
+                max_new_tokens,
+            )
+        )
+        teacher_eval = score_prediction(
+            metric=spec.metric,
+            prediction_text=teacher_text,
+            answer=item.get("answer"),
+            answers=item.get("answers"),
+            choices=item.get("choices"),
+            question=item.get("question") or item.get("row", {}).get("question"),
+        )
+        teacher_eval = maybe_llm_judge_eval(
+            metric=spec.metric,
+            eval_item=teacher_eval,
+            row=item.get("row", {}),
+            prediction_text=teacher_text,
+            answer=item.get("answer"),
+        )
+        teacher_kv = estimate_qwen_kv_cache_mb(
+            language_config,
+            text_tokens=text_tokens,
+            image_tokens=image_tokens,
+            dtype_bytes=_dtype_bytes(dtype),
+            adapter=False,
+        )
+        teacher_flops = estimate_qwen_prefill_flops(language_config, text_tokens=text_tokens, image_tokens=image_tokens)
+        predictions.append(
+            {
+                "index": item["index"],
+                "row": item["row"],
+                "teacher_text": teacher_text,
+                "adapter_text": None,
+                "teacher_eval": teacher_eval,
+                "adapter_eval": None,
+                "teacher_total_s": teacher_total_s,
+                "adapter_total_s": 0.0,
+                "teacher_prefill_s": teacher_prefill_s,
+                "adapter_prefill_s": 0.0,
+                "text_tokens": text_tokens,
+                "image_tokens": image_tokens,
+                "teacher_kv_cache_mb": teacher_kv,
+                "adapter_kv_cache_mb": None,
+                "teacher_prefill_flops": teacher_flops,
+                "adapter_prefill_flops": None,
+            }
+        )
+        if (idx + 1) % log_every == 0:
+            summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=["teacher_only"])
+            print(f"[{idx+1}/{len(dataset)}] {spec.display_name} teacher={summary['teacher']['score']:.4f}", flush=True)
+    summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=["teacher_only"])
+    return {"summary": summary, "predictions": predictions, "output_mode": "teacher_only"}
+
+
 def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: int) -> dict:
     device = torch.device("cuda:0")
     dtype = dtype_from_name(args.dtype)
     configure_torch_runtime()
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    if args.teacher_only:
+        dataset = QwenBenchmarkDataset(
+            args.data,
+            processor,
+            args.benchmark,
+            data_root=args.data_root,
+            max_samples=args.max_samples,
+            answer_instruction=args.answer_instruction,
+            cache_dir=args.input_cache_dir,
+        )
+        total = len(dataset)
+        per_shard = (total + num_shards - 1) // num_shards
+        start = shard_id * per_shard
+        end = min(start + per_shard, total)
+        dataset.rows = dataset.rows[start:end]
+        print(f"Shard {shard_id}: samples [{start}, {end}) = {len(dataset)} items; mode=teacher_only", flush=True)
+        result = evaluate_qwen_teacher_shard(
+            model,
+            processor,
+            dataset,
+            device,
+            args.log_every,
+            args.max_new_tokens,
+            args.benchmark,
+            args.measure_prefill,
+            dtype,
+            last_logits_only=bool(args.last_logits_only),
+        )
+        out_path = Path(args.output_dir) / f"shard_{shard_id}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"Shard {shard_id} done. Saved to {out_path}", flush=True)
+        return result
+    if args.checkpoint is None:
+        raise ValueError("--checkpoint is required unless --teacher-only is set")
     adapter, meta = load_qwen_embedding_adapter_checkpoint(args.checkpoint, model.model.language_model, device, dtype)
     if args.output_mode is not None:
         if not is_embedding_adapter_mode(args.output_mode):
@@ -2191,6 +2557,7 @@ def merge_benchmark_shards(output_dir: str, num_shards: int, benchmark: str) -> 
         if data.get("output_mode"):
             output_modes.append(str(data["output_mode"]))
 
+    apply_deferred_llm_judge(benchmark=benchmark, predictions=all_predictions, log_every=25)
     merged = summarize_benchmark_predictions(
         benchmark=benchmark,
         predictions=all_predictions,

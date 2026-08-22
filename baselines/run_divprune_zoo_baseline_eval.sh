@@ -7,7 +7,7 @@ EVAL_SCRIPT="${ROOT}/baselines/eval_baselines.py"
 
 METHODS="${METHODS:-divprune zoo}"
 RETENTIONS="${RETENTIONS:-0.05 0.10 0.15 0.20}"
-BENCHMARKS="${BENCHMARKS:-mmstar,gqa,mmb,mmb-cn,mme,pope,sqa,vqav2,realworldqa}"
+BENCHMARKS="${BENCHMARKS:-mmstar,gqa,mmb,mmb-cn,mme,pope,sqa,vqav2,realworldqa,perceptionbench}"
 FULL_BENCHMARKS="${FULL_BENCHMARKS:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000}"
 NUM_GPUS="${NUM_GPUS:-8}"

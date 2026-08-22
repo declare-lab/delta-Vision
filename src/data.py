@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -218,7 +219,8 @@ class QwenBenchmarkDataset(Dataset):
         image_paths = self._image_paths(row)
 
         question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
-        cache_path = self._cache_path(row, image_paths, question)
+        cache_question = str(row.get("problem") or question)
+        cache_path = self._cache_path(row, image_paths, cache_question)
         if cache_path is not None and cache_path.exists():
             cached = torch.load(cache_path, map_location="cpu", weights_only=False)
             item = cached["item"]
@@ -230,13 +232,8 @@ class QwenBenchmarkDataset(Dataset):
             return item
 
         images = [Image.open(path).convert("RGB") for path in image_paths]
-        messages = [
-            {
-                "role": "user",
-                "content": [{"type": "image", "image": image} for image in images]
-                + [{"type": "text", "text": question}],
-            }
-        ]
+        content = self._qwen_message_content(row, question, images)
+        messages = [{"role": "user", "content": content}]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[text], images=images, return_tensors="pt", padding=True)
         for image in images:
@@ -262,6 +259,31 @@ class QwenBenchmarkDataset(Dataset):
             torch.save({"item": item}, tmp_path)
             os.replace(tmp_path, cache_path)
         return item
+
+    def _qwen_message_content(self, row: dict, question: str, images: list[Image.Image]) -> list[dict]:
+        problem = str(row.get("problem") or "")
+        if not problem or "<|image_" not in problem:
+            return [{"type": "image", "image": image} for image in images] + [{"type": "text", "text": question}]
+
+        content: list[dict] = []
+        last = 0
+        used: set[int] = set()
+        for match in re.finditer(r"<\|image_(\d+)\|>", problem):
+            image_idx = int(match.group(1)) - 1
+            segment = problem[last : match.start()]
+            if segment:
+                content.append({"type": "text", "text": segment})
+            if 0 <= image_idx < len(images):
+                content.append({"type": "image", "image": images[image_idx]})
+                used.add(image_idx)
+            last = match.end()
+        tail = problem[last:]
+        if tail:
+            content.append({"type": "text", "text": tail})
+        for image_idx, image in enumerate(images):
+            if image_idx not in used:
+                content.append({"type": "image", "image": image})
+        return content or ([{"type": "image", "image": image} for image in images] + [{"type": "text", "text": question}])
 
     def _image_paths(self, row: dict) -> list[Path]:
         raw_paths = row.get("images")

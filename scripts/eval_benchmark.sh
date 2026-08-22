@@ -14,6 +14,7 @@ MODEL_KIND=${MODEL_KIND:-qwen}
 BENCHMARK=${BENCHMARK:-mmstar}
 BENCHMARKS=${BENCHMARKS:-}
 OUTPUT_MODE=${OUTPUT_MODE:-}
+TEACHER_ONLY=${TEACHER_ONLY:-0}
 STEP=${STEP:-500}
 STEPS=${STEPS:-}
 EVAL_ALL_CKPTS=${EVAL_ALL_CKPTS:-0}
@@ -49,6 +50,10 @@ while [[ $# -gt 0 ]]; do
     --output-mode)
       OUTPUT_MODE="$2"
       shift 2
+      ;;
+    --teacher-only)
+      TEACHER_ONLY=1
+      shift
       ;;
     --run-dir)
       RUN_DIR="$2"
@@ -106,6 +111,7 @@ Options:
   --data PATH              Override benchmark JSONL path. Use only for single eval.
   --checkpoint PATH        Adapter checkpoint path. Use only for single eval.
   --output-mode MODE       Override checkpoint output mode, e.g. recurrent_embedding_adapter.
+  --teacher-only           Evaluate only the base model; no checkpoint required.
   --run-dir PATH           Run directory containing checkpoints.
   --step N                 Single checkpoint step.
   --steps LIST             Space-separated checkpoint steps.
@@ -409,14 +415,18 @@ if [[ -z "${CKPT:-}" && -n "${RUN_DIR:-}" ]]; then
     done
   fi
 fi
-if [[ -z "${CKPT:-}" ]]; then
+if [[ -z "${CKPT:-}" && "$TEACHER_ONLY" != "1" ]]; then
   echo "set CKPT/CHECKPOINT, or set RUN_DIR with a supported checkpoint name" >&2
   exit 1
 fi
 
-RUN_NAME=${RUN_NAME:-$(basename "$(dirname "$CKPT")")}
-if [[ "$RUN_NAME" == "checkpoints" ]]; then
-  RUN_NAME="$(basename "$(dirname "$(dirname "$CKPT")")")"
+if [[ "$TEACHER_ONLY" == "1" ]]; then
+  RUN_NAME=${RUN_NAME:-$(basename "$MODEL_PATH")_teacher_only}
+else
+  RUN_NAME=${RUN_NAME:-$(basename "$(dirname "$CKPT")")}
+  if [[ "$RUN_NAME" == "checkpoints" ]]; then
+    RUN_NAME="$(basename "$(dirname "$(dirname "$CKPT")")")"
+  fi
 fi
 NUM_SHARDS=${NUM_SHARDS:-8}
 if [[ -z "${MAX_SAMPLES+x}" ]]; then
@@ -456,13 +466,15 @@ echo "model_kind=$MODEL_KIND"
 echo "data_root=$DATA_ROOT"
 echo "model_root=$MODEL_ROOT"
 echo "model_path=$MODEL_PATH"
-echo "checkpoint=$CKPT"
+echo "checkpoint=${CKPT:-teacher_only}"
+echo "teacher_only=$TEACHER_ONLY"
 echo "output=$OUT_DIR"
 echo "benchmark=$BENCHMARK max_samples=$MAX_SAMPLES max_new_tokens=$MAX_NEW_TOKENS shards=$NUM_SHARDS"
 echo "attn=$ATTN_IMPL dtype=$DTYPE"
 echo "measure_prefill=${MEASURE_PREFILL:-1}"
 echo "compile_adapter=${COMPILE_ADAPTER:-1} compile_verify=${COMPILE_VERIFY:-0}"
 echo "structured_answer_early_stop=${STRUCTURED_ANSWER_EARLY_STOP:-1}"
+echo "eval_batch_size=${EVAL_BATCH_SIZE:-128} eval_max_batch_tokens=${EVAL_MAX_BATCH_TOKENS:-0}"
 
 IFS=',' read -r -a DEVICES <<< "$CUDA_DEVICES_CSV"
 if [[ "${#DEVICES[@]}" -lt "$NUM_SHARDS" ]]; then
@@ -543,6 +555,17 @@ CONTEXT_CACHE_ARGS=()
 if [[ "$MODEL_KIND" == "qwen" && "${CONTEXT_CACHE:-0}" == "1" ]]; then
   CONTEXT_CACHE_ARGS=(--context-cache-dir "${CONTEXT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_initial_contexts}")
 fi
+EVAL_BATCH_ARGS=()
+if [[ "$MODEL_KIND" == "qwen" ]]; then
+  EVAL_BATCH_ARGS=(--eval-batch-size "${EVAL_BATCH_SIZE:-128}" --eval-max-batch-tokens "${EVAL_MAX_BATCH_TOKENS:-0}")
+fi
+TEACHER_ONLY_ARGS=()
+CHECKPOINT_ARGS=()
+if [[ "$TEACHER_ONLY" == "1" ]]; then
+  TEACHER_ONLY_ARGS=(--teacher-only)
+else
+  CHECKPOINT_ARGS=(--checkpoint "$CKPT")
+fi
 
 pids=()
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
@@ -554,7 +577,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     --data "$DATA" \
     --data-root "$DATA_ROOT" \
     --model-path "$MODEL_PATH" \
-    --checkpoint "$CKPT" \
+    "${CHECKPOINT_ARGS[@]}" \
     --output-dir "$SHARD_DIR" \
     --num-shards "$NUM_SHARDS" \
     --shard-id "$shard" \
@@ -569,6 +592,8 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     "${LAST_LOGITS_ARGS[@]}" \
     "${INPUT_CACHE_ARGS[@]}" \
     "${CONTEXT_CACHE_ARGS[@]}" \
+    "${EVAL_BATCH_ARGS[@]}" \
+    "${TEACHER_ONLY_ARGS[@]}" \
     --dtype "$DTYPE" \
     --attn-implementation "$ATTN_IMPL" \
     > "$SHARD_DIR/shard_$(printf '%02d' "$shard").log" 2>&1 &
@@ -585,7 +610,7 @@ done
   --data "$DATA" \
   --data-root "$DATA_ROOT" \
   --model-path "$MODEL_PATH" \
-  --checkpoint "$CKPT" \
+  "${CHECKPOINT_ARGS[@]}" \
   --output-dir "$SHARD_DIR" \
   --num-shards "$NUM_SHARDS" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
@@ -599,6 +624,8 @@ done
   "${LAST_LOGITS_ARGS[@]}" \
   "${INPUT_CACHE_ARGS[@]}" \
   "${CONTEXT_CACHE_ARGS[@]}" \
+  "${EVAL_BATCH_ARGS[@]}" \
+  "${TEACHER_ONLY_ARGS[@]}" \
   --dtype "$DTYPE" \
   --attn-implementation "$ATTN_IMPL"
 
@@ -607,5 +634,4 @@ cp "$SHARD_DIR/predictions.json" "$OUT_DIR/predictions.json"
 if [[ -f "$SHARD_DIR/summary.csv" ]]; then
   cp "$SHARD_DIR/summary.csv" "$OUT_DIR/summary.csv"
 fi
-
 echo "Done. Results at $OUT_DIR/results.json"

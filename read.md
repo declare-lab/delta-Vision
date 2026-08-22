@@ -36,11 +36,11 @@ Teacher/student setup:
 
 Relevant files:
 
-- Training script: `test/rendered_text_teacher_train.py`
-- Copy training wrapper: `test/train_rendered_text_copy.sh`
-- Copy eval script: `test/eval_rendered_text_copy.py`
-- Copy eval wrapper: `test/eval_rendered_text_copy.sh`
-- Low-rank KV eval: `test/eval_text_context_lowrank_kv.py`
+- Training script: `src/ocr_train.py`
+- Copy training wrapper: `scripts/ocr_train.sh`
+- Copy data builder: `test/build_ocr_copy_data.py`
+- Copy data wrapper: `test/build_ocr_copy_data.sh`
+- QA eval wrapper: `scripts/ocr_qa_eval.sh`
 
 ## Data
 
@@ -523,4 +523,3 @@ Eval results:
   `artifacts/eval/qwen/rendered_text_copy_300_kl_ds8_mb4_wandb_20260821_072442/eager/step500_rendered_qa_300_all_76samples_1gpu_v2/results.json`
 - Mixed 76-row transcription:
   `artifacts/eval/qwen/rendered_text_copy_300_kl_ds8_mb4_wandb_20260821_072442/eager/step500_rendered_qa_300_transcribe_76samples_adapter/results.json`
-

@@ -12,7 +12,7 @@ MAX_ANSWER_TOKENS=${MAX_ANSWER_TOKENS:-2048}
 DATASET_NAME=${DATASET_NAME:-rendered_text_copy_${MAX_ANSWER_TOKENS}}
 OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/data/train/$DATASET_NAME}
 
-"$PY" test/build_rendered_text_copy_data.py \
+"$PY" test/build_ocr_copy_data.py \
   --source-train "${SOURCE_TRAIN:-$ROOT_DIR/data/train/rendered_text/paired_train.jsonl}" \
   --source-eval "${SOURCE_EVAL:-$ROOT_DIR/data/train/rendered_text/paired_eval.jsonl}" \
   --output-dir "$OUTPUT_DIR" \
