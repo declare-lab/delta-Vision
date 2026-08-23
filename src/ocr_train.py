@@ -136,7 +136,6 @@ def reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str,
 
 
 RENDERED_PAGE_INSTRUCTION = "Read the ordered page images and answer using only their text."
-ANSWER_INSTRUCTION = "Answer directly with a short phrase."
 QA_IMAGE_INSTRUCTION = "Use the image text to answer the question."
 QA_FINAL_ANSWER_INSTRUCTION = "Return only the final answer, with no explanation."
 COPY_TRANSCRIPTION_INSTRUCTION = "Transcribe all visible text in the image exactly. Preserve line breaks."
@@ -144,10 +143,6 @@ COPY_TRANSCRIPTION_INSTRUCTION = "Transcribe all visible text in the image exact
 
 def is_copy_transcription(row: dict[str, Any]) -> bool:
     return str(row.get("task_type") or "").strip() in {"copy", "copy_transcription"}
-
-
-def is_qa(row: dict[str, Any]) -> bool:
-    return str(row.get("task_type") or "").strip() == "qa" or not is_copy_transcription(row)
 
 
 def cleaned_rendered_question(row: dict[str, Any]) -> str:
