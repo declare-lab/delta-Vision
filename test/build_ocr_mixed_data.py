@@ -137,7 +137,7 @@ def normalize_qa_row(
     out["question"] = question
     out["rendered_question"] = question
     out["text_context"] = context
-    out["image_root"] = str(image_root)
+    out["image_root"] = str(row.get("image_root") or image_root)
     out["answer_tokens"] = answer_tokens
     out["context_tokens"] = context_tokens
     return out
