@@ -26,9 +26,13 @@ from torch import Tensor
 
 from src.model import (
     QwenEmbeddingAdapter,
+    _compile_exact_qwen_apply_rotary_pos_emb,
+    build_qwen_initial_context,
     dtype_from_name,
     load_frozen_qwen3vl,
+    prepare_qwen_embedding_adapter_inputs,
     prepare_qwen3vl_batch_inputs,
+    qwen_embedding_adapter_prefill_cache_prepared,
     qwen_embedding_adapter_logits,
 )
 from src.train import lr_multiplier, optimizer_param_groups, save_checkpoint, set_engine_lr, trainable_parameters_for_mode
@@ -98,8 +102,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--kl-topk", type=int, default=1024)
+    parser.add_argument("--teacher-mode", choices=("text", "image"), default="text")
     parser.add_argument("--lambda-logit", type=float, default=1.0)
     parser.add_argument("--lambda-ce", type=float, default=0.0, help="Optional student CE on all answer tokens; 0 keeps KL-only behavior.")
+    parser.add_argument("--lambda-effect", type=float, default=0.0, help="Optional attention-output effect MSE alignment loss.")
+    parser.add_argument("--effect-mask", choices=("answer", "all_text"), default="answer")
+    parser.add_argument("--effect-layers", choices=("last", "all"), default="last")
+    parser.add_argument("--lambda-prefill-kv", type=float, default=0.0, help="Optional prefill K/V MSE alignment loss.")
+    parser.add_argument("--prefill-kv-layers", choices=("last", "all"), default="all")
+    parser.add_argument("--prefill-kv-eps", type=float, default=1e-6)
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--output-mode", default="embedding_adapter")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
@@ -137,7 +148,7 @@ def reduce_metrics(metrics: dict[str, float], device: torch.device) -> dict[str,
 
 RENDERED_PAGE_INSTRUCTION = "Read the ordered page images and answer using only their text."
 QA_IMAGE_INSTRUCTION = "Use the image text to answer the question."
-QA_FINAL_ANSWER_INSTRUCTION = "Return only the final answer, with no explanation."
+QA_FINAL_ANSWER_INSTRUCTION = "Answer directly with a short phrase."
 COPY_TRANSCRIPTION_INSTRUCTION = "Transcribe all visible text in the image exactly. Preserve line breaks."
 
 
@@ -275,15 +286,15 @@ def masked_unaligned_student_answer_ce(
     student_logits: Tensor,
     student_ids: Tensor,
     student_answer_mask: Tensor,
-    teacher_answer_mask: Tensor,
+    teacher_answer_mask: Tensor | None,
 ) -> Tensor:
     losses: list[Tensor] = []
     for batch_idx in range(student_logits.shape[0]):
         s_mask = student_answer_mask[batch_idx, 1:].bool()
-        t_mask = teacher_answer_mask[batch_idx, 1:].bool()
         s = student_logits[batch_idx, :-1][s_mask]
         targets = student_ids[batch_idx, 1:][s_mask]
-        count = min(int(s.shape[0]), int(t_mask.sum().item()), int(targets.shape[0]))
+        teacher_count = int(teacher_answer_mask[batch_idx, 1:].bool().sum().item()) if teacher_answer_mask is not None else int(targets.shape[0])
+        count = min(int(s.shape[0]), teacher_count, int(targets.shape[0]))
         if count <= 0:
             continue
         s = s[-count:].float()
@@ -340,8 +351,219 @@ def masked_unaligned_answer_diagnostics(
     }
 
 
+def gather_text_logits(logits: Tensor, text_positions: Tensor) -> Tensor:
+    rows = []
+    for batch_idx in range(logits.shape[0]):
+        rows.append(logits[batch_idx, text_positions[batch_idx].long()])
+    return torch.stack(rows, dim=0)
+
+
+def gather_text_hidden(hidden: Tensor, text_positions: Tensor) -> Tensor:
+    rows = []
+    for batch_idx in range(hidden.shape[0]):
+        rows.append(hidden[batch_idx, text_positions[batch_idx].long()])
+    return torch.stack(rows, dim=0)
+
+
+def text_alignment_mask(answer_mask: Tensor, text_mask: Tensor, mode: str) -> Tensor:
+    if mode == "answer":
+        return answer_mask.bool()
+    if mode == "all_text":
+        return text_mask.bool()
+    raise ValueError(f"unknown text alignment mask mode: {mode}")
+
+
+def selected_layer_indices(num_layers: int, mode: str) -> set[int]:
+    if mode == "last":
+        return {int(num_layers) - 1}
+    if mode == "all":
+        return set(range(int(num_layers)))
+    raise ValueError(f"unknown layer selection mode: {mode}")
+
+
+def capture_attention_effects(model: torch.nn.Module, layer_indices: set[int]) -> tuple[list[Tensor], list[Any]]:
+    effects: list[Tensor] = []
+    handles: list[Any] = []
+    layers = model.model.language_model.layers
+    for layer_idx in sorted(layer_indices):
+        module = layers[layer_idx].self_attn.o_proj
+
+        def hook(_module: torch.nn.Module, _inputs: tuple[Any, ...], output: Tensor, *, _layer_idx: int = layer_idx) -> None:
+            effects.append(output)
+
+        handles.append(module.register_forward_hook(hook))
+    return effects, handles
+
+
+def remove_hooks(handles: list[Any]) -> None:
+    for handle in handles:
+        handle.remove()
+
+
+def masked_effect_mse_alignment(
+    student_effects: list[Tensor],
+    teacher_effects: list[Tensor],
+    text_positions: Tensor,
+    mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if len(student_effects) != len(teacher_effects):
+        raise RuntimeError(f"effect count mismatch: student={len(student_effects)} teacher={len(teacher_effects)}")
+    losses: list[Tensor] = []
+    cosines: list[Tensor] = []
+    token_counts: list[Tensor] = []
+    valid = mask.bool()
+    for student_effect, teacher_effect in zip(student_effects, teacher_effects):
+        teacher_text = gather_text_hidden(teacher_effect.detach(), text_positions)
+        if student_effect.shape[:2] != teacher_text.shape[:2]:
+            raise RuntimeError(f"effect shape mismatch: student={tuple(student_effect.shape)} teacher={tuple(teacher_text.shape)}")
+        if not bool(valid.any().item()):
+            continue
+        student = student_effect[valid].float()
+        teacher = teacher_text[valid].float()
+        losses.append(F.mse_loss(student, teacher, reduction="mean"))
+        cosines.append(F.cosine_similarity(student, teacher, dim=-1))
+        token_counts.append(torch.tensor(float(student.shape[0]), device=student_effect.device))
+    if not losses:
+        zero = student_effects[0].new_zeros((), dtype=torch.float32) if student_effects else torch.tensor(0.0)
+        return zero, zero, zero
+    loss = torch.stack(losses).mean()
+    cosine = torch.cat(cosines).mean()
+    tokens = torch.stack(token_counts).sum()
+    return loss.to(dtype=student_effects[0].dtype), cosine, tokens
+
+
+def capture_native_prefill_kv(model: torch.nn.Module, layer_indices: set[int]) -> tuple[dict[int, dict[str, Tensor]], list[Any]]:
+    captured: dict[int, dict[str, Tensor]] = {}
+    handles: list[Any] = []
+    layers = model.model.language_model.layers
+    for layer_idx in sorted(layer_indices):
+        attn = layers[layer_idx].self_attn
+
+        def hook(
+            module: torch.nn.Module,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            *,
+            _layer_idx: int = layer_idx,
+        ) -> None:
+            hidden_states = kwargs.get("hidden_states", args[0] if args else None)
+            position_embeddings = kwargs.get("position_embeddings", args[1] if len(args) > 1 else None)
+            if hidden_states is None or position_embeddings is None:
+                raise RuntimeError("unable to capture native Qwen prefill K/V: missing hidden_states or position_embeddings")
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, module.head_dim)
+            key = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            _, key = _compile_exact_qwen_apply_rotary_pos_emb(key, key, position_embeddings)
+            captured[_layer_idx] = {"key": key.detach(), "value": value.detach()}
+
+        handles.append(attn.register_forward_pre_hook(hook, with_kwargs=True))
+    return captured, handles
+
+
+def _gather_kv_positions(kv: Tensor, positions: Tensor) -> Tensor:
+    index = positions.long().clamp_min(0)[:, None, :, None].expand(-1, kv.shape[1], -1, kv.shape[-1])
+    return torch.gather(kv, dim=2, index=index)
+
+
+def _masked_normalized_mse(student: Tensor, teacher: Tensor, mask: Tensor, eps: float) -> Tensor:
+    if not bool(mask.any().item()):
+        return student.new_zeros((), dtype=torch.float32)
+    valid = mask[:, None, :, None].to(device=student.device, dtype=torch.bool)
+    diff = (student.float() - teacher.float()).masked_fill(~valid, 0.0)
+    ref = teacher.float().masked_fill(~valid, 0.0)
+    return diff.square().sum() / ref.square().sum().clamp_min(float(eps))
+
+
+def _paired_masked_normalized_mse(
+    first_student: Tensor,
+    first_teacher: Tensor,
+    first_mask: Tensor,
+    second_student: Tensor,
+    second_teacher: Tensor,
+    second_mask: Tensor,
+    eps: float,
+) -> Tensor:
+    first_valid = first_mask[:, None, :, None].to(device=first_student.device, dtype=torch.bool)
+    second_valid = second_mask[:, None, :, None].to(device=second_student.device, dtype=torch.bool)
+    numerator = (first_student.float() - first_teacher.float()).masked_fill(~first_valid, 0.0).square().sum()
+    numerator = numerator + (second_student.float() - second_teacher.float()).masked_fill(~second_valid, 0.0).square().sum()
+    denominator = first_teacher.float().masked_fill(~first_valid, 0.0).square().sum()
+    denominator = denominator + second_teacher.float().masked_fill(~second_valid, 0.0).square().sum()
+    return numerator / denominator.clamp_min(float(eps))
+
+
+def masked_prefill_kv_alignment(
+    student_cache: dict[str, Any],
+    teacher_kv: dict[int, dict[str, Tensor]],
+    *,
+    layer_indices: set[int],
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    text_positions = student_cache["text_positions"]
+    image_positions = student_cache["image_positions"]
+    text_mask = student_cache["text_mask"].bool()
+    image_mask = student_cache["image_mask"].bool()
+    image_end = image_positions.masked_fill(~image_mask, -1).amax(dim=1, keepdim=True)
+    post_image_text_mask = text_mask & (text_positions > image_end)
+    valid_tokens = image_mask.sum() + post_image_text_mask.sum()
+    losses: list[Tensor] = []
+    cosines: list[Tensor] = []
+    for layer_idx in sorted(layer_indices):
+        student_layer = student_cache["layers"][layer_idx]
+        teacher_layer = teacher_kv[layer_idx]
+        teacher_image_key = _gather_kv_positions(teacher_layer["key"], image_positions)
+        teacher_image_value = _gather_kv_positions(teacher_layer["value"], image_positions)
+        teacher_text_key = _gather_kv_positions(teacher_layer["key"], text_positions)
+        teacher_text_value = _gather_kv_positions(teacher_layer["value"], text_positions)
+        key_loss = _paired_masked_normalized_mse(
+            student_layer["visual_key"],
+            teacher_image_key,
+            image_mask,
+            student_layer["text_key"],
+            teacher_text_key,
+            post_image_text_mask,
+            eps,
+        )
+        value_loss = _paired_masked_normalized_mse(
+            student_layer["visual_value"],
+            teacher_image_value,
+            image_mask,
+            student_layer["text_value"],
+            teacher_text_value,
+            post_image_text_mask,
+            eps,
+        )
+        losses.append(0.5 * (key_loss + value_loss))
+        if bool(image_mask.any().item()):
+            cosines.append(
+                F.cosine_similarity(
+                    student_layer["visual_value"].transpose(1, 2)[image_mask].float(),
+                    teacher_image_value.transpose(1, 2)[image_mask].float(),
+                    dim=-1,
+                )
+            )
+        if bool(post_image_text_mask.any().item()):
+            cosines.append(
+                F.cosine_similarity(
+                    student_layer["text_value"].transpose(1, 2)[post_image_text_mask].float(),
+                    teacher_text_value.transpose(1, 2)[post_image_text_mask].float(),
+                    dim=-1,
+                )
+            )
+    if not losses:
+        zero = next(iter(student_cache["layers"][0].values())).new_zeros((), dtype=torch.float32)
+        return zero, zero, zero
+    loss = torch.stack(losses).mean()
+    cosine = torch.cat(cosines).mean() if cosines else loss.new_zeros((), dtype=torch.float32)
+    return loss.to(dtype=next(iter(student_cache["layers"][0].values())).dtype), cosine, valid_tokens.float()
+
+
 def main() -> None:
     args = parse_args()
+    if float(args.lambda_prefill_kv) != 0.0 and args.teacher_mode != "image":
+        raise ValueError("--lambda-prefill-kv requires --teacher-mode image")
+    needs_teacher_logits = float(args.lambda_logit) != 0.0 or float(args.lambda_effect) != 0.0
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
     if distributed:
@@ -443,6 +665,12 @@ def main() -> None:
         current_lr = set_engine_lr(engine, base_lrs, lr_multiplier(args, step - 1))
         accum: dict[str, float] = {
             "logit_kl": 0.0,
+            "effect_loss": 0.0,
+            "effect_cos": 0.0,
+            "effect_tokens": 0.0,
+            "prefill_kv_loss": 0.0,
+            "prefill_kv_cos": 0.0,
+            "prefill_kv_tokens": 0.0,
             "student_ce": 0.0,
             "teacher_ce": 0.0,
             "student_target_acc": 0.0,
@@ -459,12 +687,6 @@ def main() -> None:
                 + rank * int(args.micro_batch_size_per_gpu)
             )
             rows = data.batch(sample_base, int(args.micro_batch_size_per_gpu))
-            teacher_inputs, _, teacher_answer_mask = prepare_text_teacher_inputs(
-                processor,
-                rows,
-                device,
-                max_context_chars=args.max_context_chars,
-            )
             student_inputs, student_ids, student_answer_mask, image_paths = prepare_qwen3vl_batch_inputs(
                 processor,
                 student_rows(rows),
@@ -474,37 +696,184 @@ def main() -> None:
             )
             assert student_ids is not None and student_answer_mask is not None
 
-            with torch.no_grad():
-                teacher = model(**teacher_inputs, return_dict=True, use_cache=False)
-                teacher_logits = teacher.logits.detach()
-            student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
+            teacher_logits: Tensor | None = None
+            teacher_answer_mask: Tensor | None = None
+            teacher_effects: list[Tensor] | None = None
+            student_effects: list[Tensor] | None = None
+            effect_mask = None
+            if not needs_teacher_logits:
+                student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
+            elif args.teacher_mode == "text":
+                    if float(args.lambda_effect) != 0.0:
+                        raise ValueError("--lambda-effect requires --teacher-mode image")
+                    teacher_inputs, _, teacher_answer_mask = prepare_text_teacher_inputs(
+                        processor,
+                        rows,
+                        device,
+                        max_context_chars=args.max_context_chars,
+                    )
+                    with torch.no_grad():
+                        teacher = model(**teacher_inputs, return_dict=True, use_cache=False)
+                        teacher_logits = teacher.logits.detach()
+                    student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
+            elif args.teacher_mode == "image":
+                initial_hidden, position_ids = build_qwen_initial_context(model, student_inputs)
+                prepared = prepare_qwen_embedding_adapter_inputs(
+                    model,
+                    engine.module,
+                    student_inputs["input_ids"],
+                    student_inputs["attention_mask"],
+                    student_inputs["mm_token_type_ids"],
+                    initial_hidden,
+                    position_ids,
+                )
+                effect_indices = selected_layer_indices(len(model.model.language_model.layers), args.effect_layers)
+                with torch.no_grad():
+                    teacher_handles: list[Any] = []
+                    if float(args.lambda_effect) != 0.0:
+                        teacher_effects, teacher_handles = capture_attention_effects(model, effect_indices)
+                    teacher = model(
+                        **student_inputs,
+                        return_dict=True,
+                        use_cache=False,
+                        output_hidden_states=False,
+                    )
+                    remove_hooks(teacher_handles)
+                    teacher_logits = gather_text_logits(teacher.logits.detach(), prepared["text_positions"])
+                student_handles = []
+                if float(args.lambda_effect) != 0.0:
+                    student_effects, student_handles = capture_attention_effects(model, effect_indices)
+                try:
+                    student_logits, _, _ = qwen_embedding_adapter_logits(
+                        model,
+                        engine.module,
+                        student_inputs,
+                        initial_hidden=initial_hidden,
+                        position_ids=position_ids,
+                        collect_states=False,
+                    )
+                finally:
+                    remove_hooks(student_handles)
+                teacher_answer_mask = student_answer_mask
+                if float(args.lambda_effect) != 0.0:
+                    effect_mask = text_alignment_mask(student_answer_mask, prepared["text_mask"], args.effect_mask)
+            else:
+                raise ValueError(f"unknown teacher mode: {args.teacher_mode}")
 
-            kl, answer_counts = masked_unaligned_topk_kl(
-                student_logits,
-                teacher_logits,
-                student_ids,
-                student_answer_mask,
-                teacher_answer_mask,
-                temperature=args.temperature,
-                topk=args.kl_topk,
-            )
-            diagnostics = masked_unaligned_answer_diagnostics(
-                student_logits,
-                teacher_logits,
-                student_ids,
-                student_answer_mask,
-                teacher_answer_mask,
-            )
+            if teacher_logits is not None and teacher_answer_mask is not None:
+                kl, answer_counts = masked_unaligned_topk_kl(
+                    student_logits,
+                    teacher_logits,
+                    student_ids,
+                    student_answer_mask,
+                    teacher_answer_mask,
+                    temperature=args.temperature,
+                    topk=args.kl_topk,
+                )
+                diagnostics = masked_unaligned_answer_diagnostics(
+                    student_logits,
+                    teacher_logits,
+                    student_ids,
+                    student_answer_mask,
+                    teacher_answer_mask,
+                )
+            else:
+                kl = student_logits.new_zeros(())
+                answer_counts = student_answer_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
+                zero = student_logits.new_zeros((), dtype=torch.float32)
+                diagnostics = {
+                    "teacher_ce": zero,
+                    "student_target_acc": zero,
+                    "teacher_target_acc": zero,
+                    "top1_agreement": zero,
+                }
             ce = masked_unaligned_student_answer_ce(
                 student_logits,
                 student_ids,
                 student_answer_mask,
                 teacher_answer_mask,
             ).to(dtype=student_logits.dtype)
-            unscaled_loss = float(args.lambda_logit) * kl + float(args.lambda_ce) * ce
+            effect_loss = student_logits.new_zeros(())
+            effect_cos = torch.zeros((), device=device, dtype=torch.float32)
+            effect_tokens = torch.zeros((), device=device, dtype=torch.float32)
+            if float(args.lambda_effect) != 0.0:
+                assert student_effects is not None and teacher_effects is not None and effect_mask is not None
+                effect_loss, effect_cos, effect_tokens = masked_effect_mse_alignment(
+                    student_effects,
+                    teacher_effects,
+                    prepared["text_positions"],
+                    effect_mask,
+                )
+            prefill_kv_loss = student_logits.new_zeros(())
+            prefill_kv_cos = torch.zeros((), device=device, dtype=torch.float32)
+            prefill_kv_tokens = torch.zeros((), device=device, dtype=torch.float32)
+            if float(args.lambda_prefill_kv) != 0.0:
+                prefill_inputs, _, _, _ = prepare_qwen3vl_batch_inputs(
+                    processor,
+                    student_rows(rows),
+                    image_root,
+                    device,
+                    include_answers=False,
+                )
+                prefill_initial_hidden, prefill_position_ids = build_qwen_initial_context(model, prefill_inputs)
+                prefill_prepared = prepare_qwen_embedding_adapter_inputs(
+                    model,
+                    engine.module,
+                    prefill_inputs["input_ids"],
+                    prefill_inputs["attention_mask"],
+                    prefill_inputs["mm_token_type_ids"],
+                    prefill_initial_hidden,
+                    prefill_position_ids,
+                )
+                prefill_layer_indices = selected_layer_indices(len(model.model.language_model.layers), args.prefill_kv_layers)
+                with torch.no_grad():
+                    teacher_kv, teacher_kv_handles = capture_native_prefill_kv(model, prefill_layer_indices)
+                    try:
+                        model(
+                            **prefill_inputs,
+                            return_dict=True,
+                            use_cache=False,
+                            output_hidden_states=False,
+                        )
+                    finally:
+                        remove_hooks(teacher_kv_handles)
+                _, _, student_cache = qwen_embedding_adapter_prefill_cache_prepared(
+                    model,
+                    engine.module,
+                    h=prefill_prepared["h"],
+                    visual_memory=prefill_prepared["visual_memory"],
+                    text_mask=prefill_prepared["text_mask"],
+                    image_mask=prefill_prepared["image_mask"],
+                    text_positions=prefill_prepared["text_positions"],
+                    image_positions=prefill_prepared["image_positions"],
+                    text_position_ids=prefill_prepared["text_position_ids"],
+                    visual_position_ids=prefill_prepared["visual_position_ids"],
+                    prefix_attention_mask=prefill_prepared["prefix_attention_mask"],
+                    text_position_embeddings=prefill_prepared["text_position_embeddings"],
+                    visual_position_embeddings=prefill_prepared["visual_position_embeddings"],
+                    logits_to_keep=1,
+                )
+                prefill_kv_loss, prefill_kv_cos, prefill_kv_tokens = masked_prefill_kv_alignment(
+                    student_cache,
+                    teacher_kv,
+                    layer_indices=prefill_layer_indices,
+                    eps=float(args.prefill_kv_eps),
+                )
+            unscaled_loss = (
+                float(args.lambda_logit) * kl
+                + float(args.lambda_ce) * ce
+                + float(args.lambda_effect) * effect_loss
+                + float(args.lambda_prefill_kv) * prefill_kv_loss
+            )
             loss = unscaled_loss / float(args.gradient_accumulation_steps)
             engine.backward(loss)
             accum["logit_kl"] += float(kl.detach()) / float(args.gradient_accumulation_steps)
+            accum["effect_loss"] += float(effect_loss.detach()) / float(args.gradient_accumulation_steps)
+            accum["effect_cos"] += float(effect_cos.detach()) / float(args.gradient_accumulation_steps)
+            accum["effect_tokens"] += float(effect_tokens.detach()) / float(args.gradient_accumulation_steps)
+            accum["prefill_kv_loss"] += float(prefill_kv_loss.detach()) / float(args.gradient_accumulation_steps)
+            accum["prefill_kv_cos"] += float(prefill_kv_cos.detach()) / float(args.gradient_accumulation_steps)
+            accum["prefill_kv_tokens"] += float(prefill_kv_tokens.detach()) / float(args.gradient_accumulation_steps)
             accum["student_ce"] += float(ce.detach()) / float(args.gradient_accumulation_steps)
             accum["teacher_ce"] += float(diagnostics["teacher_ce"].detach()) / float(args.gradient_accumulation_steps)
             accum["student_target_acc"] += float(diagnostics["student_target_acc"].detach()) / float(args.gradient_accumulation_steps)
@@ -529,10 +898,12 @@ def main() -> None:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 print(
                     f"step={step} loss={payload['loss']:.6f} kl={payload['logit_kl']:.6f} "
+                    f"effect={payload['effect_loss']:.6f} effect_cos={payload['effect_cos']:.3f} "
+                    f"prefill_kv={payload['prefill_kv_loss']:.6f} prefill_kv_cos={payload['prefill_kv_cos']:.3f} "
                     f"student_ce={payload['student_ce']:.6f} teacher_ce={payload['teacher_ce']:.6f} "
                     f"student_acc={payload['student_target_acc']:.3f} teacher_acc={payload['teacher_target_acc']:.3f} "
                     f"agree={payload['top1_agreement']:.3f} "
-                    f"answer_tokens={payload['answer_tokens']:.1f} lr={payload['lr']:.3e} "
+                    f"answer_tokens={payload['answer_tokens']:.1f} prefill_kv_tokens={payload['prefill_kv_tokens']:.1f} lr={payload['lr']:.3e} "
                     f"global_batch={payload['global_batch']}",
                     flush=True,
                 )

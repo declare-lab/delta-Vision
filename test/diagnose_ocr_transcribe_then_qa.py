@@ -34,7 +34,7 @@ from src.model import (
 
 COPY_TRANSCRIPTION_INSTRUCTION = "Transcribe all visible text in the image exactly. Preserve line breaks."
 DEFAULT_ANSWER_INSTRUCTION = "Answer directly with a short phrase."
-STRICT_ANSWER_INSTRUCTION = "Return only the final answer, with no explanation."
+STRICT_ANSWER_INSTRUCTION = "Answer directly with a short phrase."
 RENDERED_PAGE_INSTRUCTION = "Read the ordered page images and answer using only their text."
 READ_THEN_ANSWER_TEMPLATE = """First transcribe the relevant text from the image that helps answer the question.
 Then answer the question using only that transcribed text.
@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-read-then-answer-tokens", type=int, default=512)
     parser.add_argument(
         "--answer-instruction",
-        default=STRICT_ANSWER_INSTRUCTION,
+        default=DEFAULT_ANSWER_INSTRUCTION,
         help="Instruction appended to text-QA and direct adapter-QA prompts.",
     )
     parser.add_argument("--metric", default="relaxed_exact")

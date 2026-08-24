@@ -108,7 +108,7 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
     "rendered-context-qa": BenchmarkSpec(
         name="rendered-context-qa",
         display_name="RenderedContextQA",
-        metric="relaxed_exact",
+        metric="token_f1",
         default_data="data/rendered_context_qa_eval_v1/rendered_qa.jsonl",
         answer_instruction="Answer directly with a short phrase.",
         max_new_tokens=48,
@@ -585,6 +585,27 @@ def _answer_list(answer: Any, answers: Any = None) -> list[Any]:
     return [value for value in values if _stringify(value)]
 
 
+def token_f1_score(prediction: Any, reference: Any) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    ref_tokens = normalize_answer(reference).split()
+    if not pred_tokens or not ref_tokens:
+        return float(pred_tokens == ref_tokens)
+    pred_counts: dict[str, int] = defaultdict(int)
+    for token in pred_tokens:
+        pred_counts[token] += 1
+    overlap = 0
+    for token in ref_tokens:
+        count = pred_counts.get(token, 0)
+        if count > 0:
+            overlap += 1
+            pred_counts[token] = count - 1
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(pred_tokens)
+    recall = overlap / len(ref_tokens)
+    return 2.0 * precision * recall / (precision + recall)
+
+
 def score_prediction(
     *,
     metric: str,
@@ -638,17 +659,22 @@ def score_prediction(
 
     gold_values = _answer_list(answer, answers)
     gold_norms = [normalize_answer(value) for value in gold_values]
-    if metric == "relaxed_exact":
+    if metric in {"token_f1", "f1"}:
+        scored_refs = [(token_f1_score(prediction_text, value), normalize_answer(value)) for value in gold_values]
+        score, gold = max(scored_refs, default=(0.0, ""))
+    elif metric == "relaxed_exact":
         score = 0.0
+        gold = gold_norms[0] if gold_norms else ""
         for gold in gold_norms:
             if gold and (pred_norm == gold or gold in pred_norm):
                 score = 1.0
                 break
     else:
         score = float(bool(pred_norm) and pred_norm in set(gold_norms))
+        gold = gold_norms[0] if gold_norms else ""
     return {
         "prediction": pred_norm,
-        "gold": gold_norms[0] if gold_norms else "",
+        "gold": gold,
         "score": score,
         "invalid": not bool(pred_norm),
     }
