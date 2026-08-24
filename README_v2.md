@@ -15,11 +15,10 @@ Current eval set is not only OCR:
 | POPE | yes/no object existence | object existence yes/no |
 | SQA | science multi-choice | science/diagram/common-sense MC |
 | VQA-v2 | general short-answer VQA | general short answer |
-| TextVQA | scene text short-answer VQA | scene text OCR QA |
 | VizWiz | real user VQA, often OCR/unanswerable | short answer + realistic OCR |
 | OCRBench | text recognition/doc/KIE/formula/structured OCR | OCR, document, KIE, formula, rendered text |
 
-The target is to improve general retention without losing TextVQA/OCRBench gains.
+The target is to improve general retention without losing OCRBench gains.
 
 There is also a longer-term target: storing long textual context as images and letting the visual-delta path retrieve useful information from that visual memory. Rendered text is therefore not only an OCR augmentation block; it is the first controlled training source for long-context-as-image behavior.
 
@@ -45,7 +44,6 @@ step1500, OPD top1024, 1000 samples per benchmark, 8 GPUs
 
 | Benchmark | Teacher | Adapter | Drop | Retention | Agreement |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| TextVQA | 82.3 | 81.6 | -0.7 | 97.3% | 90.2% |
 | OCRBench | 80.7 | 78.3 | -2.4 | 95.4% | 86.9% |
 | MMStar | 64.9 | 49.8 | -15.1 | 65.6% | 62.0% |
 | GQA | 61.6 | 51.9 | -9.7 | 73.7% | 65.0% |
@@ -59,7 +57,7 @@ step1500, OPD top1024, 1000 samples per benchmark, 8 GPUs
 
 Interpretation:
 
-- OCR/TextVQA retention is strong.
+- OCR retention is strong.
 - General VQA and reasoning benchmarks still drop too much, especially MMStar, GQA, SQA, VQA-v2, and VizWiz.
 - The next 6k-step training mix should add more general visual/instruction data while keeping OCR at 30%.
 
@@ -73,7 +71,7 @@ Use a 100% mixture with OCR capped at about 30%.
 | --- | ---: | --- |
 | Pixmo-clean | 35% | broad visual coverage, object/count/color/spatial/general QA |
 | FineVision LLaVA-Instruct-150K | 35% | instruction-following general VQA and richer reasoning |
-| Current clean OCR mix | 30% | TextVQA/OCRBench/doc/chart/KIE/formula coverage |
+| Current clean OCR mix | 30% | OCRBench/doc/chart/KIE/formula coverage |
 
 For a 6k-step run with global batch 32, the model sees exactly 192k training examples:
 
@@ -190,7 +188,7 @@ For current OCR mix:
 
 - Use `ocrbench_target_mix_v2_80k` as the base clean OCR source.
 - Preserve original question/answer.
-- Keep all major sources: docvqa, pdfvqa, ureader_qa_processed, textvqa, st_vqa, chartqa, plotqa, infographic_vqa, sroie, funsd, ocrvqa, hme100k, cord_receipt_kie.
+- Keep all major sources: docvqa, pdfvqa, ureader_qa_processed, st_vqa, chartqa, plotqa, infographic_vqa, sroie, funsd, ocrvqa, hme100k, cord_receipt_kie.
 - Drop only obviously bad rows: empty answer, unanswerable labels, full-page OCR dumps, binary yes/no if they appear again.
 
 For rendered real-text validation sources:
@@ -381,7 +379,7 @@ Shuffle the final combined JSONL after source sampling.
 Compared with `ocrbench_target_mix_v2_80k` alone:
 
 - Better MMStar/MMB/SQA/GQA/VQA-v2 retention because 75% of the data pool is general visual/instruction data.
-- TextVQA/OCRBench should remain strong because 25% of the data pool is still clean OCR-heavy data.
+- OCRBench should remain strong because 25% of the data pool is still clean OCR-heavy data.
 - Less risk of the model becoming an OCR-only adapter.
 
 Compared with `pixmo_clean_ocrmix_300k`:
@@ -423,11 +421,10 @@ bash scripts/train_qwen_delta.sh
 Evaluate every 500 steps on:
 
 ```text
-mmstar gqa mmb mmb-cn mme pope sqa vqav2 textvqa vizwiz ocrbench
+mmstar gqa mmb mmb-cn mme pope sqa vqav2 vizwiz ocrbench
 ```
 
 Primary regression checks:
 
-- TextVQA should not drop materially from the current 81.6 adapter result.
 - OCRBench should stay close to the current 78.3 adapter result.
 - MMStar/SQA/GQA/MMB should improve relative to the OCR-focused run.

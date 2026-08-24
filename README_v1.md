@@ -84,7 +84,7 @@ MODEL_KIND=qwen scripts/eval_benchmark.sh
 ```
 
 Generic Qwen benchmark eval uses the shared benchmark registry. Supported names are:
-`mmstar`, `gqa`, `mmb`, `mmb-cn`, `mme`, `pope`, `sqa`, `vqav2`, `textvqa`, `vizwiz`, `ocrbench`.
+`mmstar`, `gqa`, `mmb`, `mmb-cn`, `mme`, `pope`, `sqa`, `vqav2`, `vizwiz`, `ocrbench`.
 
 Run one benchmark:
 
@@ -98,7 +98,7 @@ MODEL_KIND=qwen scripts/eval_benchmark.sh ocrbench \
 Run an explicit benchmark list and write aggregate CSV/JSON summaries:
 
 ```bash
-MODEL_KIND=qwen scripts/eval_benchmark.sh mmstar ocrbench textvqa \
+MODEL_KIND=qwen scripts/eval_benchmark.sh mmstar ocrbench \
   --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/RUN_NAME \
   --step 1000
 ```
@@ -114,11 +114,11 @@ MODEL_KIND=qwen scripts/eval_benchmark.sh --benchmarks all \
 Qwen 1k benchmark output for `RUN_NAME` is saved under
 `artifacts/eval/qwen_topk1024_freezeqkv/RUN_NAME/`.
 
-| Model | GQA | MMB | MMB-CN | MME | POPE | SQA | VQA-v2 | TextVQA | VizWiz | OCRBench |
-|-------|-----|-----|--------|-----|------|-----|--------|---------|--------|----------|
-| Base Teacher | 61.6 | 87.5 | 87.7 | 84.7 | 89.3 | 93.3 | 80.9 | 82.3 | 25.9 | 80.7 |
-| embedding_adapter | 54.1 | 82.4 | 82.0 | 79.4 | 86.3 | 81.4 | 75.1 | 63.2 | 18.5 | 49.5 |
-| Gap | -7.5 | -5.1 | -5.7 | -5.3 | -3.0 | -11.9 | -5.8 | -19.1 | -7.3 | -31.2 |
+| Model | GQA | MMB | MMB-CN | MME | POPE | SQA | VQA-v2 | VizWiz | OCRBench |
+|-------|-----|-----|--------|-----|------|-----|--------|--------|----------|
+| Base Teacher | 61.6 | 87.5 | 87.7 | 84.7 | 89.3 | 93.3 | 80.9 | 25.9 | 80.7 |
+| embedding_adapter | 54.1 | 82.4 | 82.0 | 79.4 | 86.3 | 81.4 | 75.1 | 18.5 | 49.5 |
+| Gap | -7.5 | -5.1 | -5.7 | -5.3 | -3.0 | -11.9 | -5.8 | -7.3 | -31.2 |
 
 | Model | Total Time | Prefilling Time | FLOPs | KV Cache | POPE F1 | Speedup Total | Speedup Prefilling |
 |-------|------------|-----------------|-------|----------|---------|---------------|--------------------|
@@ -147,20 +147,20 @@ generic answers.
 
 Adapter scores, 1000-sample subsets:
 
-| Step | MMStar | GQA | MMB | MMB-CN | MME | POPE | SQA | VQA-v2 | TextVQA | VizWiz | OCRBench |
-|------|--------|-----|-----|--------|-----|------|-----|--------|---------|--------|----------|
-| 1000 | 0.479 | 0.511 | 0.799 | 0.800 | 0.770 | 0.823 | 0.810 | 0.685 | 0.530 | 0.091 | 0.395 |
-| 2000 | 0.525 | 0.540 | 0.835 | 0.823 | 0.784 | 0.857 | 0.814 | 0.744 | 0.635 | 0.188 | 0.495 |
-| 3000 | 0.537 | 0.545 | 0.834 | 0.827 | 0.795 | 0.872 | 0.823 | 0.760 | 0.662 | 0.204 | 0.532 |
-| 4000 | 0.522 | 0.553 | 0.833 | 0.824 | 0.796 | 0.865 | 0.822 | 0.763 | 0.670 | 0.201 | 0.527 |
-| 5000 | 0.530 | 0.545 | 0.837 | 0.825 | 0.800 | 0.867 | 0.818 | 0.767 | 0.674 | 0.213 | 0.545 |
-| 6000 | 0.538 | 0.554 | 0.845 | 0.820 | 0.803 | 0.872 | 0.821 | 0.771 | 0.678 | 0.215 | 0.541 |
-| 7000 | 0.538 | 0.562 | 0.842 | 0.828 | 0.804 | 0.875 | 0.818 | 0.773 | 0.679 | 0.215 | 0.547 |
-| 8000 | 0.540 | 0.562 | 0.845 | 0.822 | 0.808 | 0.874 | 0.822 | 0.776 | 0.680 | 0.214 | 0.543 |
-| 9000 | 0.541 | 0.563 | 0.845 | 0.821 | 0.804 | 0.876 | 0.816 | 0.780 | 0.688 | 0.222 | 0.541 |
-| 10000 | 0.544 | 0.567 | 0.845 | 0.821 | 0.804 | 0.874 | 0.817 | 0.776 | 0.686 | 0.222 | 0.543 |
-| 11000 | 0.542 | 0.564 | 0.844 | 0.822 | 0.805 | 0.873 | 0.817 | 0.776 | 0.687 | 0.219 | 0.543 |
-| 12000 | 0.539 | 0.564 | 0.845 | 0.823 | 0.806 | 0.875 | 0.817 | 0.772 | 0.686 | 0.220 | 0.543 |
+| Step | MMStar | GQA | MMB | MMB-CN | MME | POPE | SQA | VQA-v2 | VizWiz | OCRBench |
+|------|--------|-----|-----|--------|-----|------|-----|--------|--------|----------|
+| 1000 | 0.479 | 0.511 | 0.799 | 0.800 | 0.770 | 0.823 | 0.810 | 0.685 | 0.091 | 0.395 |
+| 2000 | 0.525 | 0.540 | 0.835 | 0.823 | 0.784 | 0.857 | 0.814 | 0.744 | 0.188 | 0.495 |
+| 3000 | 0.537 | 0.545 | 0.834 | 0.827 | 0.795 | 0.872 | 0.823 | 0.760 | 0.204 | 0.532 |
+| 4000 | 0.522 | 0.553 | 0.833 | 0.824 | 0.796 | 0.865 | 0.822 | 0.763 | 0.201 | 0.527 |
+| 5000 | 0.530 | 0.545 | 0.837 | 0.825 | 0.800 | 0.867 | 0.818 | 0.767 | 0.213 | 0.545 |
+| 6000 | 0.538 | 0.554 | 0.845 | 0.820 | 0.803 | 0.872 | 0.821 | 0.771 | 0.215 | 0.541 |
+| 7000 | 0.538 | 0.562 | 0.842 | 0.828 | 0.804 | 0.875 | 0.818 | 0.773 | 0.215 | 0.547 |
+| 8000 | 0.540 | 0.562 | 0.845 | 0.822 | 0.808 | 0.874 | 0.822 | 0.776 | 0.214 | 0.543 |
+| 9000 | 0.541 | 0.563 | 0.845 | 0.821 | 0.804 | 0.876 | 0.816 | 0.780 | 0.222 | 0.541 |
+| 10000 | 0.544 | 0.567 | 0.845 | 0.821 | 0.804 | 0.874 | 0.817 | 0.776 | 0.222 | 0.543 |
+| 11000 | 0.542 | 0.564 | 0.844 | 0.822 | 0.805 | 0.873 | 0.817 | 0.776 | 0.219 | 0.543 |
+| 12000 | 0.539 | 0.564 | 0.845 | 0.823 | 0.806 | 0.875 | 0.817 | 0.772 | 0.220 | 0.543 |
 
 Best observed checkpoints:
 
@@ -174,7 +174,6 @@ Best observed checkpoints:
 | POPE | 9000 | 0.876 |
 | SQA | 3000 | 0.823 |
 | VQA-v2 | 9000 | 0.780 |
-| TextVQA | 9000 | 0.688 |
 | VizWiz | 9000/10000 | 0.222 |
 | OCRBench | 7000 | 0.547 |
 
@@ -262,7 +261,7 @@ Use that file with `--data-root /lustre-data/leijingdi/code/delta-vision/data/pi
 - Path: `/lustre-data/leijingdi/code/vision-kv-inject/data/pixmo_clean_ocrmix_300k/train.jsonl`
 - Manifest: `/lustre-data/leijingdi/code/vision-kv-inject/data/pixmo_clean_ocrmix_300k/manifest.json`
 - Samples: 300,000
-- Mix: `pixmo_clean` 135,000; `docvqa` 22,500; `pdfvqa` 11,250; `ureader_qa_processed` 11,250; `textvqa` 24,750; `st_vqa` 20,250; `infographic_vqa` 11,250; `chartqa` 20,250; `plotqa` 13,500; `sroie` 9,000; `invoices_receipts` 3,750; `funsd` 2,250; `ocrvqa` 15,000
+- Mix: `pixmo_clean` 135,000; `docvqa` 22,500; `pdfvqa` 11,250; `ureader_qa_processed` 11,250; `st_vqa` 20,250; `infographic_vqa` 11,250; `chartqa` 20,250; `plotqa` 13,500; `sroie` 9,000; `invoices_receipts` 3,750; `funsd` 2,250; `ocrvqa` 15,000
 - Format: `{image, image_root, question, answer, source}`
 - Token stats: `/lustre-data/leijingdi/code/vision-kv-inject/artifacts/data_stats/ocrmix300k_token_stats_exact.json`
 - Use sample-normalized training loss for this mix: `--loss-normalization sample`

@@ -82,13 +82,6 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         default_data="data/benchmarks/vqav2/validation.jsonl",
         answer_instruction="Answer with only one word or a short phrase. Do not explain your answer.",
     ),
-    "textvqa": BenchmarkSpec(
-        name="textvqa",
-        display_name="TextVQA",
-        metric="vqa",
-        default_data="data/benchmarks/textvqa/validation.jsonl",
-        answer_instruction="Answer with only one word or a short phrase. Do not explain your answer.",
-    ),
     "realworldqa": BenchmarkSpec(
         name="realworldqa",
         display_name="RealWorldQA",
@@ -128,9 +121,6 @@ def canonical_benchmark_name(name: str) -> str:
         "vqa": "vqav2",
         "vqa-v2": "vqav2",
         "vqa^v2": "vqav2",
-        "vqa-text": "textvqa",
-        "vqa^text": "textvqa",
-        "text-vqa": "textvqa",
         "realworld": "realworldqa",
         "real-world-qa": "realworldqa",
         "real-worldqa": "realworldqa",
@@ -396,7 +386,7 @@ def normalize_answer(text: Any) -> str:
 
 
 def normalize_vqa_answer(text: Any) -> str:
-    """EvalAI-style answer normalization used by VQAv2/TextVQA."""
+    """EvalAI-style answer normalization used by VQAv2."""
     out = _stringify(text).lower().replace(",", "").replace("?", "").replace("'s", " 's")
     out = out.replace("\n", " ").replace("\t", " ").strip()
     for punct in _VQA_PUNCTUATIONS:

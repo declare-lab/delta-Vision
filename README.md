@@ -190,7 +190,7 @@ scripts/eval_benchmark.sh
 Supported benchmark names:
 
 ```text
-mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, textvqa, realworldqa, perceptionbench
+mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, realworldqa, perceptionbench
 ```
 
 PerceptionBench expects a converted JSONL file at

@@ -99,7 +99,7 @@ Single eval:
   scripts/eval_benchmark.sh sqa --model-kind qwen --run-dir RUN --step 12000
 
 Batch eval:
-  scripts/eval_benchmark.sh --benchmarks sqa,vqav2,textvqa --run-dir RUN --step 12000
+  scripts/eval_benchmark.sh --benchmarks sqa,vqav2,realworldqa --run-dir RUN --step 12000
   scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --steps "1000 2000 3000"
   scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --all-ckpts
 
