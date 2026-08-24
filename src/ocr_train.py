@@ -99,7 +99,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=2.0)
     parser.add_argument("--kl-topk", type=int, default=1024)
     parser.add_argument("--lambda-logit", type=float, default=1.0)
-    parser.add_argument("--lambda-ce", type=float, default=0.0, help="Optional student CE on all answer tokens; 0 keeps KL-only behavior.")
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--output-mode", default="embedding_adapter")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
@@ -271,75 +270,6 @@ def masked_unaligned_topk_kl(
     return flat_losses.float().mean().to(dtype=student_logits.dtype), answer_counts
 
 
-def masked_unaligned_student_answer_ce(
-    student_logits: Tensor,
-    student_ids: Tensor,
-    student_answer_mask: Tensor,
-    teacher_answer_mask: Tensor,
-) -> Tensor:
-    losses: list[Tensor] = []
-    for batch_idx in range(student_logits.shape[0]):
-        s_mask = student_answer_mask[batch_idx, 1:].bool()
-        t_mask = teacher_answer_mask[batch_idx, 1:].bool()
-        s = student_logits[batch_idx, :-1][s_mask]
-        targets = student_ids[batch_idx, 1:][s_mask]
-        count = min(int(s.shape[0]), int(t_mask.sum().item()), int(targets.shape[0]))
-        if count <= 0:
-            continue
-        s = s[-count:].float()
-        targets = targets[-count:].long()
-        losses.append(F.cross_entropy(s, targets, reduction="none"))
-    if not losses:
-        return student_logits.new_zeros((), dtype=torch.float32)
-    return torch.cat(losses).mean()
-
-
-def masked_unaligned_answer_diagnostics(
-    student_logits: Tensor,
-    teacher_logits: Tensor,
-    student_ids: Tensor,
-    student_answer_mask: Tensor,
-    teacher_answer_mask: Tensor,
-) -> dict[str, Tensor]:
-    teacher_ce_losses: list[Tensor] = []
-    student_correct: list[Tensor] = []
-    teacher_correct: list[Tensor] = []
-    top1_agree: list[Tensor] = []
-    for batch_idx in range(student_logits.shape[0]):
-        s_mask = student_answer_mask[batch_idx, 1:].bool()
-        t_mask = teacher_answer_mask[batch_idx, 1:].bool()
-        s = student_logits[batch_idx, :-1][s_mask]
-        t = teacher_logits[batch_idx, :-1][t_mask]
-        targets = student_ids[batch_idx, 1:][s_mask]
-        count = min(int(s.shape[0]), int(t.shape[0]), int(targets.shape[0]))
-        if count <= 0:
-            continue
-        s = s[-count:].float()
-        t = t[-count:].float()
-        targets = targets[-count:].long()
-        s_top1 = s.argmax(dim=-1)
-        t_top1 = t.argmax(dim=-1)
-        teacher_ce_losses.append(F.cross_entropy(t, targets, reduction="none"))
-        student_correct.append(s_top1.eq(targets).float())
-        teacher_correct.append(t_top1.eq(targets).float())
-        top1_agree.append(s_top1.eq(t_top1).float())
-
-    if not teacher_ce_losses:
-        zero = student_logits.new_zeros((), dtype=torch.float32)
-        return {
-            "teacher_ce": zero,
-            "student_target_acc": zero,
-            "teacher_target_acc": zero,
-            "top1_agreement": zero,
-        }
-    return {
-        "teacher_ce": torch.cat(teacher_ce_losses).mean(),
-        "student_target_acc": torch.cat(student_correct).mean(),
-        "teacher_target_acc": torch.cat(teacher_correct).mean(),
-        "top1_agreement": torch.cat(top1_agree).mean(),
-    }
-
-
 def main() -> None:
     args = parse_args()
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -443,11 +373,6 @@ def main() -> None:
         current_lr = set_engine_lr(engine, base_lrs, lr_multiplier(args, step - 1))
         accum: dict[str, float] = {
             "logit_kl": 0.0,
-            "student_ce": 0.0,
-            "teacher_ce": 0.0,
-            "student_target_acc": 0.0,
-            "teacher_target_acc": 0.0,
-            "top1_agreement": 0.0,
             "loss": 0.0,
             "answer_tokens": 0.0,
         }
@@ -477,7 +402,7 @@ def main() -> None:
             with torch.no_grad():
                 teacher = model(**teacher_inputs, return_dict=True, use_cache=False)
                 teacher_logits = teacher.logits.detach()
-            student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs, collect_states=False)
+            student_logits, _, _ = qwen_embedding_adapter_logits(model, engine.module, student_inputs)
 
             kl, answer_counts = masked_unaligned_topk_kl(
                 student_logits,
@@ -488,28 +413,10 @@ def main() -> None:
                 temperature=args.temperature,
                 topk=args.kl_topk,
             )
-            diagnostics = masked_unaligned_answer_diagnostics(
-                student_logits,
-                teacher_logits,
-                student_ids,
-                student_answer_mask,
-                teacher_answer_mask,
-            )
-            ce = masked_unaligned_student_answer_ce(
-                student_logits,
-                student_ids,
-                student_answer_mask,
-                teacher_answer_mask,
-            ).to(dtype=student_logits.dtype)
-            unscaled_loss = float(args.lambda_logit) * kl + float(args.lambda_ce) * ce
+            unscaled_loss = float(args.lambda_logit) * kl
             loss = unscaled_loss / float(args.gradient_accumulation_steps)
             engine.backward(loss)
             accum["logit_kl"] += float(kl.detach()) / float(args.gradient_accumulation_steps)
-            accum["student_ce"] += float(ce.detach()) / float(args.gradient_accumulation_steps)
-            accum["teacher_ce"] += float(diagnostics["teacher_ce"].detach()) / float(args.gradient_accumulation_steps)
-            accum["student_target_acc"] += float(diagnostics["student_target_acc"].detach()) / float(args.gradient_accumulation_steps)
-            accum["teacher_target_acc"] += float(diagnostics["teacher_target_acc"].detach()) / float(args.gradient_accumulation_steps)
-            accum["top1_agreement"] += float(diagnostics["top1_agreement"].detach()) / float(args.gradient_accumulation_steps)
             accum["loss"] += float(unscaled_loss.detach()) / float(args.gradient_accumulation_steps)
             accum["answer_tokens"] += float(answer_counts.mean().item()) / float(args.gradient_accumulation_steps)
         engine.step()
@@ -529,9 +436,6 @@ def main() -> None:
                     handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 print(
                     f"step={step} loss={payload['loss']:.6f} kl={payload['logit_kl']:.6f} "
-                    f"student_ce={payload['student_ce']:.6f} teacher_ce={payload['teacher_ce']:.6f} "
-                    f"student_acc={payload['student_target_acc']:.3f} teacher_acc={payload['teacher_target_acc']:.3f} "
-                    f"agree={payload['top1_agreement']:.3f} "
                     f"answer_tokens={payload['answer_tokens']:.1f} lr={payload['lr']:.3e} "
                     f"global_batch={payload['global_batch']}",
                     flush=True,

@@ -1975,8 +1975,6 @@ def qwen_embedding_adapter_logits_prepared(
     prefix_attention_mask: Tensor,
     text_position_embeddings: tuple[Tensor, Tensor] | None = None,
     visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
-    collect_states: bool = False,
-    collect_state_indices: set[int] | None = None,
     logits_to_keep: int = 0,
     use_hf_attention: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
@@ -1986,14 +1984,6 @@ def qwen_embedding_adapter_logits_prepared(
     compile_exact = torch.compiler.is_compiling()
     # Pre-compute all visual memories in one batched BMM
     all_vis_memories = adapter.all_visual_memories_batched(visual_memory)  # [L, B, N, H]
-    states = None
-    if collect_states:
-        if collect_state_indices is None:
-            states = [h]
-        else:
-            states = [h.new_empty(0) for _ in range(len(layers) + 1)]
-            if 0 in collect_state_indices:
-                states[0] = h
     for layer_idx, layer in enumerate(layers):
         attn = layer.self_attn
         normed_text = _eager_module_call(layer.input_layernorm, h) if compile_exact else layer.input_layernorm(h)
@@ -2049,14 +2039,8 @@ def qwen_embedding_adapter_logits_prepared(
         h = _eager_module_call(layer.post_attention_layernorm, h) if compile_exact else layer.post_attention_layernorm(h)
         h = _eager_module_call(layer.mlp, h) if compile_exact else layer.mlp(h)
         h = residual + h
-        if states is not None:
-            state_idx = layer_idx + 1
-            if collect_state_indices is None:
-                states.append(h)
-            elif state_idx in collect_state_indices:
-                states[state_idx] = h
     logits = qwen_lm_head_logits(model, language_model, h, text_mask, logits_to_keep=logits_to_keep)
-    return logits, text_mask, states
+    return logits, text_mask, None
 
 
 def qwen_embedding_adapter_logits_prepared_hf_attention(
@@ -2363,9 +2347,7 @@ def qwen_embedding_adapter_logits_from_tensors(
     initial_hidden: Tensor,
     position_ids: Tensor,
     *,
-    collect_states: bool = False,
     compact_no_padding: bool = False,
-    collect_state_indices: set[int] | None = None,
     logits_to_keep: int = 0,
     reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
@@ -2390,8 +2372,6 @@ def qwen_embedding_adapter_logits_from_tensors(
         prefix_attention_mask=prepared["prefix_attention_mask"],
         text_position_embeddings=prepared["text_position_embeddings"],
         visual_position_embeddings=prepared["visual_position_embeddings"],
-        collect_states=collect_states,
-        collect_state_indices=collect_state_indices,
         logits_to_keep=logits_to_keep,
     )
 
@@ -2403,9 +2383,7 @@ def qwen_embedding_adapter_logits(
     *,
     initial_hidden: Tensor | None = None,
     position_ids: Tensor | None = None,
-    collect_states: bool = False,
     compact_no_padding: bool = False,
-    collect_state_indices: set[int] | None = None,
     logits_to_keep: int = 0,
     reuse_position_embeddings: bool = True,
 ) -> tuple[Tensor, Tensor, list[Tensor] | None]:
@@ -2419,9 +2397,7 @@ def qwen_embedding_adapter_logits(
         inputs["mm_token_type_ids"],
         initial_hidden,
         position_ids,
-        collect_states=collect_states,
         compact_no_padding=compact_no_padding,
-        collect_state_indices=collect_state_indices,
         logits_to_keep=logits_to_keep,
         reuse_position_embeddings=reuse_position_embeddings,
     )

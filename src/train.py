@@ -146,7 +146,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--visual-adapter-rank", type=int, default=128)
     parser.add_argument("--supervision-loss", choices=("distill", "ce"), default="distill")
     parser.add_argument("--lambda-logit", type=float, default=2.0)
-    parser.add_argument("--lambda-kv-mse", type=float, default=0.0)
     parser.add_argument("--loss-normalization", choices=("token", "sample"), default="token")
     parser.add_argument("--micro-batch-size-per-gpu", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -499,7 +498,6 @@ def compute_qwen_loss_for_prepared_inputs(
             model,
             adapter,
             inputs,
-            collect_states=False,
         )
         ce, per_sample_supervision, answer_counts = masked_ce_loss(
             student_logits,
@@ -511,8 +509,6 @@ def compute_qwen_loss_for_prepared_inputs(
             "loss": float(ce.detach()),
             "ce": float(ce.detach()),
             "logit_kl": 0.0,
-            "kv_mse": 0.0,
-            "visual_mass": 0.0,
             "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
             "answer_tokens": float(answer_counts.sum().item()) / max(1, answer_counts.shape[0]),
         }
@@ -548,7 +544,6 @@ def compute_qwen_loss_for_prepared_inputs(
         inputs,
         initial_hidden=initial_hidden,
         position_ids=full_position_ids,
-        collect_states=False,
     )
     if student_text_mask.shape != text_mask.shape:
         raise RuntimeError("student/teacher text masks differ")
@@ -562,15 +557,12 @@ def compute_qwen_loss_for_prepared_inputs(
         args.kl_topk,
         normalization=args.loss_normalization,
     )
-    kv_mse = student_logits.new_zeros(())
-    loss = args.lambda_logit * logit_kl + args.lambda_kv_mse * kv_mse
+    loss = args.lambda_logit * logit_kl
 
     metrics = {
         "loss": float(loss.detach()),
         "ce": 0.0,
         "logit_kl": float(logit_kl.detach()),
-        "kv_mse": float(kv_mse.detach()),
-        "visual_mass": 0.0,
         "text_tokens": float(student_text_mask.sum().item()) / max(1, student_text_mask.shape[0]),
         "answer_tokens": float(answer_counts.sum().item()) / max(1, answer_counts.shape[0]),
     }
@@ -1045,7 +1037,6 @@ def run_qwen(args: argparse.Namespace) -> None:
                 "step": int(global_step),
                 **reduced,
                 "lambda_logit": float(args.lambda_logit),
-                "lambda_kv_mse": float(args.lambda_kv_mse),
                 "global_batch": int(world_size * args.gradient_accumulation_steps * args.micro_batch_size_per_gpu),
             }
             if is_rank0():
@@ -1056,7 +1047,6 @@ def run_qwen(args: argparse.Namespace) -> None:
                     f"step={global_step} loss={float(payload['loss']):.6f} "
                     f"ce={float(payload.get('ce', 0.0)):.6f} "
                     f"logit_kl={float(payload['logit_kl']):.6f} "
-                    f"kv_mse={float(payload['kv_mse']):.6f} visual_mass={float(payload['visual_mass']):.6f} "
                     f"lr={float(payload['lr']):.3e} global_batch={payload['global_batch']}",
                     flush=True,
                 )

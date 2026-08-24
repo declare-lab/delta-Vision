@@ -49,7 +49,6 @@ CMD=(
   --kl-topk "${KL_TOPK:-1024}"
   --temperature "${TEMPERATURE:-2.0}"
   --lambda-logit "${LAMBDA_LOGIT:-1.0}"
-  --lambda-ce "${LAMBDA_CE:-0.0}"
   --visual-adapter-rank "${VISUAL_ADAPTER_RANK:-128}"
   --max-context-chars "${MAX_CONTEXT_CHARS:-0}"
   --deepspeed-config "${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}"

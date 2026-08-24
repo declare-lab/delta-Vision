@@ -1003,7 +1003,6 @@ def generate_adapter_qwen(
                 inputs,
                 initial_hidden=initial_hidden,
                 position_ids=position_ids,
-                collect_states=False,
                 compact_no_padding=True,
                 logits_to_keep=1 if last_logits_only else 0,
             )
@@ -1086,7 +1085,6 @@ def generate_adapter_qwen_batch(
                 step_inputs,
                 initial_hidden=initial_hidden,
                 position_ids=position_ids,
-                collect_states=False,
                 compact_no_padding=True,
                 logits_to_keep=1 if last_logits_only else 0,
             )
@@ -1272,7 +1270,6 @@ def build_qwen_adapter_logits_fn(
                 inputs,
                 initial_hidden=initial_hidden,
                 position_ids=position_ids,
-                collect_states=False,
                 compact_no_padding=True,
                 logits_to_keep=logits_to_keep,
             )
@@ -1285,7 +1282,6 @@ def build_qwen_adapter_logits_fn(
                 inputs["mm_token_type_ids"],
                 initial_hidden,
                 position_ids,
-                collect_states=False,
                 compact_no_padding=True,
                 logits_to_keep=logits_to_keep,
             )
@@ -1709,7 +1705,6 @@ def evaluate_qwen_benchmark_shard(
                     dict(inputs),
                     initial_hidden=initial_hidden,
                     position_ids=position_ids,
-                    collect_states=False,
                     compact_no_padding=True,
                     logits_to_keep=1 if last_logits_only else 0,
                 )
@@ -2050,7 +2045,6 @@ def evaluate_qwen_benchmark_shard_batched(
                     dict(batch_inputs),
                     initial_hidden=initial_hidden,
                     position_ids=position_ids,
-                    collect_states=False,
                     compact_no_padding=True,
                     logits_to_keep=1 if last_logits_only else 0,
                 )
