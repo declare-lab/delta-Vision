@@ -100,8 +100,8 @@ Single eval:
 
 Batch eval:
   scripts/eval_benchmark.sh --benchmarks sqa,vqav2,realworldqa --run-dir RUN --step 12000
-  scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --steps "1000 2000 3000"
-  scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --all-ckpts
+  scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --steps "1000 2000 3000"  # default benchmark set
+  scripts/eval_benchmark.sh --benchmarks all --run-dir RUN --all-ckpts              # default benchmark set
 
 Options:
   --model-kind llava|qwen  Model family. Can also set MODEL_KIND.
@@ -271,7 +271,7 @@ for result_path in sorted(out_root.glob(f"step*_*_{max_samples}samples_{num_shar
     try:
         step_text, rest = name[4:].split("_", 1)
         benchmark = rest.rsplit(f"_{max_samples}samples_{num_shards}gpu", 1)[0]
-        step = int(step_text)
+        step = int(step_text) if step_text.isdigit() else step_text
     except ValueError:
         continue
     data = json.loads(result_path.read_text(encoding="utf-8"))
@@ -308,7 +308,12 @@ for result_path in sorted(out_root.glob(f"step*_*_{max_samples}samples_{num_shar
         "result_dir": str(result_path.parent),
     })
 
-rows.sort(key=lambda item: (int(item["step"]), str(item["benchmark"])))
+def step_sort_key(step):
+    if isinstance(step, int):
+        return (0, step)
+    return (1, str(step))
+
+rows.sort(key=lambda item: (*step_sort_key(item["step"]), str(item["benchmark"])))
 out_root.mkdir(parents=True, exist_ok=True)
 (out_root / "all_ckpt_benchmark_summary.json").write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
 fields = list(rows[0].keys()) if rows else [
@@ -329,7 +334,7 @@ for row in rows:
 with (out_root / "all_ckpt_scores_wide.csv").open("w", encoding="utf-8", newline="") as handle:
     writer = csv.writer(handle)
     writer.writerow(["step", *benchmarks])
-    for step in sorted(by_step):
+    for step in sorted(by_step, key=step_sort_key):
         writer.writerow([step, *[by_step[step].get(benchmark) for benchmark in benchmarks]])
 print(f"Wrote aggregate summaries under {out_root}")
 PY
@@ -363,6 +368,10 @@ fi
 if [[ "$MODEL_PATH" != /* ]]; then
   if [[ -e "$ROOT_DIR/$MODEL_PATH" ]]; then
     MODEL_PATH="$ROOT_DIR/$MODEL_PATH"
+  elif [[ -e "$MODEL_ROOT/$MODEL_PATH" ]]; then
+    MODEL_PATH="$MODEL_ROOT/$MODEL_PATH"
+  elif [[ "$MODEL_PATH" != */*/* && "$MODEL_PATH" == */* ]]; then
+    MODEL_PATH="$MODEL_PATH"
   else
     MODEL_PATH="$MODEL_ROOT/$MODEL_PATH"
   fi

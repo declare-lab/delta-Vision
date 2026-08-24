@@ -81,7 +81,15 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
 
   if [[ "$MODEL_PATH" != /* ]]; then
-    MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+    if [[ -e "$ROOT_DIR/$MODEL_PATH" ]]; then
+      MODEL_PATH="$ROOT_DIR/$MODEL_PATH"
+    elif [[ -e "$DATA_ROOT/$MODEL_PATH" ]]; then
+      MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+    elif [[ "$MODEL_PATH" != */*/* && "$MODEL_PATH" == */* ]]; then
+      MODEL_PATH="$MODEL_PATH"
+    else
+      MODEL_PATH="$DATA_ROOT/$MODEL_PATH"
+    fi
   fi
   if [[ "$DATA" != /* ]]; then
     if [[ -f "$ROOT_DIR/$DATA" ]]; then
@@ -193,11 +201,19 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
     fi
   fi
 
+  if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
+    while IFS='=' read -r name _; do
+      if [[ "$name" == NCCL_* ]]; then
+        unset "$name"
+      fi
+    done < <(env)
+    unset GLOO_SOCKET_IFNAME
+  elif [[ -n "${NCCL_NET:-}" ]]; then
+    export NCCL_NET
+  fi
   export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
-  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo}
-  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
-  export NCCL_NET=${NCCL_NET:-Socket}
-  unset NCCL_NET_PLUGIN 2>/dev/null || true
+  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
+  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}
 
   mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 
@@ -227,6 +243,7 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
     --save-every "${SAVE_EVERY:-500}"
     --output-mode "$OUTPUT_MODE"
     --deepspeed-config "$DS_CONFIG"
+    --dist-backend "${DIST_BACKEND:-nccl}"
     --seed "${SEED:-42}"
   )
 else

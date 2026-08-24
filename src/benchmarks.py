@@ -102,11 +102,24 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         name="rendered-context-qa",
         display_name="RenderedContextQA",
         metric="relaxed_exact",
-        default_data="data/rendered_context_qa_eval_v1/rendered_qa.jsonl",
+        default_data="data/benchmarks/rendered_qa_300_msmarco/msmarco_200_400_span_100.jsonl",
         answer_instruction="Answer directly with a short phrase.",
         max_new_tokens=48,
     ),
 }
+
+
+DEFAULT_BENCHMARK_NAMES: tuple[str, ...] = (
+    "mmstar",
+    "gqa",
+    "mmb",
+    "mmb-cn",
+    "mme",
+    "pope",
+    "sqa",
+    "vqav2",
+    "realworldqa",
+)
 
 
 def canonical_benchmark_name(name: str) -> str:
@@ -139,7 +152,7 @@ def canonical_benchmark_name(name: str) -> str:
 
 
 def all_benchmark_names() -> list[str]:
-    return list(BENCHMARK_SPECS)
+    return list(DEFAULT_BENCHMARK_NAMES)
 
 
 def parse_benchmark_names(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -647,11 +660,11 @@ def score_prediction(
 def summarize_metric(metric: str, scored: list[dict[str, Any]], rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     total = len(scored)
     invalid = sum(1 for item in scored if item.get("invalid"))
-    score = sum(float(item.get("score", 0.0)) for item in scored) / max(total, 1)
+    question_accuracy = sum(float(item.get("score", 0.0)) for item in scored) / max(total, 1)
     summary: dict[str, Any] = {
         "samples": total,
-        "score": score,
-        "accuracy": score,
+        "score": question_accuracy,
+        "accuracy": question_accuracy,
         "invalid_rate": invalid / max(total, 1),
     }
     if metric == "pope_f1":
@@ -672,7 +685,9 @@ def summarize_metric(metric: str, scored: list[dict[str, Any]], rows: list[dict[
         f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
         summary.update({"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn, "tn": tn})
     if metric == "mme" and rows is not None:
-        summary.update(_summarize_mme(scored, rows))
+        mme_summary = _summarize_mme(scored, rows)
+        summary.update(mme_summary)
+        summary["question_accuracy"] = question_accuracy
     return summary
 
 
@@ -695,8 +710,11 @@ def _summarize_mme(scored: list[dict[str, Any]], rows: list[dict[str, Any]]) -> 
         category_score = acc + acc_plus
         total_score += category_score
         category_scores[category] = {"acc": acc, "acc_plus": acc_plus, "score": category_score}
+    max_score = 200.0 * max(len(category_scores), 1)
     return {
         "mme_score": total_score,
+        "mme_score_max": max_score,
+        "mme_score_normalized": total_score / max_score,
         "mme_category_scores": category_scores,
     }
 

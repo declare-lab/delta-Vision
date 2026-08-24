@@ -187,10 +187,16 @@ The supported benchmark evaluation entry is:
 scripts/eval_benchmark.sh
 ```
 
-Supported benchmark names:
+Default benchmark names:
 
 ```text
-mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, realworldqa, perceptionbench
+mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, realworldqa
+```
+
+Additional benchmark names can be run explicitly:
+
+```text
+perceptionbench, rendered-context-qa
 ```
 
 PerceptionBench expects a converted JSONL file at

@@ -609,7 +609,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     torch.cuda.set_device(local_rank)
-    deepspeed.init_distributed()
+    deepspeed.init_distributed(dist_backend=args.dist_backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     is_main = rank == 0

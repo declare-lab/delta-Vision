@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import io
 import os
 from pathlib import Path
@@ -12,7 +13,13 @@ from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import AutoProcessor, AutoModelForImageTextToText, LlavaForConditionalGeneration, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    AutoModelForImageTextToText,
+    LlavaForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLMoeForConditionalGeneration,
+)
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 from transformers.masking_utils import create_causal_mask
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as llama_apply_rotary_pos_emb, repeat_kv as llama_repeat_kv
@@ -1383,14 +1390,19 @@ def load_frozen_qwen3vl(
     dtype: torch.dtype,
     device: torch.device,
     attn_implementation: str = "flash_attention_2",
-) -> tuple[Any, Qwen3VLForConditionalGeneration]:
+) -> tuple[Any, Qwen3VLForConditionalGeneration | Qwen3VLMoeForConditionalGeneration]:
     processor = AutoProcessor.from_pretrained(model_path)
     if attn_implementation == "auto":
         attn_implementation = "flash_attention_2"
     kwargs: dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
-    model = Qwen3VLForConditionalGeneration.from_pretrained(model_path, **kwargs).to(device)
+    config_path = Path(model_path) / "config.json"
+    model_type = ""
+    if config_path.exists():
+        model_type = str(json.loads(config_path.read_text(encoding="utf-8")).get("model_type") or "")
+    model_cls = Qwen3VLMoeForConditionalGeneration if model_type == "qwen3_vl_moe" else Qwen3VLForConditionalGeneration
+    model = model_cls.from_pretrained(model_path, **kwargs).to(device)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)

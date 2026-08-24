@@ -20,7 +20,10 @@ from src.model import (
 
 
 DEFAULT_MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
-DEFAULT_CKPT = os.environ.get("QWEN_EMBEDDING_ADAPTER_CKPT", "")
+DEFAULT_CKPT = os.environ.get(
+    "QWEN_EMBEDDING_ADAPTER_CKPT",
+    "/lustre-data/leijingdi/code/vision-kv-inject/artifacts/experiments/rendered_text_copy_300_kl_ds8_mb4_wandb_20260821_072442/qwen_embedding_adapter_step500.pt",
+)
 
 
 def parse_args() -> argparse.Namespace:
