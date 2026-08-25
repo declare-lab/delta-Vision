@@ -58,6 +58,7 @@ COMMON_TRAIN_ENV=(
   SUPERVISION_LOSS="${SUPERVISION_LOSS:-distill}"
   LAMBDA_LOGIT="${LAMBDA_LOGIT:-1.0}"
   VISUAL_ADAPTER_RANK="${VISUAL_ADAPTER_RANK:-128}"
+  SEED="${SEED:-44}"
   WANDB="$WANDB"
   WANDB_PROJECT="$WANDB_PROJECT"
   WANDB_MODE="$WANDB_MODE"
@@ -68,7 +69,7 @@ QWEN_TRAIN_ENV=(
   OUTPUT_MODE="${QWEN_OUTPUT_MODE:-embedding_adapter}"
   MICRO_BATCH_SIZE_PER_GPU="${MICRO_BATCH_SIZE_PER_GPU:-4}"
   GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-  DS_CONFIG="${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2_coeff.json}"
+  DS_CONFIG="${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}"
   DISTRIBUTED_ENGINE="${DISTRIBUTED_ENGINE:-deepspeed}"
   PIXEL_AREA_CACHE="${PIXEL_AREA_CACHE:-$ROOT_DIR/artifacts/cache/pixmo_ama_full_valid.clean.pixel_areas.json}"
   MASTER_PORT="${QWEN_MASTER_PORT:-29540}"
@@ -77,15 +78,18 @@ QWEN_TRAIN_ENV=(
 LLAVA_TRAIN_ENV=(
   MODEL_KIND=llava
   OUTPUT_MODE="${LLAVA_OUTPUT_MODE:-embedding_adapter}"
-  BATCH_SIZE="${LLAVA_BATCH_SIZE:-1}"
+  BATCH_SIZE="${LLAVA_BATCH_SIZE:-${MICRO_BATCH_SIZE_PER_GPU:-4}}"
+  DS_CONFIG="${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}"
+  DISTRIBUTED_ENGINE="${DISTRIBUTED_ENGINE:-deepspeed}"
+  GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
   DIST_BACKEND="${LLAVA_DIST_BACKEND:-${DIST_BACKEND:-nccl}}"
   MASTER_PORT="${LLAVA_MASTER_PORT:-29550}"
 )
 
 MODELS=(
-  "llava|llava-v1.5-13b|$ROOT_DIR/model/llava-v1.5-13b|unsupported_original_llava"
+  "llava|llava-1.5-7b-hf|$DATA_ROOT/models/llava-1.5-7b-hf|embedding_adapter"
   "llava|llava-1.5-13b-hf|$ROOT_DIR/model/llava-1.5-13b-hf|embedding_adapter"
-  "llava|llava-v1.6-mistral-7b-hf|$ROOT_DIR/model/llava-v1.6-mistral-7b-hf|kv_adapter"
+  "llava|llava-v1.6-mistral-7b-hf|$ROOT_DIR/model/llava-v1.6-mistral-7b-hf|embedding_adapter"
   "qwen|qwen3-vl-8b|$ROOT_DIR/model/Qwen3-VL-8B-Instruct|embedding_adapter"
   "qwen|qwen3-vl-30b-a3b|$ROOT_DIR/model/Qwen3-VL-30B-A3B-Instruct|embedding_adapter"
 )
@@ -116,11 +120,6 @@ run_eval() {
 for entry in "${MODELS[@]}"; do
   IFS='|' read -r model_kind model_label model_path model_output_mode <<< "$entry"
   if [[ -n "${MODEL_FILTER:-}" && ",${MODEL_FILTER}," != *",${model_label},"* ]]; then
-    continue
-  fi
-  if [[ "$model_output_mode" == "unsupported_original_llava" ]]; then
-    echo "=== SKIP ${model_label}: original LLaVA format is not supported by src.train HF loader ==="
-    echo "    Use model/llava-1.5-13b-hf for the HF-converted LLaVA-1.5 13B checkpoint."
     continue
   fi
   run_name="${GROUP_NAME}_${model_label}"

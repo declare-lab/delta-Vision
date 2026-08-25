@@ -90,22 +90,6 @@ BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
         answer_instruction="Answer directly with the final answer only.",
         max_new_tokens=8,
     ),
-    "perceptionbench": BenchmarkSpec(
-        name="perceptionbench",
-        display_name="PerceptionBench",
-        metric="llm_judge",
-        default_data="data/benchmarks/perceptionbench/test.jsonl",
-        answer_instruction="Answer directly with only the final answer. Do not explain your answer.",
-        max_new_tokens=128,
-    ),
-    "rendered-context-qa": BenchmarkSpec(
-        name="rendered-context-qa",
-        display_name="RenderedContextQA",
-        metric="relaxed_exact",
-        default_data="data/benchmarks/rendered_qa_300_msmarco/msmarco_200_400_span_100.jsonl",
-        answer_instruction="Answer directly with a short phrase.",
-        max_new_tokens=48,
-    ),
 }
 
 
@@ -138,12 +122,6 @@ def canonical_benchmark_name(name: str) -> str:
         "real-world-qa": "realworldqa",
         "real-worldqa": "realworldqa",
         "rwqa": "realworldqa",
-        "perception": "perceptionbench",
-        "perception-bench": "perceptionbench",
-        "perception-benchmark": "perceptionbench",
-        "rendered_context_qa": "rendered-context-qa",
-        "rendered-qa": "rendered-context-qa",
-        "context-qa": "rendered-context-qa",
     }
     key = aliases.get(key, key)
     if key not in BENCHMARK_SPECS:

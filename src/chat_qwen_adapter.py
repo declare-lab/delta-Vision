@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--history", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
-    if not args.checkpoint:
+    if args.mode in {"adapter", "both"} and not args.checkpoint:
         raise SystemExit("set --checkpoint or QWEN_EMBEDDING_ADAPTER_CKPT")
     return args
 
@@ -106,7 +106,7 @@ def generate_once(
     mode: str,
     model: Any,
     processor: Any,
-    adapter: Any,
+    adapter: Any | None,
     image: Image.Image | None,
     messages: list[dict[str, Any]],
     device: torch.device,
@@ -130,6 +130,8 @@ def generate_once(
         _, text = generate_teacher_qwen(model, processor, **common)
         outputs["teacher"] = text.strip()
     if mode in {"adapter", "both"}:
+        if adapter is None:
+            raise ValueError("adapter mode needs a loaded adapter checkpoint")
         _, text = generate_adapter_qwen(model, processor, adapter, **common, early_stop_metric=None)
         outputs["adapter"] = text.strip()
     return outputs
@@ -149,9 +151,9 @@ def print_help() -> None:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = resolve_path(args.checkpoint)
+    checkpoint = resolve_path(args.checkpoint) if args.checkpoint else None
     model_path = str(resolve_path(args.model_path)) if not Path(args.model_path).is_absolute() else args.model_path
-    if not checkpoint.exists():
+    if args.mode in {"adapter", "both"} and (checkpoint is None or not checkpoint.exists()):
         raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -159,12 +161,14 @@ def main() -> None:
     configure_torch_runtime()
     print(f"Loading model: {model_path}", flush=True)
     processor, model = load_frozen_qwen3vl(model_path, dtype, device, args.attn_implementation)
-    print(f"Loading adapter: {checkpoint}", flush=True)
-    adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
-    print(
-        f"Loaded adapter mode={adapter.mode} step={meta.get('global_step')} missing={len(meta['missing'])} unexpected={len(meta['unexpected'])}",
-        flush=True,
-    )
+    adapter = None
+    if args.mode in {"adapter", "both"}:
+        print(f"Loading adapter: {checkpoint}", flush=True)
+        adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
+        print(
+            f"Loaded adapter mode={adapter.mode} step={meta.get('global_step')} missing={len(meta['missing'])} unexpected={len(meta['unexpected'])}",
+            flush=True,
+        )
 
     image, image_path = load_image(args.image)
     mode = args.mode

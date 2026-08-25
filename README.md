@@ -144,6 +144,30 @@ WANDB=1 \
 scripts/train.sh
 ```
 
+Qwen3-VL-235B train/eval:
+
+```bash
+scripts/train_eval_qwen235b_kl_only.sh
+```
+
+This script downloads `Qwen/Qwen3-VL-235B-A22B-Instruct` to
+`model/Qwen3-VL-235B-A22B-Instruct`, then trains the Qwen `embedding_adapter` with the same
+KL settings as `scripts/train_eval_five_models_kl_only.sh`. Because the 235B backbone cannot
+be replicated per rank, it uses `QWEN_DEVICE_MAP=auto`, `NPROC_PER_NODE=1`, `NUM_SHARDS=1`,
+`MICRO_BATCH_SIZE_PER_GPU=1`, and `GRADIENT_ACCUMULATION_STEPS=32` to keep the effective
+global batch at 32 while one process shards the frozen backbone over all visible GPUs.
+
+Continue download or reuse the same run paths:
+
+```bash
+DOWNLOAD=0 STAMP=<same_stamp> scripts/train_eval_qwen235b_kl_only.sh
+```
+
+The Hugging Face download resumes automatically. Training restarts from step 0 unless an
+`INIT_CHECKPOINT` is supplied; use `SKIP_TRAIN=1` or `SKIP_EVAL=1` to run only one stage.
+For 235B adapter evaluation, `COMPILE_ADAPTER=0`, `ADAPTER_DECODE_CACHE=0`, and
+`EVAL_BATCH_SIZE=1` are the safe defaults.
+
 Qwen 12k-style mixed run:
 
 ```bash

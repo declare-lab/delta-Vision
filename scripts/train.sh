@@ -61,6 +61,8 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   MASTER_PORT=${MASTER_PORT:-29540}
   ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
   DTYPE=${DTYPE:-bfloat16}
+  QWEN_DEVICE_MAP=${QWEN_DEVICE_MAP:-}
+  QWEN_MAX_MEMORY=${QWEN_MAX_MEMORY:-}
   MAX_STEPS=${MAX_STEPS:-500}
   SAVE_EVERY=${SAVE_EVERY:-$MAX_STEPS}
   LOG_EVERY=${LOG_EVERY:-5}
@@ -68,6 +70,13 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
   REQUIRED_WORLD_SIZE=${REQUIRED_WORLD_SIZE:-$NPROC_PER_NODE}
   DISTRIBUTED_ENGINE=${DISTRIBUTED_ENGINE:-torch_grad_sync}
+  if [[ -n "$QWEN_DEVICE_MAP" && "$QWEN_DEVICE_MAP" != "none" && "$QWEN_DEVICE_MAP" != "replicated" ]]; then
+    if [[ "$NPROC_PER_NODE" != "1" ]]; then
+      echo "QWEN_DEVICE_MAP=$QWEN_DEVICE_MAP requires NPROC_PER_NODE=1 so one process can see all visible GPUs" >&2
+      exit 1
+    fi
+    REQUIRED_WORLD_SIZE=1
+  fi
 
   LR=${LR:-5e-5}
   LR_SCHEDULER=${LR_SCHEDULER:-constant}
@@ -129,6 +138,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
   echo "lambda_logit=$LAMBDA_LOGIT"
   echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
+  echo "qwen_device_map=${QWEN_DEVICE_MAP:-none} qwen_max_memory=${QWEN_MAX_MEMORY:-auto}"
 
   CMD=(
     "$PY" -m torch.distributed.run
@@ -162,6 +172,8 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     --deepspeed-config "$DS_CONFIG"
     --dtype "$DTYPE"
     --attn-implementation "$ATTN_IMPL"
+    --qwen-device-map "$QWEN_DEVICE_MAP"
+    --qwen-max-memory "$QWEN_MAX_MEMORY"
     --dist-backend "${DIST_BACKEND:-nccl}"
     --distributed-engine "$DISTRIBUTED_ENGINE"
     --grad-clip "${GRAD_CLIP:-1.0}"
@@ -180,11 +192,36 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
   fi
   OUTPUT_DIR=${OUTPUT_DIR:-$ROOT_DIR/artifacts/$RUN_NAME}
   LOG_FILE=${LOG_FILE:-$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log}
+  METRICS_JSONL=${METRICS_JSONL:-$OUTPUT_DIR/train_metrics.jsonl}
+  INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
   MODEL_PATH=${MODEL_PATH:-models/llava-1.5-7b-hf}
   DATA=${DATA:-data/pixmo_ama_train.jsonl}
   DS_CONFIG=${DS_CONFIG:-$ROOT_DIR/configs/ds_zero2.json}
   NPROC_PER_NODE=${NPROC_PER_NODE:-${NUM_GPUS:-8}}
   MASTER_PORT=${MASTER_PORT:-29500}
+  ATTN_IMPL=${ATTN_IMPL:-flash_attention_2}
+  DTYPE=${DTYPE:-bfloat16}
+  MAX_STEPS=${MAX_STEPS:-500}
+  SAVE_EVERY=${SAVE_EVERY:-$MAX_STEPS}
+  LOG_EVERY=${LOG_EVERY:-5}
+  BATCH_SIZE=${BATCH_SIZE:-4}
+  LR=${LR:-5e-5}
+  LR_SCHEDULER=${LR_SCHEDULER:-constant}
+  WARMUP_RATIO=${WARMUP_RATIO:-0.0}
+  WARMUP_START_LR_RATIO=${WARMUP_START_LR_RATIO:-0.0}
+  MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+  WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
+  TEMPERATURE=${TEMPERATURE:-2.0}
+  KL_TOPK=${KL_TOPK:-1024}
+  LOSS_NORMALIZATION=${LOSS_NORMALIZATION:-token}
+  SUPERVISION_LOSS=${SUPERVISION_LOSS:-distill}
+  LAMBDA_LOGIT=${LAMBDA_LOGIT:-2.0}
+  VISUAL_ADAPTER_RANK=${VISUAL_ADAPTER_RANK:-128}
+  GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-1}
+  GRAD_CLIP=${GRAD_CLIP:-1.0}
+  SEED=${SEED:-44}
+  REQUIRED_WORLD_SIZE=${REQUIRED_WORLD_SIZE:-$NPROC_PER_NODE}
+  DISTRIBUTED_ENGINE=${DISTRIBUTED_ENGINE:-deepspeed}
 
   if [[ "$MODEL_PATH" != /* ]]; then
     if [[ -e "$ROOT_DIR/$MODEL_PATH" ]]; then
@@ -202,18 +239,17 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
   fi
 
   if [[ "${KEEP_NCCL_ENV:-0}" != "1" ]]; then
-    while IFS='=' read -r name _; do
-      if [[ "$name" == NCCL_* ]]; then
-        unset "$name"
-      fi
-    done < <(env)
+    unset NCCL_NET
+    unset NCCL_IB_DISABLE
+    unset NCCL_SOCKET_IFNAME
     unset GLOO_SOCKET_IFNAME
-  elif [[ -n "${NCCL_NET:-}" ]]; then
-    export NCCL_NET
+    unset TORCH_NCCL_ASYNC_ERROR_HANDLING
   fi
-  export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
-  export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
-  export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-eth0}
+  for name in NCCL_IB_DISABLE NCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME NCCL_NET NCCL_NET_GDR_LEVEL NCCL_TUNER_CONFIG_PATH; do
+    if [[ -n "${!name:-}" ]]; then
+      export "$name"
+    fi
+  done
 
   mkdir -p "$OUTPUT_DIR" "$(dirname "$LOG_FILE")"
 
@@ -224,6 +260,10 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
   echo "model_path=$MODEL_PATH"
   echo "data=$DATA"
   echo "nproc=$NPROC_PER_NODE cuda=$CUDA_VISIBLE_DEVICES"
+  echo "max_steps=$MAX_STEPS save_every=$SAVE_EVERY"
+  echo "lr=$LR scheduler=$LR_SCHEDULER warmup_ratio=$WARMUP_RATIO loss_normalization=$LOSS_NORMALIZATION supervision_loss=$SUPERVISION_LOSS kl_topk=$KL_TOPK output_mode=$OUTPUT_MODE attn=$ATTN_IMPL distributed_engine=$DISTRIBUTED_ENGINE"
+  echo "lambda_logit=$LAMBDA_LOGIT"
+  echo "visual_adapter_rank=$VISUAL_ADAPTER_RANK"
 
   CMD=(
     "$PY" -m torch.distributed.run
@@ -235,16 +275,34 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
     --data "$DATA"
     --data-root "$DATA_ROOT"
     --output-dir "$OUTPUT_DIR"
-    --max-steps "${MAX_STEPS:-4000}"
-    --batch-size "${BATCH_SIZE:-1}"
-    --lr "${LR:-1e-4}"
-    --kl-topk "${KL_TOPK:-1024}"
-    --log-every "${LOG_EVERY:-10}"
-    --save-every "${SAVE_EVERY:-500}"
+    --metrics-jsonl "$METRICS_JSONL"
+    --init-checkpoint "$INIT_CHECKPOINT"
+    --max-steps "$MAX_STEPS"
+    --batch-size "$BATCH_SIZE"
+    --lr "$LR"
+    --lr-scheduler "$LR_SCHEDULER"
+    --warmup-ratio "$WARMUP_RATIO"
+    --warmup-start-lr-ratio "$WARMUP_START_LR_RATIO"
+    --min-lr-ratio "$MIN_LR_RATIO"
+    --weight-decay "$WEIGHT_DECAY"
+    --temperature "$TEMPERATURE"
+    --kl-topk "$KL_TOPK"
+    --lambda-logit "$LAMBDA_LOGIT"
+    --loss-normalization "$LOSS_NORMALIZATION"
+    --supervision-loss "$SUPERVISION_LOSS"
+    --log-every "$LOG_EVERY"
+    --save-every "$SAVE_EVERY"
     --output-mode "$OUTPUT_MODE"
+    --visual-adapter-rank "$VISUAL_ADAPTER_RANK"
     --deepspeed-config "$DS_CONFIG"
     --dist-backend "${DIST_BACKEND:-nccl}"
-    --seed "${SEED:-42}"
+    --distributed-engine "$DISTRIBUTED_ENGINE"
+    --required-world-size "$REQUIRED_WORLD_SIZE"
+    --grad-clip "$GRAD_CLIP"
+    --dtype "$DTYPE"
+    --attn-implementation "$ATTN_IMPL"
+    --gradient-accumulation-steps "$GRADIENT_ACCUMULATION_STEPS"
+    --seed "$SEED"
   )
 else
   echo "MODEL_KIND must be qwen or llava, got $MODEL_KIND" >&2

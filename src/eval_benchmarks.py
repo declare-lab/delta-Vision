@@ -5,7 +5,9 @@ import argparse
 import concurrent.futures
 import csv
 import json
+import math
 import os
+import random
 import re
 import time
 import urllib.error
@@ -27,7 +29,6 @@ from src.benchmarks import (
     extract_yes_no,
     format_seconds_minsec,
     get_benchmark_spec,
-    safe_mean,
     score_prediction,
     summarize_metric,
 )
@@ -51,6 +52,7 @@ from src.model import (
     load_frozen_qwen3vl,
     load_qwen_embedding_adapter_checkpoint,
     prepare_qwen_embedding_adapter_inputs,
+    qwen_input_device,
     qwen_embedding_adapter_decode_step,
     qwen_embedding_adapter_decode_step_shape_exact,
     qwen_embedding_adapter_prefill_cache,
@@ -457,6 +459,7 @@ def generate_adapter_llava(
     adapter_decode_cache: bool = True,
     early_stop_metric: str | None = None,
     choices: list[Any] | None = None,
+    image_sizes=None,
 ) -> tuple[str | None, str]:
     full_ids = input_ids.clone()
     full_mask = attention_mask.clone()
@@ -473,6 +476,7 @@ def generate_adapter_llava(
                 pixel_values,
                 image_token_id,
                 attention_mask=full_mask,
+                image_sizes=image_sizes,
             )
         else:
             assert source_k is not None and source_v is not None
@@ -496,6 +500,7 @@ def generate_adapter_llava(
                     adapter,
                     image_token_id,
                     attention_mask=full_mask,
+                    image_sizes=image_sizes,
                 )
             else:
                 assert source_k is not None and source_v is not None
@@ -621,6 +626,7 @@ def evaluate_llava_shard(
                         pixel_values,
                         image_token_id,
                         attention_mask=attention_mask,
+                        image_sizes=image_sizes,
                     )
                 return student_forward_llava_embedding_adapter(
                     model,
@@ -629,6 +635,7 @@ def evaluate_llava_shard(
                     adapter,
                     image_token_id,
                     attention_mask=attention_mask,
+                    image_sizes=image_sizes,
                 )
             assert source_k is not None and source_v is not None
             if adapter_decode_cache:
@@ -669,6 +676,7 @@ def evaluate_llava_shard(
                 adapter_decode_cache=adapter_decode_cache,
                 early_stop_metric=spec.metric if structured_answer_early_stop else None,
                 choices=choices,
+                image_sizes=image_sizes,
             )
         )
         adapter_total_s += source_s
@@ -688,6 +696,7 @@ def evaluate_llava_shard(
                 adapter_decode_cache=False,
                 early_stop_metric=spec.metric if structured_answer_early_stop else None,
                 choices=choices,
+                image_sizes=image_sizes,
             )
             if recompute_text != adapter_text:
                 raise RuntimeError(
@@ -782,6 +791,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--answer-instruction", default=None)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--qwen-device-map", default="", help="Optional Qwen HF device_map, e.g. auto, for single-process multi-GPU loading.")
+    parser.add_argument("--qwen-max-memory", default="", help="Optional HF max_memory, JSON or comma list like 0=120GiB,1=120GiB,cpu=200GiB.")
     parser.add_argument("--measure-prefill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--teacher-only", action="store_true", help="Evaluate only the frozen/base model; does not require --checkpoint.")
     parser.add_argument("--compile-adapter", action=argparse.BooleanOptionalAction, default=False)
@@ -844,6 +856,34 @@ def parse_args() -> argparse.Namespace:
     if args.output_mode is not None:
         args.output_mode = canonical_adapter_mode(args.output_mode)
     return args
+
+
+def parse_qwen_device_map(value: str) -> str | dict[str, Any] | None:
+    value = str(value or "").strip()
+    if not value or value.lower() in {"none", "replicated"}:
+        return None
+    if value.startswith("{"):
+        return json.loads(value)
+    return value
+
+
+def parse_qwen_max_memory(value: str) -> dict[Any, str] | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.startswith("{"):
+        parsed = json.loads(value)
+        return {int(key) if str(key).isdigit() else key: str(mem) for key, mem in parsed.items()}
+    max_memory: dict[Any, str] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"invalid --qwen-max-memory item {item!r}; expected key=value")
+        key, mem = item.split("=", 1)
+        key = key.strip()
+        max_memory[int(key) if key.isdigit() else key] = mem.strip()
+    return max_memory
 
 
 def run_llava_single_shard(args, shard_id: int, num_shards: int):
@@ -1201,6 +1241,30 @@ def _sync_cuda() -> None:
         torch.cuda.synchronize()
 
 
+def _tensor_tree_nbytes(value: Any, seen: set[tuple[str, int]] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    if torch.is_tensor(value):
+        try:
+            storage = value.untyped_storage()
+            key = (str(value.device), int(storage.data_ptr()))
+            if key in seen:
+                return 0
+            seen.add(key)
+            return int(storage.nbytes())
+        except Exception:
+            return int(value.numel() * value.element_size())
+    if isinstance(value, dict):
+        return sum(_tensor_tree_nbytes(item, seen) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_tree_nbytes(item, seen) for item in value)
+    return 0
+
+
+def _tensor_tree_mb(value: Any) -> float:
+    return _tensor_tree_nbytes(value) / (1024.0**2)
+
+
 @torch.inference_mode()
 def _timed_call(fn, enabled: bool = True):
     if not enabled:
@@ -1210,6 +1274,35 @@ def _timed_call(fn, enabled: bool = True):
     value = fn()
     _sync_cuda()
     return time.perf_counter() - start, value
+
+
+@torch.inference_mode()
+def _timed_cuda_peak_call(fn, enabled: bool = True):
+    if not enabled:
+        return 0.0, None, {}
+    _sync_cuda()
+    stats: dict[str, float] = {}
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        base_allocated = torch.cuda.memory_allocated()
+        base_reserved = torch.cuda.memory_reserved()
+    else:
+        base_allocated = 0
+        base_reserved = 0
+    start = time.perf_counter()
+    value = fn()
+    _sync_cuda()
+    elapsed = time.perf_counter() - start
+    if torch.cuda.is_available():
+        peak_allocated = torch.cuda.max_memory_allocated()
+        peak_reserved = torch.cuda.max_memory_reserved()
+        stats = {
+            "peak_allocated_mb": peak_allocated / (1024.0**2),
+            "peak_reserved_mb": peak_reserved / (1024.0**2),
+            "peak_allocated_delta_mb": max(0, peak_allocated - base_allocated) / (1024.0**2),
+            "peak_reserved_delta_mb": max(0, peak_reserved - base_reserved) / (1024.0**2),
+        }
+    return elapsed, value, stats
 
 
 def configure_torch_runtime() -> None:
@@ -1227,6 +1320,13 @@ def configure_torch_runtime() -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def assert_same_logits_and_mask(
@@ -1499,6 +1599,7 @@ def summarize_benchmark_predictions(
     teacher_prefill_s = sum(float(item.get("teacher_prefill_s", 0.0)) for item in predictions)
     adapter_total_s = sum(float(item.get("adapter_total_s", 0.0)) for item in predictions)
     adapter_prefill_s = sum(float(item.get("adapter_prefill_s", 0.0)) for item in predictions)
+    adapter_decode_s = sum(float(item.get("adapter_decode_s", 0.0)) for item in predictions)
 
     timing = {
         "teacher_total_s": teacher_total_s,
@@ -1509,14 +1610,38 @@ def summarize_benchmark_predictions(
         "adapter_total_minsec": format_seconds_minsec(adapter_total_s),
         "adapter_prefill_s": adapter_prefill_s,
         "adapter_prefill_minsec": format_seconds_minsec(adapter_prefill_s),
+        "adapter_decode_s": adapter_decode_s,
+        "adapter_decode_minsec": format_seconds_minsec(adapter_decode_s),
         "speedup_total": (teacher_total_s / adapter_total_s) if adapter_total_s > 0 else None,
         "speedup_prefill": (teacher_prefill_s / adapter_prefill_s) if adapter_prefill_s > 0 else None,
     }
+
+    def resource_mean(key: str) -> float | None:
+        values = [item.get(key) for item in predictions]
+        numeric = [float(value) for value in values if value is not None and not math.isnan(float(value))]
+        if not numeric:
+            return None
+        return sum(numeric) / len(numeric)
+
     resources = {
-        "teacher_kv_cache_mb_avg": safe_mean([item.get("teacher_kv_cache_mb", 0.0) for item in predictions]),
-        "adapter_kv_cache_mb_avg": safe_mean([item.get("adapter_kv_cache_mb", 0.0) for item in predictions]),
-        "teacher_prefill_flops_avg": safe_mean([item.get("teacher_prefill_flops", 0.0) for item in predictions]),
-        "adapter_prefill_flops_avg": safe_mean([item.get("adapter_prefill_flops", 0.0) for item in predictions]),
+        "teacher_kv_cache_mb_avg": resource_mean("teacher_kv_cache_mb"),
+        "adapter_kv_cache_mb_avg": resource_mean("adapter_kv_cache_mb"),
+        "teacher_prefill_flops_avg": resource_mean("teacher_prefill_flops"),
+        "adapter_prefill_flops_avg": resource_mean("adapter_prefill_flops"),
+        "teacher_prefill_peak_allocated_mb_avg": resource_mean("teacher_prefill_peak_allocated_mb"),
+        "teacher_prefill_peak_reserved_mb_avg": resource_mean("teacher_prefill_peak_reserved_mb"),
+        "teacher_prefill_peak_allocated_delta_mb_avg": resource_mean("teacher_prefill_peak_allocated_delta_mb"),
+        "teacher_prefill_peak_reserved_delta_mb_avg": resource_mean("teacher_prefill_peak_reserved_delta_mb"),
+        "adapter_prefill_peak_allocated_mb_avg": resource_mean("adapter_prefill_peak_allocated_mb"),
+        "adapter_prefill_peak_reserved_mb_avg": resource_mean("adapter_prefill_peak_reserved_mb"),
+        "adapter_decode_peak_allocated_mb_avg": resource_mean("adapter_decode_peak_allocated_mb"),
+        "adapter_decode_peak_reserved_mb_avg": resource_mean("adapter_decode_peak_reserved_mb"),
+        "adapter_prefill_peak_allocated_delta_mb_avg": resource_mean("adapter_prefill_peak_allocated_delta_mb"),
+        "adapter_prefill_peak_reserved_delta_mb_avg": resource_mean("adapter_prefill_peak_reserved_delta_mb"),
+        "adapter_decode_peak_allocated_delta_mb_avg": resource_mean("adapter_decode_peak_allocated_delta_mb"),
+        "adapter_decode_peak_reserved_delta_mb_avg": resource_mean("adapter_decode_peak_reserved_delta_mb"),
+        "adapter_prefill_decode_cache_mb_avg": resource_mean("adapter_prefill_decode_cache_mb"),
+        "adapter_final_decode_cache_mb_avg": resource_mean("adapter_final_decode_cache_mb"),
     }
 
     summary: dict[str, Any] = {
@@ -1582,6 +1707,8 @@ def evaluate_qwen_benchmark_shard(
     adapter_decode_cache: bool = True,
     adapter_decode_cache_mode: str = "shape_exact",
     verify_decode_cache_generation: int = 0,
+    adapter_prefill_fn: Callable[[dict[str, torch.Tensor]], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]] | None = None,
+    prefill_warmup: int = 0,
 ) -> dict:
     if int(eval_batch_size) > 1:
         return evaluate_qwen_benchmark_shard_batched(
@@ -1610,6 +1737,8 @@ def evaluate_qwen_benchmark_shard(
             adapter_decode_cache=adapter_decode_cache,
             adapter_decode_cache_mode=adapter_decode_cache_mode,
             verify_decode_cache_generation=verify_decode_cache_generation,
+            adapter_prefill_fn=adapter_prefill_fn,
+            prefill_warmup=prefill_warmup,
         )
 
     spec = get_benchmark_spec(benchmark)
@@ -1648,10 +1777,15 @@ def evaluate_qwen_benchmark_shard(
 
         text_tokens, image_tokens = _qwen_token_counts(attention_mask, mm_token_type_ids)
         cached_teacher = teacher_cache_entries[idx] if teacher_cache_entries is not None else None
+        teacher_prefill_stats: dict[str, float] = {}
         if cached_teacher is None:
             if require_teacher_cache:
                 raise FileNotFoundError(f"required teacher cache entry {idx} is missing: {teacher_cache_path}")
-            teacher_prefill_s, _ = _timed_call(
+            if measure_prefill and int(prefill_warmup) > 0:
+                for _ in range(int(prefill_warmup)):
+                    model(**inputs, logits_to_keep=1 if last_logits_only else 0).logits
+                _sync_cuda()
+            teacher_prefill_s, _, teacher_prefill_stats = _timed_cuda_peak_call(
                 lambda: model(**inputs, logits_to_keep=1 if last_logits_only else 0).logits,
                 enabled=measure_prefill,
             )
@@ -1680,6 +1814,10 @@ def evaluate_qwen_benchmark_shard(
             teacher_total_s = float(cached_teacher.get("teacher_total_s", 0.0))
 
         def adapter_prefill():
+            if adapter_prefill_fn is not None:
+                if not adapter_decode_cache:
+                    raise ValueError("adapter_prefill_fn requires adapter_decode_cache=True")
+                return adapter_prefill_fn(inputs)
             initial_hidden, position_ids = load_or_build_qwen_initial_context(
                 model,
                 inputs,
@@ -1712,13 +1850,21 @@ def evaluate_qwen_benchmark_shard(
                 logits, text_mask = adapter_logits_fn(dict(inputs), initial_hidden, position_ids)
             return logits, text_mask, initial_hidden, position_ids
 
-        adapter_prefill_s, adapter_prefill_payload = _timed_call(
+        if measure_prefill and int(prefill_warmup) > 0:
+            for _ in range(int(prefill_warmup)):
+                adapter_prefill()
+            _sync_cuda()
+        adapter_prefill_s, adapter_prefill_payload, adapter_prefill_stats = _timed_cuda_peak_call(
             adapter_prefill,
             enabled=measure_prefill,
         )
+        adapter_decode_s = 0.0
+        adapter_decode_stats: dict[str, float] = {}
+        adapter_prefill_decode_cache_mb: float | None = None
+        adapter_final_decode_cache_mb: float | None = None
         if adapter_prefill_payload is None:
             if adapter_decode_cache:
-                adapter_total_s, (_, adapter_texts) = _timed_call(
+                adapter_total_s, (_, adapter_texts), adapter_decode_stats = _timed_cuda_peak_call(
                     lambda: generate_adapter_qwen_decode_cache(
                         model,
                         processor,
@@ -1733,7 +1879,7 @@ def evaluate_qwen_benchmark_shard(
                 )
                 adapter_text = adapter_texts[0]
             else:
-                adapter_total_s, (_, adapter_text) = _timed_call(
+                adapter_total_s, (_, adapter_text), adapter_decode_stats = _timed_cuda_peak_call(
                     lambda: generate_adapter_qwen(
                         model,
                         processor,
@@ -1750,10 +1896,12 @@ def evaluate_qwen_benchmark_shard(
                         choices=item.get("choices"),
                     )
                 )
+            adapter_decode_s = adapter_total_s
         else:
             if adapter_decode_cache:
                 prefill_logits, prefill_text_mask, initial_hidden, position_ids, decode_cache = adapter_prefill_payload
-                adapter_continuation_s, (_, adapter_texts) = _timed_call(
+                adapter_prefill_decode_cache_mb = _tensor_tree_mb(decode_cache)
+                adapter_continuation_s, (_, adapter_texts), adapter_decode_stats = _timed_cuda_peak_call(
                     lambda: generate_adapter_qwen_decode_cache(
                         model,
                         processor,
@@ -1772,9 +1920,10 @@ def evaluate_qwen_benchmark_shard(
                     )
                 )
                 adapter_text = adapter_texts[0]
+                adapter_final_decode_cache_mb = _tensor_tree_mb(decode_cache)
             else:
                 prefill_logits, prefill_text_mask, initial_hidden, position_ids = adapter_prefill_payload
-                adapter_continuation_s, (_, adapter_text) = _timed_call(
+                adapter_continuation_s, (_, adapter_text), adapter_decode_stats = _timed_cuda_peak_call(
                     lambda: generate_adapter_qwen(
                         model,
                         processor,
@@ -1795,6 +1944,7 @@ def evaluate_qwen_benchmark_shard(
                         choices=item.get("choices"),
                     )
                 )
+            adapter_decode_s = adapter_continuation_s
             adapter_total_s = adapter_prefill_s + adapter_continuation_s
 
         if adapter_decode_cache and idx < int(verify_decode_cache_generation):
@@ -1888,12 +2038,27 @@ def evaluate_qwen_benchmark_shard(
                 "adapter_total_s": adapter_total_s,
                 "teacher_prefill_s": teacher_prefill_s,
                 "adapter_prefill_s": adapter_prefill_s,
+                "adapter_decode_s": adapter_decode_s,
                 "text_tokens": text_tokens,
                 "image_tokens": image_tokens,
                 "teacher_kv_cache_mb": teacher_kv,
                 "adapter_kv_cache_mb": adapter_kv,
                 "teacher_prefill_flops": teacher_flops,
                 "adapter_prefill_flops": adapter_flops,
+                "teacher_prefill_peak_allocated_mb": teacher_prefill_stats.get("peak_allocated_mb"),
+                "teacher_prefill_peak_reserved_mb": teacher_prefill_stats.get("peak_reserved_mb"),
+                "teacher_prefill_peak_allocated_delta_mb": teacher_prefill_stats.get("peak_allocated_delta_mb"),
+                "teacher_prefill_peak_reserved_delta_mb": teacher_prefill_stats.get("peak_reserved_delta_mb"),
+                "adapter_prefill_peak_allocated_mb": adapter_prefill_stats.get("peak_allocated_mb"),
+                "adapter_prefill_peak_reserved_mb": adapter_prefill_stats.get("peak_reserved_mb"),
+                "adapter_prefill_peak_allocated_delta_mb": adapter_prefill_stats.get("peak_allocated_delta_mb"),
+                "adapter_prefill_peak_reserved_delta_mb": adapter_prefill_stats.get("peak_reserved_delta_mb"),
+                "adapter_decode_peak_allocated_mb": adapter_decode_stats.get("peak_allocated_mb"),
+                "adapter_decode_peak_reserved_mb": adapter_decode_stats.get("peak_reserved_mb"),
+                "adapter_decode_peak_allocated_delta_mb": adapter_decode_stats.get("peak_allocated_delta_mb"),
+                "adapter_decode_peak_reserved_delta_mb": adapter_decode_stats.get("peak_reserved_delta_mb"),
+                "adapter_prefill_decode_cache_mb": adapter_prefill_decode_cache_mb,
+                "adapter_final_decode_cache_mb": adapter_final_decode_cache_mb,
             }
         )
         if (idx + 1) % log_every == 0:
@@ -1943,6 +2108,8 @@ def evaluate_qwen_benchmark_shard_batched(
     adapter_decode_cache: bool = True,
     adapter_decode_cache_mode: str = "shape_exact",
     verify_decode_cache_generation: int = 0,
+    adapter_prefill_fn: Callable[[dict[str, torch.Tensor]], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]] | None = None,
+    prefill_warmup: int = 0,
 ) -> dict:
     spec = get_benchmark_spec(benchmark)
     language_config = model.model.language_model.config
@@ -2363,7 +2530,20 @@ def run_qwen_single_shard(args: argparse.Namespace, shard_id: int, num_shards: i
     device = torch.device("cuda:0")
     dtype = dtype_from_name(args.dtype)
     configure_torch_runtime()
-    processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    qwen_device_map = parse_qwen_device_map(args.qwen_device_map)
+    qwen_max_memory = parse_qwen_max_memory(args.qwen_max_memory)
+    processor, model = load_frozen_qwen3vl(
+        args.model_path,
+        dtype,
+        device,
+        args.attn_implementation,
+        device_map=qwen_device_map,
+        max_memory=qwen_max_memory,
+    )
+    if qwen_device_map is not None:
+        device = qwen_input_device(model)
+        if shard_id == 0:
+            print(f"qwen_device_map={qwen_device_map} input_device={device} max_memory={qwen_max_memory or 'auto'}", flush=True)
     if args.teacher_only:
         dataset = QwenBenchmarkDataset(
             args.data,
@@ -2601,6 +2781,7 @@ def merge_benchmark_shards(output_dir: str, num_shards: int, benchmark: str) -> 
 
 def main() -> None:
     args = parse_args()
+    set_global_seed(int(args.seed))
     if args.shard_id is not None:
         if args.model_kind == "qwen":
             run_qwen_single_shard(args, args.shard_id, args.num_shards)

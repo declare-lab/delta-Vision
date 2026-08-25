@@ -19,6 +19,7 @@ STEP=${STEP:-500}
 STEPS=${STEPS:-}
 EVAL_ALL_CKPTS=${EVAL_ALL_CKPTS:-0}
 FORCE_EVAL=${FORCE_EVAL:-0}
+NUM_SHARDS_EXPLICIT=${NUM_SHARDS+x}
 POSITIONAL_BENCHMARKS=()
 
 while [[ $# -gt 0 ]]; do
@@ -145,6 +146,12 @@ if [[ "$MODEL_KIND" != "qwen" && "$MODEL_KIND" != "llava" ]]; then
   echo "MODEL_KIND must be qwen or llava, got $MODEL_KIND" >&2
   exit 1
 fi
+QWEN_DEVICE_MAP=${QWEN_DEVICE_MAP:-}
+QWEN_MAX_MEMORY=${QWEN_MAX_MEMORY:-}
+SHARDED_QWEN=0
+if [[ "$MODEL_KIND" == "qwen" && -n "$QWEN_DEVICE_MAP" && "$QWEN_DEVICE_MAP" != "none" && "$QWEN_DEVICE_MAP" != "replicated" ]]; then
+  SHARDED_QWEN=1
+fi
 
 if [[ "${#POSITIONAL_BENCHMARKS[@]}" -gt 1 ]]; then
   BENCHMARKS="${POSITIONAL_BENCHMARKS[*]}"
@@ -205,7 +212,15 @@ if [[ "${SINGLE_EVAL:-0}" != "1" && ( -n "$BENCHMARKS" || -n "$STEPS" || "$EVAL_
   if [[ "$RUN_LABEL" == "checkpoints" ]]; then
     RUN_LABEL="$(basename "$(dirname "$RUN_DIR")")"
   fi
-  NUM_SHARDS=${NUM_SHARDS:-8}
+  if [[ "$SHARDED_QWEN" == "1" && -z "$NUM_SHARDS_EXPLICIT" ]]; then
+    NUM_SHARDS=1
+  else
+    NUM_SHARDS=${NUM_SHARDS:-8}
+  fi
+  if [[ "$SHARDED_QWEN" == "1" && "$NUM_SHARDS" != "1" ]]; then
+    echo "QWEN_DEVICE_MAP=$QWEN_DEVICE_MAP requires NUM_SHARDS=1 so one process can see all visible GPUs" >&2
+    exit 1
+  fi
   MAX_SAMPLES=${MAX_SAMPLES:-1000}
   if [[ -z "${RUNTIME_TAG:-}" ]]; then
     if [[ "${COMPILE_ADAPTER:-1}" == "1" ]]; then
@@ -247,6 +262,8 @@ if [[ "${SINGLE_EVAL:-0}" != "1" && ( -n "$BENCHMARKS" || -n "$STEPS" || "$EVAL_
       OUTPUT_MODE="$OUTPUT_MODE" \
       MAX_SAMPLES="$MAX_SAMPLES" \
       NUM_SHARDS="$NUM_SHARDS" \
+      QWEN_DEVICE_MAP="$QWEN_DEVICE_MAP" \
+      QWEN_MAX_MEMORY="$QWEN_MAX_MEMORY" \
       TEACHER_CACHE_DIR="$TEACHER_CACHE_DIR" \
       SINGLE_EVAL=1 \
       bash "$0" "$benchmark"
@@ -437,7 +454,15 @@ else
     RUN_NAME="$(basename "$(dirname "$(dirname "$CKPT")")")"
   fi
 fi
-NUM_SHARDS=${NUM_SHARDS:-8}
+if [[ "$SHARDED_QWEN" == "1" && -z "$NUM_SHARDS_EXPLICIT" ]]; then
+  NUM_SHARDS=1
+else
+  NUM_SHARDS=${NUM_SHARDS:-8}
+fi
+if [[ "$SHARDED_QWEN" == "1" && "$NUM_SHARDS" != "1" ]]; then
+  echo "QWEN_DEVICE_MAP=$QWEN_DEVICE_MAP requires NUM_SHARDS=1 so one process can see all visible GPUs" >&2
+  exit 1
+fi
 if [[ -z "${MAX_SAMPLES+x}" ]]; then
   if [[ "$BENCHMARK" == "mmstar" ]]; then
     MAX_SAMPLES=1000
@@ -480,8 +505,10 @@ echo "teacher_only=$TEACHER_ONLY"
 echo "output=$OUT_DIR"
 echo "benchmark=$BENCHMARK max_samples=$MAX_SAMPLES max_new_tokens=$MAX_NEW_TOKENS shards=$NUM_SHARDS"
 echo "attn=$ATTN_IMPL dtype=$DTYPE"
+echo "qwen_device_map=${QWEN_DEVICE_MAP:-none} qwen_max_memory=${QWEN_MAX_MEMORY:-auto}"
 echo "measure_prefill=${MEASURE_PREFILL:-1}"
 echo "compile_adapter=${COMPILE_ADAPTER:-1} compile_verify=${COMPILE_VERIFY:-0}"
+echo "adapter_decode_cache=${ADAPTER_DECODE_CACHE:-1} adapter_decode_cache_mode=${ADAPTER_DECODE_CACHE_MODE:-shape_exact}"
 echo "structured_answer_early_stop=${STRUCTURED_ANSWER_EARLY_STOP:-1}"
 echo "eval_batch_size=${EVAL_BATCH_SIZE:-128} eval_max_batch_tokens=${EVAL_MAX_BATCH_TOKENS:-0}"
 
@@ -556,6 +583,16 @@ if [[ "${LAST_LOGITS_ONLY:-1}" == "1" ]]; then
 else
   LAST_LOGITS_ARGS=(--no-last-logits-only)
 fi
+ADAPTER_DECODE_ARGS=()
+if [[ "${ADAPTER_DECODE_CACHE:-1}" == "1" ]]; then
+  ADAPTER_DECODE_ARGS=(--adapter-decode-cache)
+else
+  ADAPTER_DECODE_ARGS=(--no-adapter-decode-cache)
+fi
+ADAPTER_DECODE_ARGS+=(--adapter-decode-cache-mode "${ADAPTER_DECODE_CACHE_MODE:-shape_exact}")
+if [[ -n "${VERIFY_DECODE_CACHE_GENERATION:-}" ]]; then
+  ADAPTER_DECODE_ARGS+=(--verify-decode-cache-generation "$VERIFY_DECODE_CACHE_GENERATION")
+fi
 INPUT_CACHE_ARGS=()
 if [[ "$MODEL_KIND" == "qwen" && "${INPUT_CACHE:-1}" == "1" ]]; then
   INPUT_CACHE_ARGS=(--input-cache-dir "${INPUT_CACHE_DIR:-$ROOT_DIR/artifacts/cache/qwen_benchmark_inputs}")
@@ -568,6 +605,10 @@ EVAL_BATCH_ARGS=()
 if [[ "$MODEL_KIND" == "qwen" ]]; then
   EVAL_BATCH_ARGS=(--eval-batch-size "${EVAL_BATCH_SIZE:-128}" --eval-max-batch-tokens "${EVAL_MAX_BATCH_TOKENS:-0}")
 fi
+QWEN_DEVICE_MAP_ARGS=()
+if [[ "$MODEL_KIND" == "qwen" ]]; then
+  QWEN_DEVICE_MAP_ARGS=(--qwen-device-map "$QWEN_DEVICE_MAP" --qwen-max-memory "$QWEN_MAX_MEMORY")
+fi
 TEACHER_ONLY_ARGS=()
 CHECKPOINT_ARGS=()
 if [[ "$TEACHER_ONLY" == "1" ]]; then
@@ -579,8 +620,13 @@ fi
 pids=()
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
   gpu="${DEVICES[$shard]}"
-  echo "Launching shard $shard on GPU $gpu"
-  CUDA_VISIBLE_DEVICES="$gpu" "$PY" -m src.eval_benchmarks \
+  if [[ "$SHARDED_QWEN" == "1" ]]; then
+    shard_cuda="$CUDA_DEVICES_CSV"
+  else
+    shard_cuda="$gpu"
+  fi
+  echo "Launching shard $shard on CUDA_VISIBLE_DEVICES=$shard_cuda"
+  CUDA_VISIBLE_DEVICES="$shard_cuda" "$PY" -m src.eval_benchmarks \
     --model-kind "$MODEL_KIND" \
     --benchmark "$BENCHMARK" \
     --data "$DATA" \
@@ -599,9 +645,11 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     "${COMPILE_ARGS[@]}" \
     "${TEACHER_CACHE_ARGS[@]}" \
     "${LAST_LOGITS_ARGS[@]}" \
+    "${ADAPTER_DECODE_ARGS[@]}" \
     "${INPUT_CACHE_ARGS[@]}" \
     "${CONTEXT_CACHE_ARGS[@]}" \
     "${EVAL_BATCH_ARGS[@]}" \
+    "${QWEN_DEVICE_MAP_ARGS[@]}" \
     "${TEACHER_ONLY_ARGS[@]}" \
     --dtype "$DTYPE" \
     --attn-implementation "$ATTN_IMPL" \
@@ -631,9 +679,11 @@ done
   "${COMPILE_ARGS[@]}" \
   "${TEACHER_CACHE_ARGS[@]}" \
   "${LAST_LOGITS_ARGS[@]}" \
+  "${ADAPTER_DECODE_ARGS[@]}" \
   "${INPUT_CACHE_ARGS[@]}" \
   "${CONTEXT_CACHE_ARGS[@]}" \
   "${EVAL_BATCH_ARGS[@]}" \
+  "${QWEN_DEVICE_MAP_ARGS[@]}" \
   "${TEACHER_ONLY_ARGS[@]}" \
   --dtype "$DTYPE" \
   --attn-implementation "$ATTN_IMPL"

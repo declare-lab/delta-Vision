@@ -34,6 +34,7 @@ from src.model import (
     load_frozen_llava,
     load_frozen_qwen3vl,
     prepare_qwen3vl_batch_inputs,
+    qwen_input_device,
     qwen3vl_text_ids_and_answer_mask,
     qwen_position_ids,
     qwen_embedding_adapter_logits,
@@ -61,15 +62,16 @@ def topk_kl_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
     topk: int = 1024,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """KL divergence on top-K teacher logits."""
     k = min(topk, teacher_logits.shape[-1])
     _, indices = teacher_logits.topk(k, dim=-1)
-    t_topk = teacher_logits.gather(-1, indices)
-    s_topk = student_logits.gather(-1, indices)
+    t_topk = teacher_logits.gather(-1, indices) / temperature
+    s_topk = student_logits.gather(-1, indices) / temperature
     t_prob = F.softmax(t_topk, dim=-1)
     s_logprob = F.log_softmax(s_topk, dim=-1)
-    return F.kl_div(s_logprob, t_prob, reduction="batchmean")
+    return F.kl_div(s_logprob, t_prob, reduction="batchmean") * (temperature * temperature)
 
 
 
@@ -154,11 +156,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pixel-area-cache", default="")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
+    parser.add_argument("--qwen-device-map", default="", help="Optional Qwen HF device_map, e.g. auto, for single-process multi-GPU loading.")
+    parser.add_argument("--qwen-max-memory", default="", help="Optional HF max_memory, JSON or comma list like 0=120GiB,1=120GiB,cpu=200GiB.")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     if args.kl_topk is None:
         args.kl_topk = 1024
     return args
+
+
+def parse_qwen_device_map(value: str) -> str | dict[str, Any] | None:
+    value = str(value or "").strip()
+    if not value or value.lower() in {"none", "replicated"}:
+        return None
+    if value.startswith("{"):
+        return json.loads(value)
+    return value
+
+
+def parse_qwen_max_memory(value: str) -> dict[Any, str] | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.startswith("{"):
+        parsed = json.loads(value)
+        return {int(key) if str(key).isdigit() else key: str(mem) for key, mem in parsed.items()}
+    max_memory: dict[Any, str] = {}
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"invalid --qwen-max-memory item {item!r}; expected key=value")
+        key, mem = item.split("=", 1)
+        key = key.strip()
+        max_memory[int(key) if key.isdigit() else key] = mem.strip()
+    return max_memory
 
 
 def distributed_is_initialized() -> bool:
@@ -235,6 +267,45 @@ class TorchGradSyncEngine(SimpleEngine):
             param.grad.div_(float(world_size))
 
 
+class QwenAdapterTrainingModule(nn.Module):
+    def __init__(self, model: nn.Module, adapter: QwenEmbeddingAdapter) -> None:
+        super().__init__()
+        self.model = model
+        self.adapter = adapter
+
+    def train(self, mode: bool = True) -> "QwenAdapterTrainingModule":
+        super().train(mode)
+        self.model.eval()
+        self.adapter.train(mode)
+        return self
+
+
+def load_train_deepspeed_config(args: argparse.Namespace) -> dict[str, Any]:
+    ds_config = json.loads(Path(args.deepspeed_config).read_text(encoding="utf-8"))
+    ds_config["train_micro_batch_size_per_gpu"] = args.micro_batch_size_per_gpu
+    ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+    ds_config["gradient_clipping"] = args.grad_clip
+    return ds_config
+
+
+def deepspeed_zero_stage(ds_config: dict[str, Any] | None) -> int:
+    if not ds_config:
+        return 0
+    zero_config = ds_config.get("zero_optimization", {})
+    if isinstance(zero_config, dict):
+        return int(zero_config.get("stage", 0) or 0)
+    return int(zero_config or 0)
+
+
+def qwen_engine_modules(engine: object, fallback_model: nn.Module) -> tuple[nn.Module, QwenEmbeddingAdapter]:
+    module = getattr(engine, "module", None)
+    if isinstance(module, QwenAdapterTrainingModule):
+        return module.model, module.adapter
+    if isinstance(module, QwenEmbeddingAdapter):
+        return fallback_model, module
+    raise TypeError(f"unexpected Qwen engine module type: {type(module)!r}")
+
+
 def optimizer_param_groups(engine: object) -> list[dict[str, Any]]:
     optimizer = getattr(engine, "optimizer", None)
     if optimizer is None:
@@ -283,6 +354,9 @@ def masked_topk_kl_stats(
     batch = student_logits.shape[0]
     if k <= 0:
         return student_logits.new_zeros(()), student_logits.new_zeros((batch,)), student_logits.new_zeros((batch,))
+    teacher_logits = teacher_logits.to(student_logits.device)
+    target_ids = target_ids.to(student_logits.device)
+    answer_mask = answer_mask.to(student_logits.device)
     shift_mask = answer_mask[:, 1:].bool()
     answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
     valid_count = answer_counts.sum()
@@ -353,6 +427,8 @@ def masked_ce_loss(
     normalization: str = "token",
 ) -> tuple[Tensor, Tensor, Tensor]:
     batch = student_logits.shape[0]
+    target_ids = target_ids.to(student_logits.device)
+    answer_mask = answer_mask.to(student_logits.device)
     shift_mask = answer_mask[:, 1:].bool()
     answer_counts = shift_mask.sum(dim=1).to(device=student_logits.device, dtype=torch.float32)
     valid_count = answer_counts.sum()
@@ -457,11 +533,34 @@ def build_training_order(args: argparse.Namespace, dataset: JsonlDataset, world_
     return order
 
 
+def module_has_deepspeed_partitioned_params(module: nn.Module) -> bool:
+    return any(hasattr(param, "ds_id") for param in module.parameters())
+
+
+def adapter_state_dict_for_save(adapter: QwenEmbeddingAdapter) -> dict[str, Tensor]:
+    state_dict: dict[str, Tensor] = {}
+    partitioned = distributed_is_initialized() and module_has_deepspeed_partitioned_params(adapter)
+    for name, param in adapter.named_parameters():
+        if partitioned:
+            with deepspeed.zero.GatheredParameters([param], modifier_rank=0):
+                if is_rank0():
+                    state_dict[name] = param.detach().cpu().clone()
+        elif is_rank0():
+            state_dict[name] = param.detach().cpu()
+    if is_rank0():
+        for name, buffer in adapter.named_buffers():
+            state_dict[name] = buffer.detach().cpu()
+    return state_dict
+
+
 def save_checkpoint(adapter: QwenEmbeddingAdapter, output_path: Path, args: argparse.Namespace, global_step: int) -> None:
+    state_dict = adapter_state_dict_for_save(adapter)
+    if not is_rank0():
+        return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "state_dict": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
+            "state_dict": state_dict,
             "args": vars(args),
             "global_step": int(global_step),
             "adapter_config": {
@@ -612,13 +711,16 @@ def run_llava(args: argparse.Namespace) -> None:
     deepspeed.init_distributed(dist_backend=args.dist_backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    if args.required_world_size > 1 and world_size != args.required_world_size:
+        raise RuntimeError(f"expected {args.required_world_size} ranks, got {world_size}")
     is_main = rank == 0
     device = torch.device(f"cuda:{local_rank}")
+    dtype = dtype_from_name(args.dtype)
 
     if is_main:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    processor, model = load_frozen_llava(args.model_path, dtype=torch.bfloat16, device=str(device))
+    processor, model = load_frozen_llava(args.model_path, dtype=dtype, device=str(device), attn_implementation=args.attn_implementation)
     image_token_id = int(getattr(model.config, "image_token_index", 32000))
 
     source_layers = [int(x) for x in args.source_layers.split(",")]
@@ -697,20 +799,14 @@ def run_llava(args: argparse.Namespace) -> None:
     with open(args.deepspeed_config, "r", encoding="utf-8") as f:
         ds_config = json.load(f)
     ds_config["train_micro_batch_size_per_gpu"] = args.batch_size
+    ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
+    ds_config["gradient_clipping"] = args.grad_clip
     engine, optimizer, _, _ = deepspeed.initialize(
         model=adapter,
         optimizer=optimizer,
         config=ds_config,
     )
-
-    warmup_steps = int(args.max_steps * args.warmup_ratio)
-    min_lr = args.lr * args.min_lr_ratio
-
-    def get_lr(step_idx: int) -> float:
-        if step_idx < warmup_steps:
-            return args.lr * step_idx / max(warmup_steps, 1)
-        progress = (step_idx - warmup_steps) / max(args.max_steps - warmup_steps, 1)
-        return min_lr + (args.lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+    base_lrs = [float(group.get("lr", args.lr)) for group in optimizer_param_groups(engine)]
 
     dataset = VQADataset(
         args.data,
@@ -788,6 +884,7 @@ def run_llava(args: argparse.Namespace) -> None:
                     single_pixel_values = pixel_values[i].unsqueeze(0).to(device)
                 else:
                     single_pixel_values = pixel_values[i:i+1]
+                single_image_sizes = image_sizes[i:i+1].to(device) if image_sizes is not None and torch.is_tensor(image_sizes) else None
 
                 if use_embedding_adapter:
                     student_logits = student_forward_llava_embedding_adapter(
@@ -797,6 +894,7 @@ def run_llava(args: argparse.Namespace) -> None:
                         engine.module,
                         image_token_id,
                         attention_mask=attention_mask[i:i+1],
+                        image_sizes=single_image_sizes,
                     )
                 else:
                     if source_k_list is not None:
@@ -844,34 +942,44 @@ def run_llava(args: argparse.Namespace) -> None:
                         s_answer[:min_len].float(),
                         t_answer[:min_len].float(),
                         topk=args.kl_topk,
+                        temperature=args.temperature,
                     )
                     total_loss = total_loss + kl
 
-            loss = total_loss / B
+            logit_kl = total_loss / B
+            loss = args.lambda_logit * logit_kl
             engine.backward(loss)
-            current_lr = get_lr(step + 1)
-            for pg in optimizer.param_groups:
-                pg["lr"] = current_lr
+            current_lr = set_engine_lr(engine, base_lrs, lr_multiplier(args, step))
             engine.step()
 
-            if is_main and step % args.log_every == 0:
-                item = {"step": step, "loss": float(loss.item()), "lr": current_lr}
+            completed_step = step + 1
+            if is_main and (completed_step % args.log_every == 0 or completed_step == args.max_steps):
+                item = {
+                    "step": completed_step,
+                    "loss": float(loss.item()),
+                    "logit_kl": float(logit_kl.detach().item()),
+                    "lr": current_lr,
+                    "batch_size": int(B),
+                    "global_batch": int(world_size * args.gradient_accumulation_steps * args.batch_size),
+                    "lambda_logit": float(args.lambda_logit),
+                    "supervision_loss": args.supervision_loss,
+                }
                 print(json.dumps(item), flush=True)
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(item) + "\n")
                 if wandb_run is not None:
                     wandb_run.log({
                         "train/loss": item["loss"],
-                        "train/kl_loss": item["loss"],
+                        "train/kl_loss": item["logit_kl"],
                         "train/lr": current_lr,
-                        "train/step": step,
-                    }, step=step)
+                        "train/step": completed_step,
+                    }, step=completed_step)
 
-            if is_main and step > 0 and step % args.save_every == 0:
-                ckpt_path = Path(args.output_dir) / f"step_{step}.pt"
+            if is_main and completed_step > 0 and completed_step % args.save_every == 0:
+                ckpt_path = Path(args.output_dir) / f"step_{completed_step}.pt"
                 torch.save({
                     "state_dict": engine.module.state_dict(),
-                    "step": step,
+                    "step": completed_step,
                     "args": vars(args),
                     "adapter_config": adapter_config,
                 }, ckpt_path)
@@ -915,6 +1023,20 @@ def run_qwen(args: argparse.Namespace) -> None:
         device = torch.device(args.device)
     rank_id = dist.get_rank() if distributed_is_initialized() else 0
     world_size = dist.get_world_size() if distributed_is_initialized() else 1
+    qwen_device_map = parse_qwen_device_map(args.qwen_device_map)
+    qwen_max_memory = parse_qwen_max_memory(args.qwen_max_memory)
+    if qwen_device_map is not None and world_size > 1:
+        raise RuntimeError("Qwen device_map loading uses one process over the visible GPUs; set NPROC_PER_NODE=1 for 235B.")
+    ds_config: dict[str, Any] | None = None
+    hf_ds_config: Any | None = None
+    qwen_zero3_load = False
+    if distributed and args.distributed_engine == "deepspeed":
+        ds_config = load_train_deepspeed_config(args)
+        qwen_zero3_load = deepspeed_zero_stage(ds_config) == 3 and qwen_device_map is None
+        if qwen_zero3_load:
+            from transformers.integrations import HfDeepSpeedConfig
+
+            hf_ds_config = HfDeepSpeedConfig(ds_config)
     configure_torch_runtime()
     random.seed(args.seed + rank_id)
     torch.manual_seed(args.seed + rank_id)
@@ -928,7 +1050,20 @@ def run_qwen(args: argparse.Namespace) -> None:
         (output_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
     distributed_barrier(device)
 
-    processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    processor, model = load_frozen_qwen3vl(
+        args.model_path,
+        dtype,
+        device,
+        args.attn_implementation,
+        device_map=qwen_device_map,
+        max_memory=qwen_max_memory,
+        move_to_device=not qwen_zero3_load,
+        zero3_sharded_load=qwen_zero3_load,
+        deepspeed_config=ds_config,
+    )
+    _ = hf_ds_config
+    if qwen_device_map is not None:
+        device = qwen_input_device(model)
     language_model = model.model.language_model
     num_layers = len(language_model.layers)
     adapter = QwenEmbeddingAdapter.from_language_model(
@@ -953,11 +1088,15 @@ def run_qwen(args: argparse.Namespace) -> None:
     if distributed and args.distributed_engine == "deepspeed":
         import deepspeed
 
-        ds_config = json.loads(Path(args.deepspeed_config).read_text(encoding="utf-8"))
-        ds_config["train_micro_batch_size_per_gpu"] = args.micro_batch_size_per_gpu
-        ds_config["gradient_accumulation_steps"] = args.gradient_accumulation_steps
-        ds_config["gradient_clipping"] = args.grad_clip
-        engine, _, _, _ = deepspeed.initialize(model=adapter, model_parameters=trainable_params, optimizer=optimizer, config=ds_config)
+        if ds_config is None:
+            ds_config = load_train_deepspeed_config(args)
+        train_module = QwenAdapterTrainingModule(model, adapter)
+        engine, _, _, _ = deepspeed.initialize(
+            model=train_module,
+            model_parameters=trainable_params,
+            optimizer=optimizer,
+            config=ds_config,
+        )
     elif distributed:
         engine = TorchGradSyncEngine(adapter, optimizer, args.grad_clip)
     else:
@@ -999,6 +1138,14 @@ def run_qwen(args: argparse.Namespace) -> None:
             f"batch_sampling={args.batch_sampling} order_s={order_s:.2f}",
             flush=True,
         )
+        if qwen_device_map is not None:
+            print(f"qwen_device_map={qwen_device_map} input_device={device} max_memory={qwen_max_memory or 'auto'}", flush=True)
+        if ds_config is not None:
+            print(
+                f"deepspeed_zero_stage={deepspeed_zero_stage(ds_config)} "
+                f"qwen_zero3_load={int(qwen_zero3_load)}",
+                flush=True,
+            )
 
     global_step = 0
     while global_step < args.max_steps:
@@ -1017,7 +1164,8 @@ def run_qwen(args: argparse.Namespace) -> None:
                 for offset in range(args.micro_batch_size_per_gpu)
             ]
             forward_start = time.perf_counter()
-            loss, metrics = compute_loss_for_rows(args, processor, model, engine.module, rows, device, dtype, num_layers)
+            loss_model, loss_adapter = qwen_engine_modules(engine, model)
+            loss, metrics = compute_loss_for_rows(args, processor, loss_model, loss_adapter, rows, device, dtype, num_layers)
             loss = loss / float(args.gradient_accumulation_steps)
             engine.backward(loss)
             metrics["loss_forward_s"] = time.perf_counter() - forward_start
@@ -1029,7 +1177,7 @@ def run_qwen(args: argparse.Namespace) -> None:
         engine.step()
         global_step += 1
 
-        if global_step % args.log_every == 0:
+        if global_step % args.log_every == 0 or global_step == args.max_steps:
             accum_metrics["lr"] = current_lr
             accum_metrics["sec_per_step"] = time.perf_counter() - step_start
             reduced = reduce_metric_dict(accum_metrics, device)
@@ -1056,14 +1204,16 @@ def run_qwen(args: argparse.Namespace) -> None:
                     wandb.log({f"train/{key}": value for key, value in payload.items() if isinstance(value, (int, float))})
 
         if global_step % args.save_every == 0:
-            engine.save_checkpoint(str(output_dir / "optimizer"), tag=f"step{global_step}")
-            if is_rank0():
-                save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
+            if not isinstance(getattr(engine, "module", None), QwenAdapterTrainingModule):
+                engine.save_checkpoint(str(output_dir / "optimizer"), tag=f"step{global_step}")
+            _, save_adapter = qwen_engine_modules(engine, model)
+            save_checkpoint(save_adapter, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
 
-    engine.save_checkpoint(str(output_dir / "optimizer"), tag="final")
-    if is_rank0():
-        save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
-        save_checkpoint(engine.module, output_dir / f"{checkpoint_prefix}_final.pt", args, global_step)
+    if not isinstance(getattr(engine, "module", None), QwenAdapterTrainingModule):
+        engine.save_checkpoint(str(output_dir / "optimizer"), tag="final")
+    _, save_adapter = qwen_engine_modules(engine, model)
+    save_checkpoint(save_adapter, output_dir / f"{checkpoint_prefix}_step{global_step}.pt", args, global_step)
+    save_checkpoint(save_adapter, output_dir / f"{checkpoint_prefix}_final.pt", args, global_step)
     distributed_barrier(device)
     if distributed_is_initialized():
         dist.destroy_process_group()
@@ -1089,9 +1239,9 @@ def main() -> None:
         run_qwen(args)
         return
     if args.lr_scheduler is None:
-        args.lr_scheduler = "cosine"
+        args.lr_scheduler = "constant"
     if args.warmup_ratio is None:
-        args.warmup_ratio = 0.2
+        args.warmup_ratio = 0.0
     if args.output_mode is None:
         args.output_mode = "kv_adapter"
     if args.output_mode not in LLAVA_OUTPUT_MODES:

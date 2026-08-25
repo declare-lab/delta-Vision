@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import gc
 import json
 import io
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +16,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     AutoModelForImageTextToText,
     LlavaForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
     Qwen3VLMoeForConditionalGeneration,
 )
+from transformers import initialization as hf_initialization
+from transformers.integrations.deepspeed import _load_state_dict_into_zero3_model
 from transformers.integrations.sdpa_attention import sdpa_attention_forward as hf_sdpa_attention_forward
 from transformers.masking_utils import create_causal_mask
+from transformers.modeling_utils import load_state_dict, local_torch_dtype, set_zero3_state
+from transformers.monkey_patching import apply_patches, patch_output_recorders
+from transformers.utils import ContextManagers
 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb as llama_apply_rotary_pos_emb, repeat_kv as llama_repeat_kv
 from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb as qwen_apply_rotary_pos_emb, repeat_kv as qwen_repeat_kv
 from transformers.vision_utils import (
@@ -1000,8 +1008,24 @@ def load_frozen_llava(
 def llava_projected_image_features(
     model: LlavaForConditionalGeneration,
     pixel_values: torch.Tensor,
+    image_sizes: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if pixel_values.ndim != 4 or hasattr(model.model, "image_newline"):
+    if hasattr(model.model, "image_newline"):
+        if image_sizes is None:
+            raise ValueError("LLaVA-Next embedding_adapter requires image_sizes")
+        image_outputs = model.get_image_features(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+            vision_feature_layer=model.config.vision_feature_layer,
+            vision_feature_select_strategy=model.config.vision_feature_select_strategy,
+        )
+        features = image_outputs.pooler_output
+        if isinstance(features, (list, tuple)):
+            if len(features) != 1:
+                raise NotImplementedError("LLaVA-Next embedding_adapter currently expects one image per forward")
+            return features[0].unsqueeze(0)
+        return features.unsqueeze(0) if features.ndim == 2 else features
+    if pixel_values.ndim != 4:
         raise NotImplementedError("LLaVA embedding_adapter only supports fixed-grid LLaVA-style image features")
     image_outputs = model.model.vision_tower(pixel_values, output_hidden_states=True)
     image_features = image_outputs.hidden_states[model.config.vision_feature_layer]
@@ -1016,9 +1040,10 @@ def prepare_llava_embedding_adapter_inputs(
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
+    image_sizes: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     if visual_memory is None:
-        visual_memory = llava_projected_image_features(model, pixel_values)
+        visual_memory = llava_projected_image_features(model, pixel_values, image_sizes=image_sizes)
 
     language_model = _get_language_model(model)
     valid_mask = attention_mask[0].bool() if attention_mask is not None else torch.ones_like(input_ids[0], dtype=torch.bool)
@@ -1213,6 +1238,7 @@ def llava_embedding_adapter_prefill_cache(
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
+    image_sizes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     prepared = prepare_llava_embedding_adapter_inputs(
         model,
@@ -1221,6 +1247,7 @@ def llava_embedding_adapter_prefill_cache(
         image_token_id,
         attention_mask=attention_mask,
         visual_memory=visual_memory,
+        image_sizes=image_sizes,
     )
     return llava_embedding_adapter_prefill_cache_prepared(model, adapter, **prepared)
 
@@ -1284,6 +1311,7 @@ def student_forward_llava_embedding_adapter(
     image_token_id: int,
     attention_mask: torch.Tensor | None = None,
     visual_memory: torch.Tensor | None = None,
+    image_sizes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run LLaVA text-only LLM with native projected image states as per-layer KV prefix.
 
@@ -1299,6 +1327,7 @@ def student_forward_llava_embedding_adapter(
         image_token_id,
         attention_mask=attention_mask,
         visual_memory=visual_memory,
+        image_sizes=image_sizes,
     )
     return student_forward_llava_embedding_adapter_prepared(model, adapter, **prepared)
 
@@ -1385,11 +1414,104 @@ def resolve_row_image_path(row: dict[str, Any], image_root: Path | None = None) 
     return resolve_row_image_paths(row, image_root)[0]
 
 
+def _dist_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def _rank0_print(message: str) -> None:
+    if _dist_rank() == 0:
+        print(message, flush=True)
+
+
+def _checkpoint_shards(model_path: str | Path) -> list[Path]:
+    model_dir = Path(model_path)
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        filenames = sorted(set(str(name) for name in index.get("weight_map", {}).values()))
+        return [model_dir / name for name in filenames]
+    single = model_dir / "model.safetensors"
+    if single.exists():
+        return [single]
+    shards = sorted(model_dir.glob("*.safetensors"))
+    if shards:
+        return shards
+    raise FileNotFoundError(f"no safetensors checkpoint shards found under {model_dir}")
+
+
+def _load_qwen3vl_zero3_sharded(
+    model_path: str,
+    model_cls: type[Qwen3VLForConditionalGeneration] | type[Qwen3VLMoeForConditionalGeneration],
+    dtype: torch.dtype,
+    attn_implementation: str,
+    deepspeed_config: dict[str, Any],
+) -> Qwen3VLForConditionalGeneration | Qwen3VLMoeForConditionalGeneration:
+    import deepspeed
+
+    model_dir = Path(model_path)
+    shards = _checkpoint_shards(model_dir)
+    config = AutoConfig.from_pretrained(model_path)
+    config.dtype = dtype
+    for sub_config_key in getattr(config, "sub_configs", []):
+        sub_config = getattr(config, sub_config_key, None)
+        if sub_config is not None:
+            sub_config.dtype = dtype
+    if attn_implementation:
+        config._attn_implementation = attn_implementation
+        for sub_config_key in getattr(config, "sub_configs", []):
+            sub_config = getattr(config, sub_config_key, None)
+            if sub_config is not None:
+                sub_config._attn_implementation = attn_implementation
+
+    _rank0_print(
+        f"zero3 sharded load: build empty {model_cls.__name__} dtype={dtype} "
+        f"attn={attn_implementation} shards={len(shards)}"
+    )
+    init_contexts = [
+        apply_patches(),
+        local_torch_dtype(dtype, model_cls.__name__),
+        hf_initialization.no_init_weights(),
+        deepspeed.zero.Init(config_dict_or_path=deepspeed_config),
+        set_zero3_state(),
+    ]
+    with ContextManagers(init_contexts):
+        model = model_cls(config)
+        patch_output_recorders(model)
+
+    loaded_keys: set[str] = set()
+    for idx, shard_path in enumerate(shards, start=1):
+        wall_start = time.perf_counter()
+        _rank0_print(f"zero3 sharded load: shard {idx}/{len(shards)} {shard_path.name}")
+        state_dict = load_state_dict(str(shard_path), map_location="cpu")
+        loaded_keys.update(str(key) for key in state_dict.keys())
+        _load_state_dict_into_zero3_model(model, state_dict)
+        del state_dict
+        gc.collect()
+        elapsed_s = time.perf_counter() - wall_start
+        _rank0_print(f"zero3 sharded load: shard {idx}/{len(shards)} done in {elapsed_s:.2f}s")
+
+    expected_keys = {str(name) for name, _ in model.named_parameters()}
+    expected_keys.update(str(name) for name, _ in model.named_buffers())
+    missing = sorted(expected_keys - loaded_keys)
+    if missing:
+        _rank0_print(f"zero3 sharded load: missing {len(missing)} keys, first={missing[:8]}")
+    model.tie_weights()
+    _rank0_print(f"zero3 sharded load: complete loaded_keys={len(loaded_keys)}")
+    return model
+
+
 def load_frozen_qwen3vl(
     model_path: str,
     dtype: torch.dtype,
     device: torch.device,
     attn_implementation: str = "flash_attention_2",
+    device_map: str | dict[str, Any] | None = None,
+    max_memory: dict[Any, str] | None = None,
+    move_to_device: bool = True,
+    zero3_sharded_load: bool = False,
+    deepspeed_config: dict[str, Any] | None = None,
 ) -> tuple[Any, Qwen3VLForConditionalGeneration | Qwen3VLMoeForConditionalGeneration]:
     processor = AutoProcessor.from_pretrained(model_path)
     if attn_implementation == "auto":
@@ -1397,16 +1519,70 @@ def load_frozen_qwen3vl(
     kwargs: dict[str, Any] = {"torch_dtype": dtype, "low_cpu_mem_usage": True}
     if attn_implementation:
         kwargs["attn_implementation"] = attn_implementation
+    if device_map is not None:
+        kwargs["device_map"] = device_map
+    if max_memory is not None:
+        kwargs["max_memory"] = max_memory
     config_path = Path(model_path) / "config.json"
     model_type = ""
     if config_path.exists():
         model_type = str(json.loads(config_path.read_text(encoding="utf-8")).get("model_type") or "")
     model_cls = Qwen3VLMoeForConditionalGeneration if model_type == "qwen3_vl_moe" else Qwen3VLForConditionalGeneration
-    model = model_cls.from_pretrained(model_path, **kwargs).to(device)
+    if zero3_sharded_load:
+        if device_map is not None:
+            raise ValueError("zero3_sharded_load cannot be combined with device_map")
+        if deepspeed_config is None:
+            raise ValueError("zero3_sharded_load requires deepspeed_config")
+        model = _load_qwen3vl_zero3_sharded(
+            model_path,
+            model_cls,
+            dtype,
+            attn_implementation,
+            deepspeed_config,
+        )
+    else:
+        model = model_cls.from_pretrained(model_path, **kwargs)
+    if device_map is None and move_to_device:
+        model = model.to(device)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
     return processor, model
+
+
+def module_device(module: torch.nn.Module, fallback: torch.device | None = None) -> torch.device:
+    for param in module.parameters(recurse=True):
+        if param.device.type != "meta":
+            return param.device
+    for buffer in module.buffers(recurse=True):
+        if buffer.device.type != "meta":
+            return buffer.device
+    if fallback is not None:
+        return fallback
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def qwen_input_device(model: torch.nn.Module) -> torch.device:
+    qwen_model = model.model
+    return module_device(qwen_model.get_input_embeddings(), module_device(qwen_model))
+
+
+def qwen_visual_device(model: torch.nn.Module) -> torch.device:
+    qwen_model = model.model
+    return module_device(qwen_model.visual, qwen_input_device(model))
+
+
+def move_qwen_inputs_to_device(inputs: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in inputs.items()}
+
+
+def _move_position_embeddings(
+    embeddings: tuple[Tensor, Tensor] | None,
+    device: torch.device,
+) -> tuple[Tensor, Tensor] | None:
+    if embeddings is None:
+        return None
+    return tuple(tensor.to(device) for tensor in embeddings)  # type: ignore[return-value]
 
 
 def qwen3vl_text_ids_and_answer_mask(
@@ -1511,16 +1687,18 @@ def qwen_position_ids(
     inputs_embeds: Tensor | None = None,
 ) -> Tensor:
     qwen_model = model.model
+    device = inputs_embeds.device if inputs_embeds is not None else qwen_input_device(model)
+    input_ids = inputs["input_ids"].to(device)
     if inputs_embeds is None:
-        inputs_embeds = qwen_model.get_input_embeddings()(inputs["input_ids"])
+        inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
     position_ids = qwen_model.compute_3d_position_ids(
-        input_ids=inputs["input_ids"],
-        image_grid_thw=inputs.get("image_grid_thw"),
-        video_grid_thw=inputs.get("video_grid_thw"),
+        input_ids=input_ids,
+        image_grid_thw=inputs.get("image_grid_thw").to(device) if torch.is_tensor(inputs.get("image_grid_thw")) else inputs.get("image_grid_thw"),
+        video_grid_thw=inputs.get("video_grid_thw").to(device) if torch.is_tensor(inputs.get("video_grid_thw")) else inputs.get("video_grid_thw"),
         inputs_embeds=inputs_embeds,
-        attention_mask=inputs.get("attention_mask"),
+        attention_mask=inputs.get("attention_mask").to(device) if torch.is_tensor(inputs.get("attention_mask")) else inputs.get("attention_mask"),
         past_key_values=None,
-        mm_token_type_ids=inputs.get("mm_token_type_ids"),
+        mm_token_type_ids=inputs.get("mm_token_type_ids").to(device) if torch.is_tensor(inputs.get("mm_token_type_ids")) else inputs.get("mm_token_type_ids"),
     )
     if position_ids is None:
         raise RuntimeError("Qwen3-VL position_ids could not be computed")
@@ -1557,13 +1735,16 @@ def build_qwen_initial_context(
     visual_grid_metadata: dict[str, Any] | None = None,
 ) -> tuple[Tensor, Tensor]:
     qwen_model = model.model
-    input_ids = inputs["input_ids"]
+    input_device = qwen_input_device(model)
+    visual_device = qwen_visual_device(model)
+    input_ids = inputs["input_ids"].to(input_device)
     inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
     position_inputs_embeds = inputs_embeds
     image_kwargs = dict(visual_grid_metadata) if visual_grid_metadata is not None else {}
+    image_kwargs = {key: value.to(visual_device) if torch.is_tensor(value) else value for key, value in image_kwargs.items()}
     image_outputs = qwen_model.visual(
-        inputs["pixel_values"].type(qwen_model.visual.dtype),
-        grid_thw=inputs["image_grid_thw"],
+        inputs["pixel_values"].to(visual_device).type(qwen_model.visual.dtype),
+        grid_thw=inputs["image_grid_thw"].to(visual_device),
         return_dict=True,
         **image_kwargs,
     )
@@ -1808,6 +1989,10 @@ class QwenEmbeddingAdapter(nn.Module):
                 memories.append(current)
             return torch.stack(memories, dim=0)
 
+        if self.training and any(hasattr(param, "ds_id") for param in self.parameters()):
+            memories = [self.visual_memory_for_layer(visual_memory, layer_idx) for layer_idx in range(self.num_layers)]
+            return torch.stack(memories, dim=0)
+
         L = self.num_layers
         B, N, H = visual_memory.shape
         if self.training:
@@ -1908,6 +2093,8 @@ def qwen_lm_head_logits(
     *,
     logits_to_keep: int = 0,
 ) -> Tensor:
+    if text_mask is not None:
+        text_mask = text_mask.to(hidden_states.device)
     if logits_to_keep > 0:
         if logits_to_keep == 1 and text_mask is not None:
             if text_mask.shape[0] == 1:
@@ -1918,10 +2105,14 @@ def qwen_lm_head_logits(
                 hidden_states = hidden_states[batch_idx, last_idx].unsqueeze(1)
         else:
             hidden_states = hidden_states[:, -int(logits_to_keep) :]
+    norm_device = module_device(language_model.norm, hidden_states.device)
+    hidden_states = hidden_states.to(norm_device)
     if torch.compiler.is_compiling():
         hidden_states = _eager_module_call(language_model.norm, hidden_states)
     else:
         hidden_states = language_model.norm(hidden_states)
+    head_device = module_device(model.lm_head, hidden_states.device)
+    hidden_states = hidden_states.to(head_device)
     return model.lm_head(hidden_states)
 
 
@@ -1997,6 +2188,13 @@ def qwen_embedding_adapter_logits_prepared(
     # Pre-compute all visual memories in one batched BMM
     all_vis_memories = adapter.all_visual_memories_batched(visual_memory)  # [L, B, N, H]
     for layer_idx, layer in enumerate(layers):
+        layer_device = module_device(layer, h.device)
+        h = h.to(layer_device)
+        text_position_ids_layer = text_position_ids.to(layer_device)
+        visual_position_ids_layer = visual_position_ids.to(layer_device)
+        prefix_attention_mask_layer = prefix_attention_mask.to(layer_device)
+        layer_text_position_embeddings = _move_position_embeddings(text_position_embeddings, layer_device)
+        layer_visual_position_embeddings = _move_position_embeddings(visual_position_embeddings, layer_device)
         attn = layer.self_attn
         normed_text = _eager_module_call(layer.input_layernorm, h) if compile_exact else layer.input_layernorm(h)
         text_shape = normed_text.shape[:-1]
@@ -2006,21 +2204,19 @@ def qwen_embedding_adapter_logits_prepared(
         query = (_eager_module_call(attn.q_norm, raw_query) if compile_exact else attn.q_norm(raw_query)).transpose(1, 2)
         text_key = (_eager_module_call(attn.k_norm, raw_text_key) if compile_exact else attn.k_norm(raw_text_key)).transpose(1, 2)
         text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
-        layer_text_position_embeddings = text_position_embeddings
         if layer_text_position_embeddings is None:
-            layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
+            layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids_layer)
         query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
 
-        vision_states = all_vis_memories[layer_idx]
+        vision_states = all_vis_memories[layer_idx].to(layer_device)
         normed_vision = _eager_module_call(layer.input_layernorm, vision_states) if compile_exact else layer.input_layernorm(vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
         raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
         visual_key = (_eager_module_call(attn.k_norm, raw_visual_key) if compile_exact else attn.k_norm(raw_visual_key)).transpose(1, 2)
         visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
-        layer_visual_position_embeddings = visual_position_embeddings
         if layer_visual_position_embeddings is None:
-            layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
+            layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids_layer)
         visual_key = _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings)
 
         heads = (
@@ -2031,7 +2227,7 @@ def qwen_embedding_adapter_logits_prepared(
                 visual_value,
                 text_key,
                 text_value,
-                attention_mask=prefix_attention_mask,
+                attention_mask=prefix_attention_mask_layer,
                 scaling=float(attn.scaling),
             )
             if use_hf_attention
@@ -2041,7 +2237,7 @@ def qwen_embedding_adapter_logits_prepared(
                 visual_value,
                 text_key,
                 text_value,
-                attention_mask=prefix_attention_mask,
+                attention_mask=prefix_attention_mask_layer,
                 scaling=float(attn.scaling),
             )
         )

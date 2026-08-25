@@ -6,8 +6,9 @@ PY="${ROOT}/.venv/bin/python"
 EVAL_SCRIPT="${ROOT}/baselines/eval_baselines.py"
 
 METHODS="${METHODS:-divprune zoo}"
+MODEL_LABELS="${MODEL_LABELS:-all}"
 RETENTIONS="${RETENTIONS:-0.05 0.10 0.15 0.20}"
-BENCHMARKS="${BENCHMARKS:-mmstar,gqa,mmb,mmb-cn,mme,pope,sqa,vqav2,realworldqa,perceptionbench}"
+BENCHMARKS="${BENCHMARKS:-mmstar,gqa,mmb,mmb-cn,mme,pope,sqa,vqav2,realworldqa}"
 FULL_BENCHMARKS="${FULL_BENCHMARKS:-}"
 MAX_SAMPLES="${MAX_SAMPLES:-1000}"
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -17,6 +18,7 @@ LOG_DIR="${ROOT}/artifacts/eval/baselines/logs"
 mkdir -p "${LOG_DIR}"
 
 echo "run_id=${RUN_ID}"
+echo "model_labels=${MODEL_LABELS}"
 echo "methods=${METHODS}"
 echo "retentions=${RETENTIONS}"
 echo "benchmarks=${BENCHMARKS}"
@@ -39,6 +41,7 @@ for method in ${METHODS}; do
       echo "phase=limited benchmark=${BENCHMARKS} max_samples=${MAX_SAMPLES}"
       CUDA_VISIBLE_DEVICES="${gpu}" "${PY}" "${EVAL_SCRIPT}" \
         --method "${method}" \
+        --model-label "${MODEL_LABELS}" \
         --retention "${ret}" \
         --benchmark "${BENCHMARKS}" \
         --data-root "${ROOT}" \
@@ -48,6 +51,7 @@ for method in ${METHODS}; do
         echo "phase=full benchmark=${FULL_BENCHMARKS} max_samples=all"
         CUDA_VISIBLE_DEVICES="${gpu}" "${PY}" "${EVAL_SCRIPT}" \
           --method "${method}" \
+          --model-label "${MODEL_LABELS}" \
           --retention "${ret}" \
           --benchmark "${FULL_BENCHMARKS}" \
           --data-root "${ROOT}" \

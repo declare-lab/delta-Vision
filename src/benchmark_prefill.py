@@ -6,6 +6,7 @@ import csv
 import glob
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -56,6 +57,13 @@ def configure_torch_runtime() -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def maybe_compile(fn: Callable[[], Any], args: argparse.Namespace, *, enabled: bool) -> Callable[[], Any]:
@@ -235,6 +243,10 @@ def _tree_signature(value: Any) -> Any:
         return _tensor_signature(value)
     if isinstance(value, tuple):
         return tuple(_tree_signature(item) for item in value)
+    if isinstance(value, list):
+        return tuple(_tree_signature(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, _tree_signature(value[key])) for key in sorted(value))
     if isinstance(value, (bool, int, float, str)):
         return (type(value).__name__, value)
     raise TypeError(f"unsupported CUDA graph value type: {type(value)!r}")
@@ -247,6 +259,10 @@ def _clone_tree_for_cuda_graph(value: Any) -> Any:
         return torch.empty_like(value).copy_(value)
     if isinstance(value, tuple):
         return tuple(_clone_tree_for_cuda_graph(item) for item in value)
+    if isinstance(value, list):
+        return [_clone_tree_for_cuda_graph(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _clone_tree_for_cuda_graph(item) for key, item in value.items()}
     if isinstance(value, (bool, int, float, str)):
         return value
     raise TypeError(f"unsupported CUDA graph value type: {type(value)!r}")
@@ -263,6 +279,18 @@ def _copy_tree_(target: Any, source: Any) -> None:
             raise RuntimeError("CUDA graph tuple length changed")
         for target_item, source_item in zip(target, source):
             _copy_tree_(target_item, source_item)
+        return
+    if isinstance(target, list) and isinstance(source, list):
+        if len(target) != len(source):
+            raise RuntimeError("CUDA graph list length changed")
+        for target_item, source_item in zip(target, source):
+            _copy_tree_(target_item, source_item)
+        return
+    if isinstance(target, dict) and isinstance(source, dict):
+        if target.keys() != source.keys():
+            raise RuntimeError("CUDA graph dict keys changed")
+        for key in target:
+            _copy_tree_(target[key], source[key])
         return
     if isinstance(target, (bool, int, float, str)) and isinstance(source, type(target)) and target == source:
         return
@@ -426,6 +454,164 @@ class QwenAdapterCudaGraphRunner:
         if self.output is None:
             raise RuntimeError("CUDA graph did not produce an output")
         return self.output
+
+
+class QwenAdapterPrefillCacheCudaGraphRunner:
+    def __init__(
+        self,
+        *,
+        model: torch.nn.Module,
+        adapter: torch.nn.Module,
+        prepare_qwen_embedding_adapter_inputs: Callable[..., Any],
+        qwen_embedding_adapter_prefill_cache_prepared: Callable[..., Any],
+        logits_to_keep: int,
+        graph_warmup: int,
+        verify: bool,
+        max_diff: float,
+        name: str,
+    ) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--cuda-graph requires CUDA")
+        self.model = model
+        self.adapter = adapter
+        self.prepare_qwen_embedding_adapter_inputs = prepare_qwen_embedding_adapter_inputs
+        self.qwen_embedding_adapter_prefill_cache_prepared = qwen_embedding_adapter_prefill_cache_prepared
+        self.logits_to_keep = int(logits_to_keep)
+        self.graph_warmup = int(max(0, graph_warmup))
+        self.verify = bool(verify)
+        self.max_diff = float(max_diff)
+        self.name = name
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.static_prepared: dict[str, Any] | None = None
+        self.signature: Any = None
+        self.output: tuple[torch.Tensor, torch.Tensor, dict[str, Any]] | None = None
+        self.verified = False
+
+    def _prepare(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        mm_token_type_ids: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> dict[str, Any]:
+        return self.prepare_qwen_embedding_adapter_inputs(
+            self.model,
+            self.adapter,
+            input_ids,
+            attention_mask,
+            mm_token_type_ids,
+            initial_hidden,
+            position_ids,
+            reuse_position_embeddings=True,
+        )
+
+    def _forward_prepared(self, prepared: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        return self.qwen_embedding_adapter_prefill_cache_prepared(
+            self.model,
+            self.adapter,
+            h=prepared["h"],
+            visual_memory=prepared["visual_memory"],
+            text_mask=prepared["text_mask"],
+            image_mask=prepared["image_mask"],
+            text_positions=prepared["text_positions"],
+            image_positions=prepared["image_positions"],
+            text_position_ids=prepared["text_position_ids"],
+            visual_position_ids=prepared["visual_position_ids"],
+            prefix_attention_mask=prepared["prefix_attention_mask"],
+            text_position_embeddings=prepared["text_position_embeddings"],
+            visual_position_embeddings=prepared["visual_position_embeddings"],
+            logits_to_keep=self.logits_to_keep,
+        )
+
+    def _graph_signature(self, prepared: dict[str, Any]) -> tuple[Any, ...]:
+        return (
+            _tree_signature(prepared["h"]),
+            _tree_signature(prepared["visual_memory"]),
+            _tree_signature(prepared["text_mask"]),
+            _tree_signature(prepared["image_mask"]),
+            _tree_signature(prepared["text_positions"]),
+            _tree_signature(prepared["image_positions"]),
+            _tree_signature(prepared["text_position_ids"]),
+            _tree_signature(prepared["visual_position_ids"]),
+            _tree_signature(prepared["prefix_attention_mask"]),
+            _tree_signature(prepared["text_position_embeddings"]),
+            _tree_signature(prepared["visual_position_embeddings"]),
+        )
+
+    def _clone_prepared(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "h": _clone_tree_for_cuda_graph(prepared["h"]),
+            "visual_memory": _clone_tree_for_cuda_graph(prepared["visual_memory"]),
+            "text_mask": _clone_tree_for_cuda_graph(prepared["text_mask"]),
+            "image_mask": _clone_tree_for_cuda_graph(prepared["image_mask"]),
+            "text_positions": _clone_tree_for_cuda_graph(prepared["text_positions"]),
+            "image_positions": _clone_tree_for_cuda_graph(prepared["image_positions"]),
+            "text_position_ids": _clone_tree_for_cuda_graph(prepared["text_position_ids"]),
+            "visual_position_ids": _clone_tree_for_cuda_graph(prepared["visual_position_ids"]),
+            "prefix_attention_mask": _clone_tree_for_cuda_graph(prepared["prefix_attention_mask"]),
+            "text_position_embeddings": _clone_tree_for_cuda_graph(prepared["text_position_embeddings"]),
+            "visual_position_embeddings": _clone_tree_for_cuda_graph(prepared["visual_position_embeddings"]),
+        }
+
+    def _copy_prepared_(self, prepared: dict[str, Any]) -> None:
+        if self.static_prepared is None:
+            raise RuntimeError("CUDA graph static tensors are not initialized")
+        for key in self.static_prepared:
+            _copy_tree_(self.static_prepared[key], prepared[key])
+
+    def _static_forward(self) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        if self.static_prepared is None:
+            raise RuntimeError("CUDA graph static tensors are not initialized")
+        return self._forward_prepared(self.static_prepared)
+
+    def _clone_output_for_decode(self) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        if self.output is None:
+            raise RuntimeError("CUDA graph did not produce an output")
+        logits, text_mask, decode_cache = self.output
+        return logits, text_mask, _clone_tree_for_cuda_graph(decode_cache)
+
+    def _capture(self, prepared: dict[str, Any], signature: Any) -> None:
+        eager_logits, eager_text_mask, _ = self._forward_prepared(prepared)
+        device = eager_logits.device
+        self.static_prepared = self._clone_prepared(prepared)
+        with torch.cuda.device(device):
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                for _ in range(self.graph_warmup):
+                    self._static_forward()
+            torch.cuda.current_stream().wait_stream(side_stream)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.output = self._static_forward()
+            self.graph.replay()
+        if self.verify and not self.verified:
+            if self.output is None:
+                raise RuntimeError("CUDA graph did not produce an output")
+            graph_logits, graph_text_mask, _ = self.output
+            assert_same_logits(self.name, eager_logits, graph_logits, self.max_diff)
+            if not torch.equal(eager_text_mask, graph_text_mask):
+                raise RuntimeError(f"{self.name} CUDA graph changed text mask")
+            self.verified = True
+        self.signature = signature
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        mm_token_type_ids: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        prepared = self._prepare(input_ids, attention_mask, mm_token_type_ids, initial_hidden, position_ids)
+        signature = self._graph_signature(prepared)
+        if self.graph is None or signature != self.signature:
+            self._capture(prepared, signature)
+        else:
+            self._copy_prepared_(prepared)
+            self.graph.replay()
+        return self._clone_output_for_decode()
 
 
 class QwenContextCudaGraphRunner:
@@ -1237,8 +1423,8 @@ def run_qwen3vl_batch_prefill(args: argparse.Namespace) -> None:
     if args.bucket_by_length:
         data_root = Path(args.data_root).expanduser()
         if bool(getattr(args, "exact_bucket_lengths", False)):
-            keyed_rows: list[tuple[int, dict[str, Any]]] = []
-            for row in rows:
+            keyed_rows: list[tuple[int, int, dict[str, Any]]] = []
+            for row_idx, row in enumerate(rows):
                 row_inputs, _, _, _ = prepare_qwen3vl_batch_inputs(
                     processor,
                     [row],
@@ -1246,12 +1432,17 @@ def run_qwen3vl_batch_prefill(args: argparse.Namespace) -> None:
                     device,
                     include_answers=False,
                 )
-                keyed_rows.append((int(row_inputs["attention_mask"].bool().sum().item()), row))
-            keyed_rows = sorted(keyed_rows, key=lambda item: item[0])
+                keyed_rows.append((int(row_inputs["attention_mask"].bool().sum().item()), row_idx, row))
+            keyed_rows = [(length, row) for length, _, row in sorted(keyed_rows, key=lambda item: (item[0], item[1]))]
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         else:
-            keyed_rows = sorted((rough_qwen_length_key(row), row) for row in rows)
+            keyed_rows = [
+                (length, row)
+                for length, _, row in sorted(
+                    (rough_qwen_length_key(row), row_idx, row) for row_idx, row in enumerate(rows)
+                )
+            ]
     else:
         keyed_rows = [(rough_qwen_length_key(row), row) for row in rows]
     batches = token_budget_batches(
@@ -1668,7 +1859,16 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
     from src.benchmarks import get_benchmark_spec
     from src.data import QwenBenchmarkDataset
     from src.eval_benchmarks import build_qwen_adapter_logits_fn, evaluate_qwen_benchmark_shard
-    from src.model import is_embedding_adapter_mode, load_frozen_qwen3vl, load_qwen_embedding_adapter_checkpoint
+    from src.model import (
+        build_qwen_initial_context,
+        is_embedding_adapter_mode,
+        load_frozen_qwen3vl,
+        load_qwen_embedding_adapter_checkpoint,
+        prepare_qwen_embedding_adapter_inputs,
+        qwen_embedding_adapter_prefill_cache_prepared,
+        qwen_position_ids,
+        qwen_visual_grid_metadata,
+    )
 
     checkpoint_specs = collect_checkpoint_specs(args)
     if len(checkpoint_specs) != 1:
@@ -1701,6 +1901,80 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
         compile_verify=bool(args.compile_verify),
         compile_max_diff=float(args.compile_max_diff),
     )
+    logits_to_keep = 1 if args.last_logits_only else 0
+    context_graph_runner = None
+    if bool(getattr(args, "cuda_graph", False)) and bool(getattr(args, "cuda_graph_context", False)):
+        context_graph_runner = QwenContextCudaGraphRunner(
+            model=model,
+            build_qwen_initial_context=build_qwen_initial_context,
+            qwen_position_ids=qwen_position_ids,
+            qwen_visual_grid_metadata=qwen_visual_grid_metadata,
+            graph_warmup=int(getattr(args, "cuda_graph_warmup", 3)),
+            verify=bool(getattr(args, "compile_verify", True)),
+            max_diff=float(getattr(args, "compile_max_diff", 0.0)),
+        )
+    prefill_cache_graph_runner = None
+    if bool(getattr(args, "cuda_graph", False)):
+        prefill_cache_graph_runner = QwenAdapterPrefillCacheCudaGraphRunner(
+            model=model,
+            adapter=adapter,
+            prepare_qwen_embedding_adapter_inputs=prepare_qwen_embedding_adapter_inputs,
+            qwen_embedding_adapter_prefill_cache_prepared=qwen_embedding_adapter_prefill_cache_prepared,
+            logits_to_keep=logits_to_keep,
+            graph_warmup=int(getattr(args, "cuda_graph_warmup", 3)),
+            verify=bool(getattr(args, "compile_verify", True)),
+            max_diff=float(getattr(args, "compile_max_diff", 0.0)),
+            name="qwen_metric_prefill_cache_cuda_graph",
+        )
+
+    def fast_adapter_prefill(inputs: dict[str, torch.Tensor]):
+        if context_graph_runner is None:
+            initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
+        else:
+            initial_hidden, position_ids = context_graph_runner(
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["pixel_values"],
+                inputs["image_grid_thw"],
+                inputs["mm_token_type_ids"],
+            )
+        if prefill_cache_graph_runner is not None:
+            logits, text_mask, decode_cache = prefill_cache_graph_runner(
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["mm_token_type_ids"],
+                initial_hidden,
+                position_ids,
+            )
+        else:
+            prepared = prepare_qwen_embedding_adapter_inputs(
+                model,
+                adapter,
+                inputs["input_ids"],
+                inputs["attention_mask"],
+                inputs["mm_token_type_ids"],
+                initial_hidden,
+                position_ids,
+                reuse_position_embeddings=True,
+            )
+            logits, text_mask, decode_cache = qwen_embedding_adapter_prefill_cache_prepared(
+                model,
+                adapter,
+                h=prepared["h"],
+                visual_memory=prepared["visual_memory"],
+                text_mask=prepared["text_mask"],
+                image_mask=prepared["image_mask"],
+                text_positions=prepared["text_positions"],
+                image_positions=prepared["image_positions"],
+                text_position_ids=prepared["text_position_ids"],
+                visual_position_ids=prepared["visual_position_ids"],
+                prefix_attention_mask=prepared["prefix_attention_mask"],
+                text_position_embeddings=prepared["text_position_embeddings"],
+                visual_position_embeddings=prepared["visual_position_embeddings"],
+                logits_to_keep=logits_to_keep,
+            )
+        return logits, text_mask, initial_hidden, position_ids, decode_cache
+
     dataset = QwenBenchmarkDataset(
         str(data_path),
         processor,
@@ -1734,6 +2008,8 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
         adapter_decode_cache=bool(args.adapter_decode_cache),
         adapter_decode_cache_mode=str(args.adapter_decode_cache_mode),
         verify_decode_cache_generation=int(args.verify_decode_cache_generation),
+        adapter_prefill_fn=fast_adapter_prefill,
+        prefill_warmup=int(args.metric_prefill_warmup),
     )
     summary = result["summary"]
     timing = summary["timing"]
@@ -1748,7 +2024,21 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             "prefilling_time_s": timing["teacher_prefill_s"],
             "prefilling_time": timing["teacher_prefill_minsec"],
             "flops": resources["teacher_prefill_flops_avg"],
+            "analytic_flops": resources["teacher_prefill_flops_avg"],
             "kv_cache_mb": resources["teacher_kv_cache_mb_avg"],
+            "analytic_kv_cache_mb": resources["teacher_kv_cache_mb_avg"],
+            "decode_time_s": None,
+            "decode_time": "",
+            "prefill_peak_allocated_mb": resources.get("teacher_prefill_peak_allocated_mb_avg"),
+            "prefill_peak_reserved_mb": resources.get("teacher_prefill_peak_reserved_mb_avg"),
+            "prefill_peak_allocated_delta_mb": resources.get("teacher_prefill_peak_allocated_delta_mb_avg"),
+            "prefill_peak_reserved_delta_mb": resources.get("teacher_prefill_peak_reserved_delta_mb_avg"),
+            "decode_peak_allocated_mb": None,
+            "decode_peak_reserved_mb": None,
+            "decode_peak_allocated_delta_mb": None,
+            "decode_peak_reserved_delta_mb": None,
+            "actual_prefill_decode_cache_mb": None,
+            "actual_final_decode_cache_mb": None,
             "score": _metric_value(summary, "teacher", spec.metric),
             "speedup_total": 1.0,
             "speedup_prefilling": 1.0,
@@ -1765,7 +2055,21 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             "prefilling_time_s": timing["adapter_prefill_s"],
             "prefilling_time": timing["adapter_prefill_minsec"],
             "flops": resources["adapter_prefill_flops_avg"],
+            "analytic_flops": resources["adapter_prefill_flops_avg"],
             "kv_cache_mb": resources["adapter_kv_cache_mb_avg"],
+            "analytic_kv_cache_mb": resources["adapter_kv_cache_mb_avg"],
+            "decode_time_s": timing.get("adapter_decode_s"),
+            "decode_time": timing.get("adapter_decode_minsec", ""),
+            "prefill_peak_allocated_mb": resources.get("adapter_prefill_peak_allocated_mb_avg"),
+            "prefill_peak_reserved_mb": resources.get("adapter_prefill_peak_reserved_mb_avg"),
+            "prefill_peak_allocated_delta_mb": resources.get("adapter_prefill_peak_allocated_delta_mb_avg"),
+            "prefill_peak_reserved_delta_mb": resources.get("adapter_prefill_peak_reserved_delta_mb_avg"),
+            "decode_peak_allocated_mb": resources.get("adapter_decode_peak_allocated_mb_avg"),
+            "decode_peak_reserved_mb": resources.get("adapter_decode_peak_reserved_mb_avg"),
+            "decode_peak_allocated_delta_mb": resources.get("adapter_decode_peak_allocated_delta_mb_avg"),
+            "decode_peak_reserved_delta_mb": resources.get("adapter_decode_peak_reserved_delta_mb_avg"),
+            "actual_prefill_decode_cache_mb": resources.get("adapter_prefill_decode_cache_mb_avg"),
+            "actual_final_decode_cache_mb": resources.get("adapter_final_decode_cache_mb_avg"),
             "score": _metric_value(summary, "adapter", spec.metric),
             "speedup_total": timing["speedup_total"],
             "speedup_prefilling": timing["speedup_prefill"],
@@ -1789,6 +2093,26 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             f"{_fmt_flops(row['flops']):>10} {row['kv_cache_mb']:12.2f} {_fmt_score(row['score']):>9} "
             f"{fmt_speedup(1.0, 1.0 / row['speedup_total']) if row['speedup_total'] else '':>10} "
             f"{fmt_speedup(1.0, 1.0 / row['speedup_prefilling']) if row['speedup_prefilling'] else '':>10}"
+        )
+    print()
+    print("Actual runtime/resource fields")
+    actual_header = (
+        f"{'method':14} {'Decode Time':>12} {'Prefill Peak MB':>16} {'Decode Peak MB':>15} "
+        f"{'Prefill Cache MB':>16} {'Final Cache MB':>14}"
+    )
+    print(actual_header)
+    print("-" * len(actual_header))
+
+    def fmt_optional_mb(value: Any) -> str:
+        return "" if value is None else f"{float(value):.2f}"
+
+    for row in rows:
+        print(
+            f"{row['method'][:14]:14} {str(row.get('decode_time', '')):>12} "
+            f"{fmt_optional_mb(row.get('prefill_peak_allocated_mb')):>16} "
+            f"{fmt_optional_mb(row.get('decode_peak_allocated_mb')):>15} "
+            f"{fmt_optional_mb(row.get('actual_prefill_decode_cache_mb')):>16} "
+            f"{fmt_optional_mb(row.get('actual_final_decode_cache_mb')):>14}"
         )
     write_outputs(rows, args)
 
@@ -2147,6 +2471,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-table", action="store_true", help="Run a small base-vs-adapter metric table from benchmark samples.")
     parser.add_argument("--benchmark", default="pope", help="Benchmark name for --metric-table. Defaults to POPE for F1.")
     parser.add_argument("--metric-samples", type=int, default=10, help="Number of benchmark samples for --metric-table.")
+    parser.add_argument("--metric-prefill-warmup", type=int, default=1, help="Unmeasured per-sample prefill warmup for --metric-table speed timing.")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Override metric-table generation length.")
     parser.add_argument("--answer-instruction", default=None, help="Override benchmark answer instruction for --metric-table.")
     parser.add_argument("--input-cache-dir", default="", help="Optional cache for processed benchmark inputs in --metric-table.")
@@ -2259,11 +2584,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-decode-cache-generation", type=int, default=0, help="Verify this many decode-cache generations against full recompute.")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-csv", default="")
+    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    set_global_seed(int(args.seed))
     if args.skip_e2e:
         args.measure_cached = True
     configure_torch_runtime()
