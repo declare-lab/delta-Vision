@@ -315,7 +315,155 @@ writes aggregate CSV/JSON summaries with:
 `src/benchmark_prefill.py` is the unified prefill benchmark utility. The old
 `src/qwen_benchmark_utils.py` path has been removed.
 
-Small Qwen metric table:
+Qwen adapter and pruning speed comparison using the original evaluation entry points:
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=0 \
+.venv/bin/python -m src.benchmark_prefill \
+  --model-path /lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct \
+  --checkpoint artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt \
+  --compare-methods all --comparison-protocol original \
+  --comparison-deepstack off \
+  --cuda-graph --cuda-graph-context --attn-implementation flash_attention_2 \
+  --native-cuda-graphs --optimize-attention-metadata --measure-decode-steps \
+  --retentions 0.05 0.2 --benchmark mmstar \
+  --sample-jsonl data/benchmarks/mmstar/mmstar_speedtest_200.jsonl \
+  --data-root data/benchmarks/mmstar --metric-samples 200 \
+  --metric-prefill-warmup 1 --max-new-tokens 8 \
+  --adapter-decode-cache-mode fast --log-every 25 \
+  --output-json test/results/all_fa2_mmstar200/table.json
+```
+
+`--compare-methods` defaults to `--comparison-protocol original`. It runs
+`benchmark_prefill --metric-table` for base + adapter, then `baselines.eval_baselines`
+for base + FastV, DART, DivPrune, ZooPrune, SparseVLM and VisionZip at each retention.
+These are the repository's Qwen ports. Methods can also be selected individually.
+
+- Adapter prefill uses the original vision-context and prefill-cache CUDA Graphs.
+  Graph capture and warmup occur outside timing; vision runs for every request.
+  In this fast path, `--attn-implementation flash_attention_2` selects FA2 for
+  adapter text attention as well as native vision attention. Text queries are
+  grouped by their original sequence positions so text before an image cannot
+  attend that image. Both cached decode modes also use FA2. This FA2 adapter
+  benchmark currently requires unpadded batch-size-one inputs.
+  `fast` is the decode default: each step processes one new token with growing KV,
+  using a warmed whole-decode CUDA Graph. It omits saved prefix layer activations.
+  `shape_exact` retains the older full-text-prefix recomputation for BF16 shape
+  comparisons. It is not the fast decode path. Unpadded cached queries that see
+  the entire prefix use native dense FA2 without gathering K/V or rereading the
+  mask on the CPU each step; other masks retain the varlen FA2 path.
+  For this unpadded FA2 path, prefill constructs an owned native Qwen cache once;
+  subsequent steps call the same native Qwen decoder used by base. Cache preparation
+  is included in prefill timing. Explicit sequence and M-RoPE positions preserve
+  the adapter's original logits. Masked prefixes retain the manual FA2 decoder,
+  whose graphs share immutable visual K/V across steps. Returned caches retain
+  their own data across later requests.
+- `--native-cuda-graphs` also graphs the native vision and decoder layers for base
+  and all six pruning methods, plus the whole native forward during cached decode.
+  In FA2 `--compare-methods --comparison-protocol original` runs, this now defaults
+  on whenever adapter CUDA Graphs are enabled; attention metadata reuse also defaults
+  on. This avoids comparing the adapter's graph replay against native Python dispatch.
+  Use `--no-native-cuda-graphs --no-optimize-attention-metadata` only when explicitly
+  measuring that older execution path.
+  DivPrune/ZooPrune selection and DART neighbor tensor work use warmed graphs;
+  pruning audit CPU copies are disabled during benchmark execution. DART retains
+  its original candidate order and top-k tie behavior. Every sample checks exact token, logit and KV
+  equality with eager FA2 before timing. Graph preparation is separately reported;
+  timed capture or a missing warmed shape fails the run. ZooPrune random state is
+  restored around preparation so warmup does not change its selections.
+- DeepStack is disabled by default for this comparison: vision side mergers are
+  skipped and language injection is forbidden, including on the adapter's vision
+  path. `--comparison-deepstack native` explicitly restores the older setting.
+  Base and pruning use original HF `generate`, stopping
+  at EOS or the generation limit. Adapter retains the original metric-table
+  structured-answer early stop. MMStar defaults to an 8-token limit. These original
+  stop policies can produce different output lengths; total speedup includes that effect.
+  For equal-work prefill/decode comparisons, run
+  `test/diagnostics/paired_runtime_execution.py --tokens 8`: it alternates each
+  method with base on the same GPU, suppresses EOS for all methods, and checks all
+  eight logits and the final growing KV against eager execution before timing.
+  Its totals are a separate fixed-output protocol, not the historical stopping run.
+- Times are sums across the selected samples. Image loading, preprocessing,
+  CPU-to-GPU copies and warmup are excluded. Prefill includes vision and the
+  method's processing through first-token logits. Adapter total adds continuation
+  to its measured prefill; native total measures the original `generate` call.
+- Each retention group and adapter run records its own measured base denominator.
+  Total speedup is paired base total / method total; prefill speedup is paired base
+  prefill / method prefill. The output retains all base rows and reference values.
+  With native graphs enabled, the adapter uses the optimized native base reference
+  from the baseline run; the legacy eager teacher row remains in raw adapter output.
+- Adapter `kv_cache_mb` uses measured prefill K/V storage when available; the old
+  estimate is retained as `analytic_kv_cache_mb`. Adapter
+  `actual_prefill_kv_cache_mb` counts retained text and visual K/V tensors;
+  `actual_prefill_decode_cache_mb` includes additional decoding state. The old
+  analytic text-KV-plus-one-visual-memory estimate is not actual runtime cache usage.
+- FLOPs preserve the original analytical decoder prefill formula (2 FLOPs/MAC),
+  excluding vision, selection, LM head, normalization and softmax. They are mean
+  per-sample prefill FLOPs, not whole-model or complete-generation FLOPs.
+- `Peak Memory` / `peak_memory_mb` is the maximum per-request CUDA allocated
+  memory over the dataset, in MiB. It includes the evaluation process's weights,
+  retained graph pools, KV and activations. Capture itself is excluded; other
+  processes' memory is not counted. Per-stage maxima, mean per-request peaks and
+  reserved memory are also saved. Native evaluation enables this with
+  `--measure-peak-memory`; the comparison orchestrator enables it automatically.
+
+Outputs include JSON/CSV/Markdown tables, a protocol JSON with commands and hashes,
+raw entry-point logs, paired references, and per-sample results. `--metric-table`
+also writes a `.details.json` sidecar when `--output-json` is provided.
+
+`--comparison-protocol fixed-work` explicitly selects the earlier fixed-token
+benchmark with a custom cached decode loop. Its `--comparison-runs`,
+`--comparison-decode-mode` and `--comparison-deepstack` options belong to that
+separate protocol. It does not reproduce the historical MMStar speed table.
+
+### Corrected prefill / decode accounting
+
+Add `--optimize-attention-metadata --measure-decode-steps` to the comparison command
+above to enable the FA2 metadata fix and direct decode measurements. The original
+baseline entry supports the equivalent flags `--optimize-attention-metadata
+--measure-decode`.
+
+The metadata fix preserves original RoPE, padding masks, caches, **and the original
+varlen/dense kernel choice**. It caches sequence metadata once per pruned position
+tensor instead of re-inferring it at every layer. Simply switching the varlen kernel
+to a dense kernel can change BF16 near-tie answers and is not the implemented fix.
+
+For baselines, `generation_prefill_time_s` measures the first forward inside native
+`generate`; `decode_time_s` measures subsequent cached one-token forwards directly.
+`generation_overhead_s` accounts for the remaining generation work. Thus total equals
+generation prefill + decode forwards + overhead. `prefilling_time_s` still records
+the separately measured standalone prefill and must not be subtracted from total to
+claim a decode time. Reports also include `decode_steps`, `decode_ms_per_step`,
+`generated_tokens`, and actual retained K/V storage.
+
+For the adapter, direct decode-step timing is optional and separate from its existing
+continuation timer. Structured-answer early stopping can finish at the first token:
+zero decode steps means decode ms/token is **not applicable**, not zero-cost decoding.
+Shared-GPU measurements include contention and must be labelled separately from
+isolated speed measurements.
+
+The focused **screenshot reproduction: adapter and FastV 5%** is in
+[`test/results/screenshot_adapter_fastv_20260915/README.zh.md`](test/results/screenshot_adapter_fastv_20260915/README.zh.md).
+It contains recovered historical commands/CSV/forward code, the measured FA2 and
+DeepStack-off results, Peak Memory, and the remaining protocol differences.
+
+The earlier **FA2, DeepStack-off** MMStar 200 comparison is in
+[`test/results/deepstack_off_20260915/README.zh.md`](test/results/deepstack_off_20260915/README.zh.md).
+It includes Peak Memory, actual KV, the native adapter decoder, and same-input
+5%/20% interleaving. The JSON/CSV retain the distinct measured base denominators.
+
+The earlier MMStar 200 stage report is in
+[`test/results/prefill_decode_corrected_20260915/README.zh.md`](test/results/prefill_decode_corrected_20260915/README.zh.md).
+It includes actual KV storage, direct decode steps, all requested resource/speed
+columns, and output parity against the original run. The accompanying
+[`FA2 diagnosis`](test/results/prefill_slowdown_investigation_20260915/README.zh.md)
+records the preserved kernels and removed repeated metadata operations.
+The [decode operator breakdown](test/results/decode_operator_breakdown_20260915/README.zh.md)
+also measures actual attention shapes, attributes GPU kernels, and uses an exact
+fixed-step CUDA Graph diagnostic to distinguish attention savings from native
+dispatch cost. The diagnostic graph timings are not complete-generation results.
+
+Legacy base-versus-adapter quality/metric table:
 
 ```bash
 .venv/bin/python -m src.benchmark_prefill \
@@ -451,3 +599,37 @@ MAX_NEW_TOKENS=512
 NUM_SHARDS=8
 COMPILE_ADAPTER=0
 ```
+## Qwen3.5 hybrid-attention adapter workflow
+
+The Qwen3.5-4B integration is in `src/qwen35_embedding.py` and
+`src/qwen35_experiment.py`. Each of the 32 layers has an independent
+2560 → 128 → 2560 residual MLP taking the initial visual embedding. The
+24 GatedDeltaNet layers preserve original-order causal convolution and all
+visual/text recurrent-state updates. Visual mixer outputs are discarded;
+the FFN processes text only. This implementation still computes visual
+query/readout work and is not a maximum-speed implementation.
+
+Training freezes the native model and uses the existing answer-token top-1024
+KL objective at temperature 2. No hidden-state, attention or recurrent-state
+loss is added. Microbatch-one accumulation preserves the original PixMo
+microbatch-four answer-token weighting. DeepStack and thinking are disabled.
+
+- `scripts/queue_qwen35_pixmo.py`: the local experiment queue, with a preceding
+  run dependency, correctness checks, native nine-benchmark evaluation,
+  2000-step PixMo-AMA training and adapter evaluation. Inspect its local paths
+  and predecessor before launching it on another machine.
+- `scripts/qwen35_worker.py`: validation, distributed training and sharded
+  evaluation entrypoints, configured by the prepared run's `config.json`.
+- `configs/qwen35_adapter_requirements.txt`: isolated FLA/causal-conv1d/Triton
+  dependencies. Install with `python -m pip install --no-deps --no-build-isolation
+  --target artifacts/dependencies/qwen35_python -r configs/qwen35_adapter_requirements.txt`.
+  Triton 3.7.1 is required here to avoid the older gated-backward issue on H200.
+- `test/diagnostics/test_qwen35_embedding.py`: CPU checks for hybrid-cache
+  equivalence and KL value/gradient/accumulation parity with the existing loss.
+
+The document continuation workflows are `scripts/train_document_embedding128.py`
+and `scripts/train_document_recurrent128.py`, with data preparation in
+`scripts/prepare_document_training.py`. They use the training splits of ChartQA,
+DocVQA and InfographicVQA, excluding exact encoded-image or decoded-RGB matches
+to the held-out data. The evaluation uses ChartQA relaxed accuracy and
+DocVQA/InfographicVQA ANLS, implemented in `src/document_metrics.py`.

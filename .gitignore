@@ -15,3 +15,11 @@ __pycache__/
 
 # Local baseline artifacts
 baselines/
+
+# Downloaded models and local diagnostic dependencies/output
+/models/
+*.safetensors
+/test/runtime_deps/
+/test/diagnostics/*.log
+/test/diagnostics/fastv_screenshot_forward.txt
+/截屏*.png

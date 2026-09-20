@@ -20,6 +20,27 @@ class BenchmarkSpec:
 
 
 BENCHMARK_SPECS: dict[str, BenchmarkSpec] = {
+    "chartqa": BenchmarkSpec(
+        name="chartqa", display_name="ChartQA", metric="chartqa_relaxed",
+        default_data="data/benchmarks/chartqa/eval1000_seed42.jsonl",
+        answer_instruction="Answer the question using a single word or phrase.", max_new_tokens=128,
+    ),
+    "docvqa": BenchmarkSpec(
+        name="docvqa", display_name="DocVQA", metric="anls",
+        default_data="data/benchmarks/docvqa/eval1000_seed42.jsonl",
+        answer_instruction="Answer the question using a single word or phrase.", max_new_tokens=128,
+    ),
+    "infographicvqa": BenchmarkSpec(
+        name="infographicvqa", display_name="InfographicVQA", metric="anls",
+        default_data="data/benchmarks/infographicvqa/eval1000_seed42.jsonl",
+        answer_instruction="Answer the question using a single word or phrase.", max_new_tokens=128,
+    ),
+    "videomme": BenchmarkSpec(
+        name="videomme", display_name="Video-MME", metric="multi_choice",
+        default_data="data/benchmarks/videomme/test.jsonl",
+        answer_instruction="Answer with the option's letter from the given choices directly.",
+        max_new_tokens=16,
+    ),
     "mmstar": BenchmarkSpec(
         name="mmstar",
         display_name="MMStar",
@@ -109,6 +130,11 @@ DEFAULT_BENCHMARK_NAMES: tuple[str, ...] = (
 def canonical_benchmark_name(name: str) -> str:
     key = name.strip().lower().replace("_", "-")
     aliases = {
+        "chart-qa": "chartqa",
+        "doc-vqa": "docvqa",
+        "infovqa": "infographicvqa",
+        "infographic-vqa": "infographicvqa",
+        "video-mme": "videomme",
         "mmbench": "mmb",
         "mmb-en": "mmb",
         "mmbench-en": "mmb",
@@ -476,7 +502,7 @@ def extract_choice(text: str, choices: list[Any] | None = None) -> str | None:
 
 def _realworldqa_choices_from_question(question: Any) -> list[str]:
     found: dict[str, str] = {}
-    for letter, text in re.findall(r"(?m)^\s*([A-D])[\.\):：、]\s*(.+?)\s*$", _stringify(question)):
+    for letter, text in re.findall(r"(?m)^\s*([A-D])(?:[\.\):：、]\s*|[ \t]+)(.+?)\s*$", _stringify(question)):
         found[letter.upper()] = text.strip()
     return [found[letter] for letter in "ABCD" if letter in found]
 
@@ -487,64 +513,56 @@ def score_realworldqa_prediction(
     choices: list[Any] | None = None,
     question: Any = None,
 ) -> dict[str, Any]:
+    """RealWorldQA: explicit option labels or unambiguous whole-answer matches.
+
+    Never match a gold option letter inside prose or a number inside another
+    number. This parser is local, not a claim of an official scoring protocol.
+    """
     choices = _choice_list(choices) or _realworldqa_choices_from_question(question)
-    pred_text = _stringify(prediction_text)
-    gold_text = _stringify(answer)
+    pred_text = _stringify(prediction_text).strip()
+    gold_text = _stringify(answer).strip()
+    clean = pred_text.rsplit("</think>", 1)[-1].strip()
+    pred_norm = normalize_answer(clean)
+    gold_norm = normalize_answer(gold_text)
+
+    def contains_phrase(text, phrase):
+        return bool(phrase and re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text))
 
     if choices:
-        pred_letter = extract_choice(pred_text, choices)
-        gold_letter = canonical_choice(gold_text, choices)
-        if pred_letter and gold_letter:
-            return {
-                "prediction": pred_letter,
-                "gold": gold_letter,
-                "score": float(pred_letter == gold_letter),
-                "invalid": False,
-            }
-        if pred_letter:
-            idx = ord(pred_letter) - ord("A")
-            if 0 <= idx < len(choices):
-                pred_norm = normalize_answer(choices[idx])
-                gold_norm = normalize_answer(gold_text)
-                return {
-                    "prediction": pred_letter,
-                    "gold": gold_norm,
-                    "score": float(bool(gold_norm) and pred_norm == gold_norm),
-                    "invalid": False,
-                }
-        pred_norm = normalize_answer(pred_text)
-        gold_norm = normalize_answer(gold_text)
-        return {
-            "prediction": pred_norm,
-            "gold": gold_norm,
-            "score": float(bool(pred_norm) and bool(gold_norm) and (pred_norm == gold_norm or gold_norm in pred_norm)),
-            "invalid": not bool(pred_norm),
-        }
+        letters = _choice_letters(len(choices))
+        gold_letter = gold_text.upper() if gold_text.upper() in letters else None
+        if gold_letter is None:
+            matches = [letters[i] for i, c in enumerate(choices)
+                       if normalize_answer(c) == gold_norm and gold_norm]
+            gold_letter = matches[0] if len(matches) == 1 else None
+        pred_letter = None
+        patterns = [
+            r"^\s*[\(\[]?([A-Z])(?:[\)\]\.。,:：]|\s*$|\s*\n)",
+            r"(?:ANSWER|OPTION|CHOICE|答案|选项)\s*(?:IS|是|:|：)?\s*[\(\[]?([A-Z])(?:\b|[\)\]\.。,:：])",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, clean.upper())
+            if match and match.group(1) in letters:
+                pred_letter = match.group(1)
+                break
+        if pred_letter is None:
+            matches = [letters[i] for i, c in enumerate(choices)
+                       if contains_phrase(pred_norm, normalize_answer(c))]
+            if len(matches) == 1:
+                pred_letter = matches[0]
+        return {"prediction": pred_letter, "gold": gold_letter or gold_text,
+                "score": float(pred_letter is not None and pred_letter == gold_letter),
+                "invalid": pred_letter is None}
 
-    gold_head = gold_text.strip().upper()[:1]
-    if gold_head in {"A", "B", "C", "D", "Y", "N"} and len(gold_text.strip()) <= 3:
-        pred_head = pred_text.strip().upper()[:1]
-        if gold_head in {"Y", "N"}:
-            pred_yes_no = extract_yes_no(pred_text)
-            if pred_yes_no == "yes":
-                pred_head = "Y"
-            elif pred_yes_no == "no":
-                pred_head = "N"
-        return {
-            "prediction": pred_head or None,
-            "gold": gold_head,
-            "score": float(bool(pred_head) and pred_head == gold_head),
-            "invalid": not bool(pred_head),
-        }
-
-    pred_norm = normalize_answer(pred_text)
-    gold_norm = normalize_answer(gold_text)
-    return {
-        "prediction": pred_norm,
-        "gold": gold_norm,
-        "score": float(bool(pred_norm) and bool(gold_norm) and (pred_norm == gold_norm or gold_norm in pred_norm)),
-        "invalid": not bool(pred_norm),
-    }
+    if gold_text.lower() in {"yes", "no"}:
+        found = set(re.findall(r"\b(?:yes|no)\b", clean.lower()))
+        prediction = next(iter(found)) if len(found) == 1 else None
+        return {"prediction": prediction, "gold": gold_text.lower(),
+                "score": float(prediction == gold_text.lower()), "invalid": prediction is None}
+    # Preserve acceptance of short explanatory answers, with whole-token boundaries.
+    return {"prediction": pred_norm, "gold": gold_norm,
+            "score": float(contains_phrase(pred_norm, gold_norm)),
+            "invalid": not bool(pred_norm)}
 
 
 def _answer_list(answer: Any, answers: Any = None) -> list[Any]:
@@ -576,6 +594,15 @@ def score_prediction(
     question: Any = None,
 ) -> dict[str, Any]:
     choices = _choice_list(choices)
+    if metric in {"chartqa_relaxed", "anls"}:
+        from src.document_metrics import anls, relaxed_correctness
+        targets = [str(value) for value in _answer_list(answer, answers)]
+        if not targets:
+            raise ValueError(f"{metric} requires public reference answers")
+        score = (anls(prediction_text, targets) if metric == "anls" else
+                 max(relaxed_correctness(prediction_text, target) for target in targets))
+        return {"prediction": prediction_text, "gold": targets, "score": score,
+                "invalid": not bool(prediction_text.strip())}
     if metric == "realworldqa":
         return score_realworldqa_prediction(
             prediction_text=prediction_text,

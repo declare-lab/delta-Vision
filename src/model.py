@@ -585,7 +585,12 @@ def _prefix_causal_attention_heads(
     *,
     scaling: float | None,
     attention_mask: Tensor,
+    attention_plan: dict[str, Any] | None = None,
 ) -> Tensor:
+    if attention_plan is not None:
+        from src.qwen_adapter_fa2 import attention_heads
+        return attention_heads(query, torch.cat([visual_key, text_key], dim=2),
+            torch.cat([visual_value, text_value], dim=2), scaling=scaling, plan=attention_plan)
     if torch.compiler.is_compiling():
         return _eager_prefix_causal_attention_heads(
             query,
@@ -1740,17 +1745,24 @@ def build_qwen_initial_context(
     input_ids = inputs["input_ids"].to(input_device)
     inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
     position_inputs_embeds = inputs_embeds
-    image_kwargs = dict(visual_grid_metadata) if visual_grid_metadata is not None else {}
-    image_kwargs = {key: value.to(visual_device) if torch.is_tensor(value) else value for key, value in image_kwargs.items()}
-    image_outputs = qwen_model.visual(
-        inputs["pixel_values"].to(visual_device).type(qwen_model.visual.dtype),
-        grid_thw=inputs["image_grid_thw"].to(visual_device),
-        return_dict=True,
-        **image_kwargs,
-    )
-    image_embeds = image_outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
-    image_mask = (input_ids == int(qwen_model.config.image_token_id)).unsqueeze(-1).to(device=inputs_embeds.device)
-    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    metadata = visual_grid_metadata or {}
+    for pixels_key, grid_key, token_id, kind in (
+        ("pixel_values", "image_grid_thw", qwen_model.config.image_token_id, "image"),
+        ("pixel_values_videos", "video_grid_thw", qwen_model.config.video_token_id, "video"),
+    ):
+        if not torch.is_tensor(inputs.get(pixels_key)):
+            continue
+        # Keep the original flat metadata format for image-only callers.
+        media_kwargs = metadata.get(kind, {}) if "video" in metadata else (metadata if kind == "image" else {})
+        media_kwargs = {key: value.to(visual_device) if torch.is_tensor(value) else value
+                        for key, value in media_kwargs.items()}
+        outputs = qwen_model.visual(
+            inputs[pixels_key].to(visual_device).type(qwen_model.visual.dtype),
+            grid_thw=inputs[grid_key].to(visual_device), return_dict=True, **media_kwargs,
+        )
+        embeds = outputs.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+        mask = (input_ids == int(token_id)).unsqueeze(-1).to(device=inputs_embeds.device)
+        inputs_embeds = inputs_embeds.masked_scatter(mask, embeds)
     if position_ids is None:
         position_ids = qwen_position_ids(model, inputs, inputs_embeds=position_inputs_embeds)
     return inputs_embeds, position_ids
@@ -1821,7 +1833,7 @@ def get_qwen_text_image_positions(
     valid = attention_mask.to(device=device, dtype=torch.bool)
     token_types = mm_token_type_ids.to(device=device)
     text_valid = valid & (token_types == 0)
-    image_valid = valid & (token_types == 1)
+    image_valid = valid & (token_types != 0)
     batch = input_ids.shape[0]
     if batch == 1:
         text_src = torch.where(text_valid[0])[0]
@@ -2072,7 +2084,11 @@ def qwen_prefix_causal_attention_heads(
     *,
     scaling: float,
     attention_mask: Tensor | None = None,
+    attention_plan: dict[str, Any] | None = None,
 ) -> Tensor:
+    if attention_plan is not None:
+        from src.qwen_adapter_fa2 import attention_heads
+        return attention_heads(query, key, value, scaling=scaling, plan=attention_plan)
     return F.scaled_dot_product_attention(
         query,
         key,
@@ -2151,7 +2167,12 @@ def prepare_qwen_embedding_adapter_inputs(
         rotary_emb = language_model.rotary_emb
         text_position_embeddings = rotary_emb(h, text_position_ids)
         visual_position_embeddings = rotary_emb(visual_memory, visual_position_ids)
+    attention_plan = None
+    if getattr(model, "_adapter_attention_implementation", None) == "flash_attention_2":
+        from src.qwen_adapter_fa2 import prefix_plan
+        attention_plan = prefix_plan(text_pos, image_pos, text_mask, image_mask)
     return {
+        "attention_plan": attention_plan,
         "h": h,
         "visual_memory": visual_memory,
         "text_mask": text_mask,
@@ -2176,6 +2197,7 @@ def qwen_embedding_adapter_logits_prepared(
     text_position_ids: Tensor,
     visual_position_ids: Tensor,
     prefix_attention_mask: Tensor,
+    attention_plan: dict[str, Any] | None = None,
     text_position_embeddings: tuple[Tensor, Tensor] | None = None,
     visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
     logits_to_keep: int = 0,
@@ -2239,6 +2261,7 @@ def qwen_embedding_adapter_logits_prepared(
                 text_value,
                 attention_mask=prefix_attention_mask_layer,
                 scaling=float(attn.scaling),
+                attention_plan=attention_plan,
             )
         )
         text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
@@ -2272,9 +2295,15 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     text_position_ids: Tensor,
     visual_position_ids: Tensor,
     prefix_attention_mask: Tensor,
+    attention_plan: dict[str, Any] | None = None,
     text_position_embeddings: tuple[Tensor, Tensor] | None = None,
     visual_position_embeddings: tuple[Tensor, Tensor] | None = None,
     logits_to_keep: int = 1,
+    retain_prefix_states: bool = True,
+    batch_visual_memories: bool = False,
+    exact_kernels: bool = False,
+    pack_native_cache: bool = False,
+    fused_norm_rope: bool = False,
 ) -> tuple[Tensor, Tensor, dict[str, Any]]:
     language_model = model.model.language_model
     layers = language_model.layers
@@ -2283,38 +2312,69 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     layer_inputs: list[Tensor] = []
     layer_after_attention: list[Tensor] = []
     layer_visual_memory = visual_memory
+    all_visual_memories = adapter.all_visual_memories_batched(visual_memory) if batch_visual_memories else None
+    if exact_kernels:
+        if attention_plan is None or h.shape[0] != 1 or torch.is_grad_enabled():
+            raise ValueError('Exact adapter kernels require batch-one FA2 inference')
+        from src.qwen_adapter_kernels import exact_rope, split_attention_heads
+    if fused_norm_rope:
+        if not exact_kernels:
+            raise ValueError('Fused norm/RoPE requires exact adapter kernels')
+        from src.qwen_native_order_norm import native_order_norm_rope
+    packed_native_kv = None
+    if pack_native_cache:
+        if not exact_kernels or retain_prefix_states:
+            raise ValueError('Packed native KV requires the exact fast adapter path')
+        from src.qwen_adapter_kernels import pack_native_layer
+        packed_native_kv = h.new_empty((2, len(layers), 1,
+            language_model.config.num_key_value_heads, visual_memory.shape[1] + h.shape[1],
+            layers[0].self_attn.head_dim))
 
     for layer_idx, layer in enumerate(layers):
-        layer_inputs.append(h)
+        if retain_prefix_states:
+            layer_inputs.append(h)
         attn = layer.self_attn
         normed_text = _compile_exact_module_call(layer.input_layernorm, h)
         text_shape = normed_text.shape[:-1]
         hidden_shape = (*text_shape, -1, attn.head_dim)
         raw_query = attn.q_proj(normed_text).view(hidden_shape)
         raw_text_key = attn.k_proj(normed_text).view(hidden_shape)
-        query = _compile_exact_module_call(attn.q_norm, raw_query).transpose(1, 2)
-        text_key = _compile_exact_module_call(attn.k_norm, raw_text_key).transpose(1, 2)
+        query = raw_query.transpose(1, 2) if fused_norm_rope else _compile_exact_module_call(attn.q_norm, raw_query).transpose(1, 2)
+        text_key = raw_text_key.transpose(1, 2) if fused_norm_rope else _compile_exact_module_call(attn.k_norm, raw_text_key).transpose(1, 2)
         text_value = attn.v_proj(normed_text).view(hidden_shape).transpose(1, 2)
         layer_text_position_embeddings = text_position_embeddings
         if layer_text_position_embeddings is None:
             layer_text_position_embeddings = rotary_emb(normed_text, text_position_ids)
-        query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
+        if fused_norm_rope:
+            query = native_order_norm_rope(query, attn.q_norm.weight, attn.q_norm.variance_epsilon, layer_text_position_embeddings)
+            text_key = native_order_norm_rope(text_key, attn.k_norm.weight, attn.k_norm.variance_epsilon, layer_text_position_embeddings)
+        elif exact_kernels:
+            query = exact_rope(query, layer_text_position_embeddings)
+            text_key = exact_rope(text_key, layer_text_position_embeddings)
+        else:
+            query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
 
-        vision_states = adapter.visual_memory_for_layer(layer_visual_memory, layer_idx)
+        vision_states = (all_visual_memories[layer_idx] if all_visual_memories is not None
+                         else adapter.visual_memory_for_layer(layer_visual_memory, layer_idx))
         if adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
             layer_visual_memory = vision_states
         normed_vision = _compile_exact_module_call(layer.input_layernorm, vision_states)
         vision_shape = normed_vision.shape[:-1]
         vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
         raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
-        visual_key = _compile_exact_module_call(attn.k_norm, raw_visual_key).transpose(1, 2)
+        visual_key = raw_visual_key.transpose(1, 2) if fused_norm_rope else _compile_exact_module_call(attn.k_norm, raw_visual_key).transpose(1, 2)
         visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
         layer_visual_position_embeddings = visual_position_embeddings
         if layer_visual_position_embeddings is None:
             layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
-        visual_key = _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings)
+        if fused_norm_rope:
+            visual_key = native_order_norm_rope(visual_key, attn.k_norm.weight, attn.k_norm.variance_epsilon, layer_visual_position_embeddings)
+        else:
+            visual_key = (exact_rope(visual_key, layer_visual_position_embeddings) if exact_kernels
+                          else _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings))
 
-        heads = _prefix_causal_attention_heads(
+        heads = split_attention_heads(query, visual_key, visual_value, text_key, text_value,
+            scaling=float(attn.scaling), plan=attention_plan) if exact_kernels else _prefix_causal_attention_heads(
             query,
             visual_key,
             visual_value,
@@ -2322,18 +2382,28 @@ def qwen_embedding_adapter_prefill_cache_prepared(
             text_value,
             attention_mask=prefix_attention_mask,
             scaling=float(attn.scaling),
+            attention_plan=attention_plan,
         )
-        layer_caches.append(
-            {
+        if packed_native_kv is not None:
+            packed = packed_native_kv[:, layer_idx, 0]
+            pack_native_layer(visual_key, visual_value, text_key, text_value, packed)
+            visual_length = visual_memory.shape[1]
+            layer_caches.append(dict(
+                visual_key=packed[0, :, :visual_length].unsqueeze(0),
+                text_key=packed[0, :, visual_length:].unsqueeze(0),
+                visual_value=packed[1, :, :visual_length].unsqueeze(0),
+                text_value=packed[1, :, visual_length:].unsqueeze(0)))
+        else:
+            layer_caches.append({
                 "text_key": text_key.contiguous(),
                 "text_value": text_value.contiguous(),
                 "visual_key": visual_key.contiguous(),
                 "visual_value": visual_value.contiguous(),
-            }
-        )
+            })
         text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
         h = h + text_attention.to(dtype=h.dtype)
-        layer_after_attention.append(h)
+        if retain_prefix_states:
+            layer_after_attention.append(h)
         residual = h
         h = _compile_exact_module_call(layer.post_attention_layernorm, h)
         h = _compile_exact_module_call(layer.mlp, h)
@@ -2344,6 +2414,8 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     next_position_ids = text_position_ids.gather(2, last_idx) + 1
     next_text_positions = text_positions.gather(1, text_mask.long().sum(dim=1).sub(1).clamp_min(0).view(-1, 1)) + 1
     cache = {
+        "attention_implementation": "flash_attention_2" if attention_plan is not None else "sdpa",
+        "dense_decode_ready": bool(attention_plan and attention_plan.get("dense_decode_ready", False)),
         "layers": layer_caches,
         "text_mask": text_mask.clone(),
         "image_mask": image_mask.clone(),
@@ -2355,6 +2427,8 @@ def qwen_embedding_adapter_prefill_cache_prepared(
         "next_position_ids": next_position_ids,
         "next_text_positions": next_text_positions,
     }
+    if packed_native_kv is not None:
+        cache['_packed_native_kv'] = packed_native_kv
     return logits, text_mask, cache
 
 
@@ -2392,6 +2466,7 @@ def qwen_embedding_adapter_prefill_cache(
         text_position_ids=prepared["text_position_ids"],
         visual_position_ids=prepared["visual_position_ids"],
         prefix_attention_mask=prepared["prefix_attention_mask"],
+        attention_plan=prepared.get("attention_plan"),
         text_position_embeddings=prepared["text_position_embeddings"],
         visual_position_embeddings=prepared["visual_position_embeddings"],
         logits_to_keep=logits_to_keep,
@@ -2406,7 +2481,9 @@ def _qwen_decode_attention_mask(
     text_mask = cache["text_mask"].to(dtype=torch.bool)
     image_mask = cache["image_mask"].to(dtype=torch.bool)
     image_positions = cache["image_positions"].to(device=token_position_ids.device)
-    current_pos = token_position_ids[0, :, 0].view(-1, 1)
+    # M-RoPE coordinates compress image grids and are not sequence offsets.
+    # Compare positions in the original sequence on both sides of causality.
+    current_pos = cache["next_text_positions"].to(device=token_position_ids.device).view(-1, 1)
     visual_allowed = image_mask & (image_positions <= current_pos)
     if current_text_mask is None:
         current_text = torch.ones((text_mask.shape[0], 1), device=text_mask.device, dtype=torch.bool)
@@ -2424,13 +2501,18 @@ def qwen_embedding_adapter_decode_step(
     *,
     logits_to_keep: int = 1,
     token_active_mask: Tensor | None = None,
+    attention_plan: dict[str, Any] | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
     language_model = model.model.language_model
     h = model.model.get_input_embeddings()(token_ids)
     token_position_ids = cache["next_position_ids"]
     token_position_embeddings = language_model.rotary_emb(h, token_position_ids)
-    attention_mask = _qwen_decode_attention_mask(cache, token_position_ids, token_active_mask)
+    dense_decode = cache.get("dense_decode_ready", False) and token_active_mask is None
+    attention_mask = None if dense_decode else _qwen_decode_attention_mask(cache, token_position_ids, token_active_mask)
 
+    if attention_plan is None and cache.get("attention_implementation") == "flash_attention_2":
+        from src.qwen_adapter_fa2 import decode_plan
+        attention_plan = {"dense_decode": True} if dense_decode else decode_plan(attention_mask)
     for layer_idx, layer in enumerate(language_model.layers):
         attn = layer.self_attn
         normed_text = _compile_exact_module_call(layer.input_layernorm, h)
@@ -2451,10 +2533,14 @@ def qwen_embedding_adapter_decode_step(
             key,
             value,
             attention_mask=attention_mask,
+            attention_plan=attention_plan,
             scaling=float(attn.scaling),
         )
-        layer_cache["text_key"] = torch.cat([layer_cache["text_key"], text_key.contiguous()], dim=2)
-        layer_cache["text_value"] = torch.cat([layer_cache["text_value"], text_value.contiguous()], dim=2)
+        # Attention already assembled the growing KV. Retain disjoint views
+        # of that storage instead of concatenating the text cache a second time.
+        visual_length = layer_cache["visual_key"].shape[2]
+        layer_cache["visual_key"], layer_cache["text_key"] = key[:, :, :visual_length], key[:, :, visual_length:]
+        layer_cache["visual_value"], layer_cache["text_value"] = value[:, :, :visual_length], value[:, :, visual_length:]
         text_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
         h = h + text_attention.to(dtype=h.dtype)
         residual = h
@@ -2467,7 +2553,9 @@ def qwen_embedding_adapter_decode_step(
     else:
         active_column = token_active_mask.to(device=cache["text_mask"].device, dtype=torch.bool).view(-1, 1)
     cache["text_mask"] = torch.cat([cache["text_mask"], active_column], dim=1)
+    cache["dense_decode_ready"] = dense_decode
     cache["next_position_ids"] = token_position_ids + 1
+    cache["next_text_positions"] = cache["next_text_positions"] + 1
     logits = qwen_lm_head_logits(model, language_model, h, None, logits_to_keep=logits_to_keep)
     return logits, cache
 
@@ -2501,6 +2589,10 @@ def qwen_embedding_adapter_decode_step_shape_exact(
         image_positions=cache["image_positions"],
     )
 
+    attention_plan = None
+    if cache.get("attention_implementation") == "flash_attention_2":
+        from src.qwen_adapter_fa2 import prefix_plan
+        attention_plan = prefix_plan(full_text_positions, cache["image_positions"], full_text_mask, cache["image_mask"])
     for layer_idx, layer in enumerate(language_model.layers):
         attn = layer.self_attn
         prompt_layer_input = cache["layer_inputs"][layer_idx]
@@ -2524,6 +2616,7 @@ def qwen_embedding_adapter_decode_step_shape_exact(
             text_key,
             text_value,
             attention_mask=attention_mask,
+            attention_plan=attention_plan,
             scaling=float(attn.scaling),
         )
         full_attention = attn.o_proj(heads.reshape(*text_shape, -1).contiguous())
@@ -2578,6 +2671,7 @@ def qwen_embedding_adapter_logits_from_tensors(
         text_position_ids=prepared["text_position_ids"],
         visual_position_ids=prepared["visual_position_ids"],
         prefix_attention_mask=prepared["prefix_attention_mask"],
+        attention_plan=prepared.get("attention_plan"),
         text_position_embeddings=prepared["text_position_embeddings"],
         visual_position_embeddings=prepared["visual_position_embeddings"],
         logits_to_keep=logits_to_keep,

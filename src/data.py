@@ -216,6 +216,9 @@ class QwenBenchmarkDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
+        if row.get("videos") or row.get("video"):
+            from src.video_benchmark_inputs import video_benchmark_item
+            return video_benchmark_item(self, row, idx)
         image_paths = self._image_paths(row)
 
         question = build_benchmark_prompt(row, self.spec, self.answer_instruction)

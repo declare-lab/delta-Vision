@@ -1,0 +1,6 @@
+# Install into a separate --target directory, not the running Qwen3-VL environment.
+# H200 gated DeltaNet backward requires Triton >=3.7.1 (FLA issue #640).
+flash-linear-attention==0.5.2
+fla-core==0.5.2
+causal-conv1d==1.7.0
+triton==3.7.1

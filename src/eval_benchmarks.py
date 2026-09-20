@@ -1174,6 +1174,7 @@ def generate_adapter_qwen_decode_cache(
     last_logits_only: bool = True,
     early_stop_metric: str | None = None,
     choices: list[list[Any] | None] | list[Any] | None = None,
+    decode_step_metrics: dict[str, Any] | None = None,
 ) -> tuple[list[str | None], list[str]]:
     if max_new_tokens <= 0:
         batch_size = int(inputs["input_ids"].shape[0])
@@ -1224,15 +1225,29 @@ def generate_adapter_qwen_decode_cache(
         if step_idx == max_new_tokens - 1 or not bool(active.any().item()):
             break
         decode_step = qwen_embedding_adapter_decode_step_shape_exact if decode_cache_mode == "shape_exact" else qwen_embedding_adapter_decode_step
-        logits, decode_cache = decode_step(
-            model,
-            adapter,
-            next_tokens.view(batch_size, 1).to(dtype=inputs["input_ids"].dtype),
-            decode_cache,
-            logits_to_keep=1,
-            token_active_mask=was_active,
-        )
+        if decode_cache_mode == "fast" and getattr(model, "_adapter_decode_graph_runner", None) is not None:
+            decode_step = model._adapter_decode_graph_runner
+        def advance_decode():
+            next_logits, updated_cache = decode_step(
+                model, adapter,
+                next_tokens.view(batch_size, 1).to(dtype=inputs["input_ids"].dtype),
+                # The loop only advances a single-sample request while active.
+                decode_cache, logits_to_keep=1, token_active_mask=None if batch_size == 1 else was_active,
+            )
+            # Keep the caller's cache handle current for final KV accounting.
+            # Graph replay returns owned tensors in a fresh container.
+            if updated_cache is not decode_cache:
+                decode_cache.clear()
+                decode_cache.update(updated_cache)
+            return next_logits, decode_cache
+        if decode_step_metrics is None:
+            logits, decode_cache = advance_decode()
+        else:
+            elapsed, (logits, decode_cache) = _timed_call(advance_decode)
+            decode_step_metrics.setdefault("step_times_s", []).append(elapsed)
         text_mask = torch.ones((batch_size, 1), device=logits.device, dtype=torch.bool)
+    if decode_step_metrics is not None:
+        decode_step_metrics["generated_token_ids"] = generated
     return [extract_option_from_text(text) for text in texts], texts
 
 
@@ -1258,6 +1273,9 @@ def _tensor_tree_nbytes(value: Any, seen: set[tuple[str, int]] | None = None) ->
         return sum(_tensor_tree_nbytes(item, seen) for item in value.values())
     if isinstance(value, (list, tuple)):
         return sum(_tensor_tree_nbytes(item, seen) for item in value)
+    from transformers.cache_utils import Cache
+    if isinstance(value, Cache):
+        return _tensor_tree_nbytes([(layer.keys, layer.values) for layer in value.layers], seen)
     return 0
 
 
@@ -1641,6 +1659,7 @@ def summarize_benchmark_predictions(
         "adapter_decode_peak_allocated_delta_mb_avg": resource_mean("adapter_decode_peak_allocated_delta_mb"),
         "adapter_decode_peak_reserved_delta_mb_avg": resource_mean("adapter_decode_peak_reserved_delta_mb"),
         "adapter_prefill_decode_cache_mb_avg": resource_mean("adapter_prefill_decode_cache_mb"),
+        "adapter_prefill_kv_cache_mb_avg": resource_mean("adapter_prefill_kv_cache_mb"),
         "adapter_final_decode_cache_mb_avg": resource_mean("adapter_final_decode_cache_mb"),
     }
 
@@ -1709,7 +1728,10 @@ def evaluate_qwen_benchmark_shard(
     verify_decode_cache_generation: int = 0,
     adapter_prefill_fn: Callable[[dict[str, torch.Tensor]], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]] | None = None,
     prefill_warmup: int = 0,
+    measure_decode_steps: bool = False,
 ) -> dict:
+    if measure_decode_steps and (int(eval_batch_size) != 1 or not measure_prefill or not adapter_decode_cache):
+        raise ValueError("Decode-step timing requires single-sample cached prefill evaluation")
     if int(eval_batch_size) > 1:
         return evaluate_qwen_benchmark_shard_batched(
             model,
@@ -1850,10 +1872,22 @@ def evaluate_qwen_benchmark_shard(
                 logits, text_mask = adapter_logits_fn(dict(inputs), initial_hidden, position_ids)
             return logits, text_mask, initial_hidden, position_ids
 
+        decode_graph_runner = getattr(model, "_adapter_decode_graph_runner", None)
         if measure_prefill and int(prefill_warmup) > 0:
             for _ in range(int(prefill_warmup)):
-                adapter_prefill()
+                warm_payload = adapter_prefill()
+                if decode_graph_runner is not None:
+                    decode_graph_runner.allow_capture = True
+                    try:
+                        generate_adapter_qwen_decode_cache(model, processor, adapter, inputs, max_new_tokens,
+                            initial_hidden=warm_payload[2], position_ids=warm_payload[3],
+                            prefill_logits=warm_payload[0], prefill_text_mask=warm_payload[1], decode_cache=warm_payload[4],
+                            decode_cache_mode="fast", last_logits_only=last_logits_only,
+                            early_stop_metric=spec.metric if structured_answer_early_stop else None, choices=item.get("choices"))
+                    finally:
+                        decode_graph_runner.allow_capture = False
             _sync_cuda()
+        decode_graph_before = decode_graph_runner.stats() if decode_graph_runner is not None else None
         adapter_prefill_s, adapter_prefill_payload, adapter_prefill_stats = _timed_cuda_peak_call(
             adapter_prefill,
             enabled=measure_prefill,
@@ -1861,7 +1895,9 @@ def evaluate_qwen_benchmark_shard(
         adapter_decode_s = 0.0
         adapter_decode_stats: dict[str, float] = {}
         adapter_prefill_decode_cache_mb: float | None = None
+        adapter_prefill_kv_cache_mb: float | None = None
         adapter_final_decode_cache_mb: float | None = None
+        decode_step_metrics = {} if measure_decode_steps else None
         if adapter_prefill_payload is None:
             if adapter_decode_cache:
                 adapter_total_s, (_, adapter_texts), adapter_decode_stats = _timed_cuda_peak_call(
@@ -1901,6 +1937,8 @@ def evaluate_qwen_benchmark_shard(
             if adapter_decode_cache:
                 prefill_logits, prefill_text_mask, initial_hidden, position_ids, decode_cache = adapter_prefill_payload
                 adapter_prefill_decode_cache_mb = _tensor_tree_mb(decode_cache)
+                # Inspect outside both timed regions; these layers hold text/visual K/V only.
+                adapter_prefill_kv_cache_mb = _tensor_tree_mb(decode_cache.get("_native_cache", decode_cache["layers"]))
                 adapter_continuation_s, (_, adapter_texts), adapter_decode_stats = _timed_cuda_peak_call(
                     lambda: generate_adapter_qwen_decode_cache(
                         model,
@@ -1917,6 +1955,7 @@ def evaluate_qwen_benchmark_shard(
                         last_logits_only=last_logits_only,
                         early_stop_metric=spec.metric if structured_answer_early_stop else None,
                         choices=item.get("choices"),
+                        decode_step_metrics=decode_step_metrics,
                     )
                 )
                 adapter_text = adapter_texts[0]
@@ -1947,6 +1986,10 @@ def evaluate_qwen_benchmark_shard(
             adapter_decode_s = adapter_continuation_s
             adapter_total_s = adapter_prefill_s + adapter_continuation_s
 
+        if decode_graph_runner is not None:
+            graph_after = decode_graph_runner.stats()
+            if graph_after["captures"] != decode_graph_before["captures"] or graph_after["cold_fallbacks"] != decode_graph_before["cold_fallbacks"]:
+                raise RuntimeError(f"Adapter decode graph capture/miss during timed sample {idx}; run with per-sample warmup")
         if adapter_decode_cache and idx < int(verify_decode_cache_generation):
             _, recompute_text = generate_adapter_qwen(
                 model,
@@ -2058,7 +2101,15 @@ def evaluate_qwen_benchmark_shard(
                 "adapter_decode_peak_allocated_delta_mb": adapter_decode_stats.get("peak_allocated_delta_mb"),
                 "adapter_decode_peak_reserved_delta_mb": adapter_decode_stats.get("peak_reserved_delta_mb"),
                 "adapter_prefill_decode_cache_mb": adapter_prefill_decode_cache_mb,
+                "adapter_prefill_kv_cache_mb": adapter_prefill_kv_cache_mb,
                 "adapter_final_decode_cache_mb": adapter_final_decode_cache_mb,
+                **({
+                    "adapter_decode_step_times_s": decode_step_metrics.get("step_times_s", []),
+                    "adapter_decode_steps": len(decode_step_metrics.get("step_times_s", [])),
+                    "adapter_decode_forward_s": sum(decode_step_metrics.get("step_times_s", [])),
+                    "adapter_generated_token_ids": decode_step_metrics.get("generated_token_ids", []),
+                    "adapter_generation_overhead_s": adapter_decode_s - sum(decode_step_metrics.get("step_times_s", [])),
+                } if decode_step_metrics is not None else {}),
             }
         )
         if (idx + 1) % log_every == 0:
@@ -2078,6 +2129,9 @@ def evaluate_qwen_benchmark_shard(
     summary = summarize_benchmark_predictions(benchmark=benchmark, predictions=predictions, output_modes=[adapter.mode])
     if teacher_cache_entries is None and teacher_cache_meta is not None and len(teacher_cache_to_write) == len(dataset):
         _save_teacher_cache(teacher_cache_path, teacher_cache_meta, teacher_cache_to_write)
+    if measure_decode_steps:
+        for key in ("adapter_decode_steps", "adapter_decode_forward_s", "adapter_generation_overhead_s"):
+            summary["timing"][key] = sum(p[key] for p in predictions)
     return {"summary": summary, "predictions": predictions, "output_mode": adapter.mode}
 
 

@@ -1,4 +1,4 @@
-"""Minimal prefill benchmark runner for base VLMs and embedding_adapter adapters."""
+"""Prefill benchmarks and matched generation/resource comparisons for VLMs."""
 from __future__ import annotations
 
 import argparse
@@ -360,6 +360,7 @@ class QwenAdapterCudaGraphRunner:
             text_position_ids=prepared["text_position_ids"],
             visual_position_ids=prepared["visual_position_ids"],
             prefix_attention_mask=prepared["prefix_attention_mask"],
+            attention_plan=prepared.get("attention_plan"),
             text_position_embeddings=prepared["text_position_embeddings"],
             visual_position_embeddings=prepared["visual_position_embeddings"],
             logits_to_keep=self.logits_to_keep,
@@ -373,6 +374,7 @@ class QwenAdapterCudaGraphRunner:
             _tree_signature(prepared["text_position_ids"]),
             _tree_signature(prepared["visual_position_ids"]),
             _tree_signature(prepared["prefix_attention_mask"]),
+            _tree_signature(prepared.get("attention_plan")),
             _tree_signature(prepared["text_position_embeddings"]),
             _tree_signature(prepared["visual_position_embeddings"]),
         )
@@ -385,6 +387,7 @@ class QwenAdapterCudaGraphRunner:
             "text_position_ids": _clone_tree_for_cuda_graph(prepared["text_position_ids"]),
             "visual_position_ids": _clone_tree_for_cuda_graph(prepared["visual_position_ids"]),
             "prefix_attention_mask": _clone_tree_for_cuda_graph(prepared["prefix_attention_mask"]),
+            "attention_plan": _clone_tree_for_cuda_graph(prepared.get("attention_plan")),
             "text_position_embeddings": _clone_tree_for_cuda_graph(prepared["text_position_embeddings"]),
             "visual_position_embeddings": _clone_tree_for_cuda_graph(prepared["visual_position_embeddings"]),
         }
@@ -392,8 +395,8 @@ class QwenAdapterCudaGraphRunner:
     def _copy_prepared_(self, prepared: dict[str, Any]) -> None:
         if self.static_prepared is None:
             raise RuntimeError("CUDA graph static tensors are not initialized")
-        for key in self.static_prepared:
-            _copy_tree_(self.static_prepared[key], prepared[key])
+        from src.qwen_native_graph import copy_tree
+        copy_tree(self.static_prepared, prepared)
 
     def _static_forward(self) -> torch.Tensor:
         if self.static_prepared is None:
@@ -469,6 +472,8 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
         verify: bool,
         max_diff: float,
         name: str,
+        retain_prefix_states: bool = True,
+        exact_optimizations: bool = False,
     ) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("--cuda-graph requires CUDA")
@@ -481,6 +486,11 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
         self.verify = bool(verify)
         self.max_diff = float(max_diff)
         self.name = name
+        self.retain_prefix_states = retain_prefix_states
+        self.exact_optimizations = exact_optimizations
+        self.pack_native_cache = False
+        self.fused_norm_rope = False
+        self.cache_transform = None
         self.graph: torch.cuda.CUDAGraph | None = None
         self.static_prepared: dict[str, Any] | None = None
         self.signature: Any = None
@@ -494,6 +504,7 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
         mm_token_type_ids: torch.Tensor,
         initial_hidden: torch.Tensor,
         position_ids: torch.Tensor,
+        *, topology=None,
     ) -> dict[str, Any]:
         return self.prepare_qwen_embedding_adapter_inputs(
             self.model,
@@ -504,9 +515,13 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
             initial_hidden,
             position_ids,
             reuse_position_embeddings=True,
+            **({'topology': topology} if topology is not None else {}),
         )
 
     def _forward_prepared(self, prepared: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        if 'initial_hidden' in prepared:
+            from src.qwen_adapter_prepare import materialize_fa2_inputs
+            prepared = materialize_fa2_inputs(self.model, self.adapter, prepared)
         return self.qwen_embedding_adapter_prefill_cache_prepared(
             self.model,
             self.adapter,
@@ -519,12 +534,20 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
             text_position_ids=prepared["text_position_ids"],
             visual_position_ids=prepared["visual_position_ids"],
             prefix_attention_mask=prepared["prefix_attention_mask"],
+            attention_plan=prepared.get("attention_plan"),
             text_position_embeddings=prepared["text_position_embeddings"],
             visual_position_embeddings=prepared["visual_position_embeddings"],
             logits_to_keep=self.logits_to_keep,
+            retain_prefix_states=self.retain_prefix_states,
+            batch_visual_memories=self.exact_optimizations,
+            exact_kernels=self.exact_optimizations,
+            pack_native_cache=self.pack_native_cache,
+            fused_norm_rope=self.fused_norm_rope,
         )
 
     def _graph_signature(self, prepared: dict[str, Any]) -> tuple[Any, ...]:
+        if 'initial_hidden' in prepared:
+            return _tree_signature(prepared)
         return (
             _tree_signature(prepared["h"]),
             _tree_signature(prepared["visual_memory"]),
@@ -535,11 +558,15 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
             _tree_signature(prepared["text_position_ids"]),
             _tree_signature(prepared["visual_position_ids"]),
             _tree_signature(prepared["prefix_attention_mask"]),
+            _tree_signature(prepared.get("attention_plan")),
             _tree_signature(prepared["text_position_embeddings"]),
             _tree_signature(prepared["visual_position_embeddings"]),
         )
 
     def _clone_prepared(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        if 'initial_hidden' in prepared:
+            from src.qwen_native_graph import clone_tree
+            return clone_tree(prepared)
         return {
             "h": _clone_tree_for_cuda_graph(prepared["h"]),
             "visual_memory": _clone_tree_for_cuda_graph(prepared["visual_memory"]),
@@ -550,6 +577,7 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
             "text_position_ids": _clone_tree_for_cuda_graph(prepared["text_position_ids"]),
             "visual_position_ids": _clone_tree_for_cuda_graph(prepared["visual_position_ids"]),
             "prefix_attention_mask": _clone_tree_for_cuda_graph(prepared["prefix_attention_mask"]),
+            "attention_plan": _clone_tree_for_cuda_graph(prepared.get("attention_plan")),
             "text_position_embeddings": _clone_tree_for_cuda_graph(prepared["text_position_embeddings"]),
             "visual_position_embeddings": _clone_tree_for_cuda_graph(prepared["visual_position_embeddings"]),
         }
@@ -557,6 +585,10 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
     def _copy_prepared_(self, prepared: dict[str, Any]) -> None:
         if self.static_prepared is None:
             raise RuntimeError("CUDA graph static tensors are not initialized")
+        if self.exact_optimizations:
+            from src.qwen_native_graph import copy_tree
+            copy_tree(self.static_prepared, prepared)
+            return
         for key in self.static_prepared:
             _copy_tree_(self.static_prepared[key], prepared[key])
 
@@ -569,7 +601,14 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
         if self.output is None:
             raise RuntimeError("CUDA graph did not produce an output")
         logits, text_mask, decode_cache = self.output
-        return logits, text_mask, _clone_tree_for_cuda_graph(decode_cache)
+        if self.cache_transform is not None:
+            # The transform makes owned packed KV directly from graph outputs.
+            # Avoid cloning every split visual/text tensor before packing it.
+            converted = self.cache_transform(dict(decode_cache))
+            if "_native_cache" in converted:
+                return logits, text_mask, converted
+        from src.qwen_native_graph import clone_tree
+        return logits, text_mask, clone_tree(decode_cache)
 
     def _capture(self, prepared: dict[str, Any], signature: Any) -> None:
         eager_logits, eager_text_mask, _ = self._forward_prepared(prepared)
@@ -603,8 +642,9 @@ class QwenAdapterPrefillCacheCudaGraphRunner:
         mm_token_type_ids: torch.Tensor,
         initial_hidden: torch.Tensor,
         position_ids: torch.Tensor,
+        *, topology=None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        prepared = self._prepare(input_ids, attention_mask, mm_token_type_ids, initial_hidden, position_ids)
+        prepared = self._prepare(input_ids, attention_mask, mm_token_type_ids, initial_hidden, position_ids, topology=topology)
         signature = self._graph_signature(prepared)
         if self.graph is None or signature != self.signature:
             self._capture(prepared, signature)
@@ -648,17 +688,21 @@ class QwenContextCudaGraphRunner:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_grid_thw: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
         mm_token_type_ids: torch.Tensor,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        return {
+        return {key: value for key, value in {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "mm_token_type_ids": mm_token_type_ids,
-        }
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+        }.items() if value is not None}
 
     def _prepare_static_context(
         self,
@@ -667,7 +711,12 @@ class QwenContextCudaGraphRunner:
         qwen_model = self.model.model
         position_inputs_embeds = qwen_model.get_input_embeddings()(inputs["input_ids"])
         position_ids = self.qwen_position_ids(self.model, inputs, inputs_embeds=position_inputs_embeds)
-        visual_grid_metadata = self.qwen_visual_grid_metadata(self.model, inputs["image_grid_thw"])
+        if "video_grid_thw" in inputs:
+            visual_grid_metadata = {"video": self.qwen_visual_grid_metadata(self.model, inputs["video_grid_thw"])}
+            if "image_grid_thw" in inputs:
+                visual_grid_metadata["image"] = self.qwen_visual_grid_metadata(self.model, inputs["image_grid_thw"])
+        else:
+            visual_grid_metadata = self.qwen_visual_grid_metadata(self.model, inputs["image_grid_thw"])
         return position_ids, visual_grid_metadata
 
     def _signature(
@@ -751,11 +800,15 @@ class QwenContextCudaGraphRunner:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        pixel_values: torch.Tensor,
-        image_grid_thw: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
         mm_token_type_ids: torch.Tensor,
+        *,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        inputs = self._inputs_dict(input_ids, attention_mask, pixel_values, image_grid_thw, mm_token_type_ids)
+        inputs = self._inputs_dict(input_ids, attention_mask, pixel_values, image_grid_thw, mm_token_type_ids,
+                                  pixel_values_videos, video_grid_thw)
         position_ids, visual_grid_metadata = self._prepare_static_context(inputs)
         signature = self._signature(inputs, position_ids, visual_grid_metadata)
         if self.graph is None or signature != self.signature:
@@ -811,6 +864,7 @@ def build_qwen_benchmark_delta_fn(
             text_position_ids=prepared["text_position_ids"],
             visual_position_ids=prepared["visual_position_ids"],
             prefix_attention_mask=prepared["prefix_attention_mask"],
+            attention_plan=prepared.get("attention_plan"),
             text_position_embeddings=prepared["text_position_embeddings"],
             visual_position_embeddings=prepared["visual_position_embeddings"],
             logits_to_keep=logits_to_keep,
@@ -1020,6 +1074,7 @@ def build_qwen_benchmark_e2e_fn(
                 text_position_ids=prepared["text_position_ids"],
                 visual_position_ids=prepared["visual_position_ids"],
                 prefix_attention_mask=prepared["prefix_attention_mask"],
+                attention_plan=prepared.get("attention_plan"),
                 text_position_embeddings=prepared["text_position_embeddings"],
                 visual_position_embeddings=prepared["visual_position_embeddings"],
                 logits_to_keep=logits_to_keep,
@@ -1168,6 +1223,9 @@ def run_qwen3vl(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = dtype_from_name(args.dtype)
     processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    if getattr(args, "comparison_deepstack", "off") == "off":
+        from src.qwen_deepstack import disable_qwen_deepstack
+        disable_qwen_deepstack(model)
     prepared_logits_fn = (
         qwen_embedding_adapter_logits_prepared_hf_attention
         if bool(getattr(args, "hf_attn_embedding_adapter", False))
@@ -1855,52 +1913,60 @@ def _metric_value(summary: dict[str, Any], side: str, metric: str) -> float | No
     return values.get("score")
 
 
-def run_qwen_metric_table(args: argparse.Namespace) -> None:
-    from src.benchmarks import get_benchmark_spec
-    from src.data import QwenBenchmarkDataset
-    from src.eval_benchmarks import build_qwen_adapter_logits_fn, evaluate_qwen_benchmark_shard
+def build_qwen_fast_adapter_prefill(model, adapter, args, *, native_decode=True):
+    """Shared metric-table fast path: context graph + prefill-cache graph.
+
+    Keep comparison runs on the same implementation as the original metric table.
+    Capture/warmup belongs outside timed requests; each replay rebuilds vision.
+    native_decode=False retains split KV for manual-decoder regression studies.
+    """
     from src.model import (
         build_qwen_initial_context,
-        is_embedding_adapter_mode,
-        load_frozen_qwen3vl,
-        load_qwen_embedding_adapter_checkpoint,
         prepare_qwen_embedding_adapter_inputs,
         qwen_embedding_adapter_prefill_cache_prepared,
         qwen_position_ids,
         qwen_visual_grid_metadata,
     )
+    previous_runner = getattr(model, "_adapter_decode_graph_runner", None)
+    if previous_runner is not None and hasattr(previous_runner, "remove"):
+        previous_runner.remove()
 
-    checkpoint_specs = collect_checkpoint_specs(args)
-    if len(checkpoint_specs) != 1:
-        raise ValueError("--metric-table expects exactly one --checkpoint for the adapter-only row")
-
-    spec = get_benchmark_spec(args.benchmark)
-    data_path = _resolve_repo_or_data_path(args.sample_jsonl or spec.default_data, args.data_root)
-    if not data_path.exists():
-        raise FileNotFoundError(f"benchmark data does not exist: {data_path}")
-
-    device = torch.device(args.device)
-    dtype = dtype_from_name(args.dtype)
-    processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
-    label, checkpoint = checkpoint_specs[0]
-    adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
-    if args.output_mode is not None:
-        if not is_embedding_adapter_mode(args.output_mode):
-            raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
-        adapter.mode = args.output_mode
-    if meta["missing"] or meta["unexpected"]:
-        print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
-
-    adapter_logits_fn = build_qwen_adapter_logits_fn(
-        model,
-        adapter,
-        compile_adapter=bool(args.compile),
-        compile_mode=args.compile_mode,
-        compile_dynamic=bool(args.compile_dynamic),
-        last_logits_only=bool(args.last_logits_only),
-        compile_verify=bool(args.compile_verify),
-        compile_max_diff=float(args.compile_max_diff),
-    )
+    attention = getattr(args, "attn_implementation", "auto")
+    if attention == "auto":
+        attention = model.model.language_model.config._attn_implementation
+    model._adapter_attention_implementation = attention
+    if attention == "flash_attention_2":
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func  # fail before timing if unavailable
+    max_optimizations = bool(getattr(args, "adapter_max_optimizations", False))
+    exact_optimizations = bool(getattr(args, "adapter_exact_optimizations", False)) or max_optimizations
+    for name in ('_benchmark_fused_qwen_norms', '_adapter_exact_rope', '_adapter_fused_projections'):
+        optimization = getattr(model, name, None)
+        if optimization is not None:
+            optimization.enabled = exact_optimizations
+    if exact_optimizations:
+        if attention != "flash_attention_2":
+            raise ValueError('--adapter-exact-optimizations requires FA2')
+        if next(model.parameters()).dtype != torch.bfloat16:
+            raise ValueError('--adapter-exact-optimizations requires BF16')
+        from src.qwen_fused_norm import FusedQwenNorms
+        from src.qwen_exact_rope import QwenExactRoPE
+        from src.qwen_fused_projections import QwenFusedProjections
+        from src.qwen_adapter_prepare import prepare_fa2_inputs
+        if getattr(model, '_benchmark_fused_qwen_norms', None) is None:
+            model._benchmark_fused_qwen_norms = FusedQwenNorms(model)
+        if getattr(model, '_adapter_exact_rope', None) is None:
+            model._adapter_exact_rope = QwenExactRoPE(model)
+        if getattr(model, '_adapter_fused_projections', None) is None:
+            model._adapter_fused_projections = QwenFusedProjections(model)
+        model._benchmark_fused_qwen_norms.native_order = max_optimizations
+        model._adapter_exact_rope.fuse_norm = max_optimizations
+        def prepare_qwen_embedding_adapter_inputs(model, adapter, input_ids, *rest, **kwargs):
+            if input_ids.shape[0] != 1:
+                raise ValueError('--adapter-exact-optimizations requires batch size one')
+            return prepare_fa2_inputs(model, adapter, input_ids, *rest,
+                defer_tensor_ops=bool(getattr(args, 'cuda_graph', False)), shared_prefix=max_optimizations,
+                async_copy=max_optimizations, **kwargs)
+    retain_prefix_states = getattr(args, "adapter_decode_cache_mode", "shape_exact") == "shape_exact"
     logits_to_keep = 1 if args.last_logits_only else 0
     context_graph_runner = None
     if bool(getattr(args, "cuda_graph", False)) and bool(getattr(args, "cuda_graph_context", False)):
@@ -1925,18 +1991,29 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             verify=bool(getattr(args, "compile_verify", True)),
             max_diff=float(getattr(args, "compile_max_diff", 0.0)),
             name="qwen_metric_prefill_cache_cuda_graph",
+            retain_prefix_states=retain_prefix_states,
+            exact_optimizations=exact_optimizations,
         )
+        prefill_cache_graph_runner.fused_norm_rope = max_optimizations
 
     def fast_adapter_prefill(inputs: dict[str, torch.Tensor]):
+        # Read the small topology before launching vision. Build/upload its FA2
+        # plan asynchronously while vision runs, avoiding a stream synchronize
+        # from CPU mask reads or blocking tensor constructors after vision.
+        topology = None
+        if max_optimizations and prefill_cache_graph_runner is not None:
+            topology = torch.stack((inputs['attention_mask'][0], inputs['mm_token_type_ids'][0])).tolist()
         if context_graph_runner is None:
             initial_hidden, position_ids = build_qwen_initial_context(model, inputs)
         else:
             initial_hidden, position_ids = context_graph_runner(
                 inputs["input_ids"],
                 inputs["attention_mask"],
-                inputs["pixel_values"],
-                inputs["image_grid_thw"],
+                inputs.get("pixel_values"),
+                inputs.get("image_grid_thw"),
                 inputs["mm_token_type_ids"],
+                pixel_values_videos=inputs.get("pixel_values_videos"),
+                video_grid_thw=inputs.get("video_grid_thw"),
             )
         if prefill_cache_graph_runner is not None:
             logits, text_mask, decode_cache = prefill_cache_graph_runner(
@@ -1945,6 +2022,7 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
                 inputs["mm_token_type_ids"],
                 initial_hidden,
                 position_ids,
+                topology=topology,
             )
         else:
             prepared = prepare_qwen_embedding_adapter_inputs(
@@ -1969,11 +2047,80 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
                 text_position_ids=prepared["text_position_ids"],
                 visual_position_ids=prepared["visual_position_ids"],
                 prefix_attention_mask=prepared["prefix_attention_mask"],
+                attention_plan=prepared.get("attention_plan"),
                 text_position_embeddings=prepared["text_position_embeddings"],
                 visual_position_embeddings=prepared["visual_position_embeddings"],
                 logits_to_keep=logits_to_keep,
+                retain_prefix_states=retain_prefix_states,
+                batch_visual_memories=exact_optimizations,
+                exact_kernels=exact_optimizations,
+                fused_norm_rope=max_optimizations,
             )
         return logits, text_mask, initial_hidden, position_ids, decode_cache
+
+    if not retain_prefix_states and bool(getattr(args, "cuda_graph", False)) and attention == "flash_attention_2":
+        if native_decode:
+            from src.qwen_adapter_native_graph import NativeAdapterDecodeGraphs
+            model._adapter_decode_graph_runner = NativeAdapterDecodeGraphs(model, adapter, packed_kv=max_optimizations)
+            prefill_cache_graph_runner.cache_transform = model._adapter_decode_graph_runner.prepare_cache
+            prefill_cache_graph_runner.pack_native_cache = exact_optimizations
+        else:
+            from src.qwen_adapter_shared_graph import SharedVisualDecodeGraphs
+            model._adapter_decode_graph_runner = SharedVisualDecodeGraphs(model, adapter)
+    else:
+        model._adapter_decode_graph_runner = None
+    fast_adapter_prefill.graph_runners = (context_graph_runner, prefill_cache_graph_runner)
+    return fast_adapter_prefill
+
+
+def run_qwen_metric_table(args: argparse.Namespace) -> None:
+    from src.benchmarks import get_benchmark_spec
+    from src.data import QwenBenchmarkDataset
+    from src.eval_benchmarks import build_qwen_adapter_logits_fn, evaluate_qwen_benchmark_shard
+    from src.model import (
+        is_embedding_adapter_mode,
+        load_frozen_qwen3vl,
+        load_qwen_embedding_adapter_checkpoint,
+    )
+
+    checkpoint_specs = collect_checkpoint_specs(args)
+    if len(checkpoint_specs) != 1:
+        raise ValueError("--metric-table expects exactly one --checkpoint for the adapter-only row")
+
+    spec = get_benchmark_spec(args.benchmark)
+    data_path = _resolve_repo_or_data_path(args.sample_jsonl or spec.default_data, args.data_root)
+    if not data_path.exists():
+        raise FileNotFoundError(f"benchmark data does not exist: {data_path}")
+
+    device = torch.device(args.device)
+    dtype = dtype_from_name(args.dtype)
+    processor, model = load_frozen_qwen3vl(args.model_path, dtype, device, args.attn_implementation)
+    if getattr(args, "optimize_attention_metadata", False):
+        from src.qwen_attention_metadata import optimize_qwen_attention_metadata
+        optimize_qwen_attention_metadata(model)
+    if args.comparison_deepstack == "off":
+        from src.qwen_deepstack import disable_qwen_deepstack
+        disable_qwen_deepstack(model)
+    label, checkpoint = checkpoint_specs[0]
+    adapter, meta = load_qwen_embedding_adapter_checkpoint(checkpoint, model.model.language_model, device, dtype)
+    if args.output_mode is not None:
+        if not is_embedding_adapter_mode(args.output_mode):
+            raise ValueError(f"Qwen only supports embedding adapter output modes, got {args.output_mode!r}")
+        adapter.mode = args.output_mode
+    if meta["missing"] or meta["unexpected"]:
+        print(f"checkpoint load missing={meta['missing']} unexpected={meta['unexpected']}", flush=True)
+
+    adapter_logits_fn = build_qwen_adapter_logits_fn(
+        model,
+        adapter,
+        compile_adapter=bool(args.compile),
+        compile_mode=args.compile_mode,
+        compile_dynamic=bool(args.compile_dynamic),
+        last_logits_only=bool(args.last_logits_only),
+        compile_verify=bool(args.compile_verify),
+        compile_max_diff=float(args.compile_max_diff),
+    )
+    fast_adapter_prefill = build_qwen_fast_adapter_prefill(model, adapter, args)
 
     dataset = QwenBenchmarkDataset(
         str(data_path),
@@ -2010,8 +2157,17 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
         verify_decode_cache_generation=int(args.verify_decode_cache_generation),
         adapter_prefill_fn=fast_adapter_prefill,
         prefill_warmup=int(args.metric_prefill_warmup),
+        measure_decode_steps=bool(getattr(args, "measure_decode_steps", False)),
     )
     summary = result["summary"]
+    summary["adapter_attention_implementation"] = model._adapter_attention_implementation
+    summary["vision_attention_implementation"] = model.model.visual.config._attn_implementation
+    if args.output_json:
+        detail_path = Path(args.output_json).with_suffix(".details.json")
+        detail_path.parent.mkdir(parents=True, exist_ok=True)
+        detail_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    from src.peak_memory import summarize_peak_memory
+    adapter_peak_memory = summarize_peak_memory(result['predictions'], prefix='adapter_')
     timing = summary["timing"]
     resources = summary["resources"]
     rows = [
@@ -2045,8 +2201,10 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
         },
         {
             "method": "embedding_adapter",
+            **adapter_peak_memory,
             "checkpoint": str(checkpoint),
             "checkpoint_label": label,
+            "attention_implementation": model._adapter_attention_implementation,
             "mode": result.get("output_mode"),
             "benchmark": spec.name,
             "samples": int(args.metric_samples),
@@ -2056,9 +2214,14 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             "prefilling_time": timing["adapter_prefill_minsec"],
             "flops": resources["adapter_prefill_flops_avg"],
             "analytic_flops": resources["adapter_prefill_flops_avg"],
-            "kv_cache_mb": resources["adapter_kv_cache_mb_avg"],
+            "kv_cache_mb": (resources.get("adapter_prefill_kv_cache_mb_avg")
+                if resources.get("adapter_prefill_kv_cache_mb_avg") is not None
+                else resources["adapter_kv_cache_mb_avg"]),
             "analytic_kv_cache_mb": resources["adapter_kv_cache_mb_avg"],
             "decode_time_s": timing.get("adapter_decode_s"),
+            "decode_forward_time_s": timing.get("adapter_decode_forward_s"),
+            "decode_steps": timing.get("adapter_decode_steps"),
+            "generation_overhead_s": timing.get("adapter_generation_overhead_s"),
             "decode_time": timing.get("adapter_decode_minsec", ""),
             "prefill_peak_allocated_mb": resources.get("adapter_prefill_peak_allocated_mb_avg"),
             "prefill_peak_reserved_mb": resources.get("adapter_prefill_peak_reserved_mb_avg"),
@@ -2069,6 +2232,7 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             "decode_peak_allocated_delta_mb": resources.get("adapter_decode_peak_allocated_delta_mb_avg"),
             "decode_peak_reserved_delta_mb": resources.get("adapter_decode_peak_reserved_delta_mb_avg"),
             "actual_prefill_decode_cache_mb": resources.get("adapter_prefill_decode_cache_mb_avg"),
+            "actual_prefill_kv_cache_mb": resources.get("adapter_prefill_kv_cache_mb_avg"),
             "actual_final_decode_cache_mb": resources.get("adapter_final_decode_cache_mb_avg"),
             "score": _metric_value(summary, "adapter", spec.metric),
             "speedup_total": timing["speedup_total"],
@@ -2083,21 +2247,23 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
     print(f"checkpoint={checkpoint}")
     header = (
         f"{'method':14} {'Total Time':>12} {'Prefilling':>12} {'FLOPs':>10} "
-        f"{'KV Cache MB':>12} {'score/F1':>9} {'Speedup T':>10} {'Speedup P':>10}"
+        f"{'KV Cache MB':>12} {'Peak Mem MiB':>12} {'score/F1':>9} {'Speedup T':>10} {'Speedup P':>10}"
     )
     print(header)
     print("-" * len(header))
     for row in rows:
+        peak_text = f"{row['peak_memory_mb']:.2f}" if row.get('peak_memory_mb') is not None else 'N/A'
         print(
             f"{row['method'][:14]:14} {row['total_time']:>12} {row['prefilling_time']:>12} "
-            f"{_fmt_flops(row['flops']):>10} {row['kv_cache_mb']:12.2f} {_fmt_score(row['score']):>9} "
+            f"{_fmt_flops(row['flops']):>10} {row['kv_cache_mb']:12.2f} {peak_text:>12} {_fmt_score(row['score']):>9} "
             f"{fmt_speedup(1.0, 1.0 / row['speedup_total']) if row['speedup_total'] else '':>10} "
             f"{fmt_speedup(1.0, 1.0 / row['speedup_prefilling']) if row['speedup_prefilling'] else '':>10}"
         )
     print()
     print("Actual runtime/resource fields")
+    print("Stage peak columns below are per-request means in MiB; Peak Mem above is the dataset maximum.")
     actual_header = (
-        f"{'method':14} {'Decode Time':>12} {'Prefill Peak MB':>16} {'Decode Peak MB':>15} "
+        f"{'method':14} {'Continuation':>12} {'Prefill Peak MB':>16} {'Decode Peak MB':>15} "
         f"{'Prefill Cache MB':>16} {'Final Cache MB':>14}"
     )
     print(actual_header)
@@ -2114,6 +2280,15 @@ def run_qwen_metric_table(args: argparse.Namespace) -> None:
             f"{fmt_optional_mb(row.get('actual_prefill_decode_cache_mb')):>16} "
             f"{fmt_optional_mb(row.get('actual_final_decode_cache_mb')):>14}"
         )
+    if args.measure_decode_steps:
+        print("\nDirect cached decode forwards (continuation also includes stopping/bookkeeping)")
+        for row in rows:
+            steps = row.get("decode_steps")
+            seconds = row.get("decode_forward_time_s")
+            if steps is None or seconds is None:
+                continue
+            per_step = f"{1000 * seconds / steps:.3f} ms/step" if steps else "N/A (no decode forwards)"
+            print(f"{row['method']}: {steps} steps, {seconds:.6f}s, {per_step}")
     write_outputs(rows, args)
 
 
@@ -2469,9 +2644,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--model-kind", choices=("auto", "qwen", "llava"), default="auto")
     parser.add_argument("--metric-table", action="store_true", help="Run a small base-vs-adapter metric table from benchmark samples.")
+    parser.add_argument("--compare-methods", nargs="+", default=None,
+                        help="Compare original metric-table adapter fast path and baseline evaluation entry points: all, base, embedding_adapter, fastv, dart, divprune, zoo/zooprune, sparsevlm, visionzip.")
+    parser.add_argument("--comparison-protocol", choices=("original", "fixed-work"), default="original",
+                        help="original preserves each entry point's generation and timing rules; fixed-work is a separate forced-token diagnostic.")
+    parser.add_argument("--comparison-deepstack", choices=("native", "off"), default="off",
+                        help="off (default) skips vision DeepStack mergers and language injection for all comparison methods; native restores the original model branches.")
+    parser.add_argument("--retentions", nargs="+", type=float, default=[0.2, 0.05],
+                        help="Visual retention budgets for --compare-methods.")
+    parser.add_argument("--comparison-runs", type=int, default=3,
+                        help="Measured complete requests per sample in --compare-methods; report medians.")
+    parser.add_argument("--comparison-decode-mode", choices=("fast", "shape_exact"), default="fast",
+                        help="Adapter cached decode for --compare-methods. fast processes one new token; shape_exact recomputes text states.")
     parser.add_argument("--benchmark", default="pope", help="Benchmark name for --metric-table. Defaults to POPE for F1.")
     parser.add_argument("--metric-samples", type=int, default=10, help="Number of benchmark samples for --metric-table.")
     parser.add_argument("--metric-prefill-warmup", type=int, default=1, help="Unmeasured per-sample prefill warmup for --metric-table speed timing.")
+    parser.add_argument("--measure-decode-steps", action="store_true", help="Record actual adapter decode forwards separately from token selection/early-stop overhead.")
+    parser.add_argument("--adapter-exact-optimizations", action=argparse.BooleanOptionalAction, default=False,
+                        help="Inference-only adapter RMSNorm/RoPE fusion, direct FA2 KV packing, batched visual adapters, and input preparation. Preserves BF16 rounding; opt in for paired validation.")
+    parser.add_argument("--adapter-max-optimizations", action=argparse.BooleanOptionalAction, default=False,
+                        help="Exact native-order RMSNorm/RoPE fusion, shared-prefix FA2, asynchronous input preparation and packed decode KV; implies --adapter-exact-optimizations.")
+    parser.add_argument("--optimize-attention-metadata", action=argparse.BooleanOptionalAction, default=None,
+                        help="Avoid redundant packed-sequence detection without changing RoPE. Enabled automatically for FA2 --compare-methods; use --no-optimize-attention-metadata for diagnostic replay.")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="Override metric-table generation length.")
     parser.add_argument("--answer-instruction", default=None, help="Override benchmark answer instruction for --metric-table.")
     parser.add_argument("--input-cache-dir", default="", help="Optional cache for processed benchmark inputs in --metric-table.")
@@ -2497,7 +2691,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--attn-implementation", default="auto")
+    parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument(
         "--sdpa-backend",
         choices=("default", "math", "efficient", "flash", "cudnn"),
@@ -2541,6 +2735,8 @@ def parse_args() -> argparse.Namespace:
         help="Use CUDA graph replay for Qwen vision/context build when --cuda-graph is enabled.",
     )
     parser.add_argument("--cuda-graph-warmup", type=int, default=3)
+    parser.add_argument("--native-cuda-graphs", action=argparse.BooleanOptionalAction, default=None,
+                        help="Original FA2 comparison: default to native base/pruning CUDA Graphs when adapter CUDA Graphs are enabled. Use --no-native-cuda-graphs for historical execution diagnostics.")
     parser.add_argument(
         "--hf-attn-embedding-adapter",
         action=argparse.BooleanOptionalAction,
@@ -2573,13 +2769,13 @@ def parse_args() -> argparse.Namespace:
         "--adapter-decode-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use shape-exact adapter decode cache for Qwen --metric-table generation.",
+        help="Use adapter KV caching for Qwen --metric-table generation; see --adapter-decode-cache-mode.",
     )
     parser.add_argument(
         "--adapter-decode-cache-mode",
         choices=("shape_exact", "fast"),
-        default="shape_exact",
-        help="Qwen metric-table decode cache mode. fast is diagnostic and not logits-exact.",
+        default="fast",
+        help="fast uses one new token with cached KV; shape_exact recomputes the text prefix for the older BF16 shape comparison.",
     )
     parser.add_argument("--verify-decode-cache-generation", type=int, default=0, help="Verify this many decode-cache generations against full recompute.")
     parser.add_argument("--output-json", default="")
@@ -2606,6 +2802,15 @@ def main() -> None:
             raise ValueError("Could not infer model kind from --model-path; set --model-kind qwen or llava")
 
     with sdpa_backend_context(args.sdpa_backend):
+        if args.compare_methods is not None:
+            if model_kind != "qwen":
+                raise ValueError("--compare-methods currently supports dense Qwen3-VL only")
+            if args.comparison_protocol == "original":
+                from src.benchmark_original_comparison import run_comparison
+            else:
+                from src.benchmark_comparison import run_comparison
+            run_comparison(args)
+            return
         if model_kind == "qwen":
             if args.metric_table:
                 run_qwen_metric_table(args)
