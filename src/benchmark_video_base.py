@@ -50,8 +50,8 @@ def worker(args):
     rope = QwenExactRoPE(model) if optimized else None
     projections = QwenFusedProjections(model) if optimized else None
     graphs = None if native else NativeDecoderGraphs(model, max_shapes=8, prefill_layers=not optimized,
-        packed_kv=bool(args.packed_decode_kv))
-    whole = QwenWholePrefillGraphs(model) if optimized else None
+        packed_kv=bool(args.packed_decode_kv), max_prefill_shapes=1)
+    whole = QwenWholePrefillGraphs(model, max_shapes=1) if optimized else None
     timer = GenerationStageTimer(model, measure_memory=True)
     dataset = QwenBenchmarkDataset(str(MANIFEST), processor, 'videomme',
         data_root=str(ROOT/'data/benchmarks/videomme'), cache_dir=args.input_cache)

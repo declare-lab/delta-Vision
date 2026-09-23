@@ -1,0 +1,29 @@
+{
+  "fastv": {
+    "upstream_commit": "d1659729b5bf1be225e99ee15783deeea80f63b1",
+    "upstream_url": "https://github.com/pkunlp-icler/FastV"
+  },
+  "dart": {
+    "upstream_commit": "0c888673198b0f2784053a5686f95a519ceef209",
+    "upstream_url": "https://github.com/ZichenWen1/DART",
+    "patch": "dart.patch"
+  },
+  "divprune": {
+    "upstream_commit": "799e2d950aa01ba7860907f5a6d86061f885dca6",
+    "upstream_url": "https://github.com/vbdi/divprune.git",
+    "patch": "divprune.patch"
+  },
+  "sparsevlm": {
+    "upstream_commit": "a9e71427220c4cacb6afb5a96d23cfb43142e0c3",
+    "upstream_url": "https://github.com/Gumpest/SparseVLMs"
+  },
+  "visionzip": {
+    "upstream_commit": "8f86b55c6f000eb033e6912538af2dd7dcb30502",
+    "upstream_url": "https://github.com/dvlab-research/VisionZip"
+  },
+  "zoo": {
+    "upstream_commit": "c7d05ca3a12a23f3138efd9c021445e2939d8d4f",
+    "upstream_url": "https://github.com/AIM-SKKU/ZOO-Prune.git",
+    "patch": "zoo.patch"
+  }
+}

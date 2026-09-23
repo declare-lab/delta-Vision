@@ -18,7 +18,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.benchmarks import build_benchmark_prompt, get_benchmark_spec, score_prediction
-from src.qwen35_experiment import (answer_suffix, dump, initial_context, load_model, prepare_inputs,
+from src.qwen35_experiment import (answer_suffix, dump, initial_context, load_model, prepare_inputs, generate_evaluation_answer,
                                   sha, student_loss, teacher_targets)
 
 
@@ -146,15 +146,11 @@ def evaluate(config, run, method, shard):
                 inputs, _ = prepare_inputs(processor, row, info['image_root'], device,
                     question=build_benchmark_prompt(row, spec))
                 with controller.activate(method, inputs['mm_token_type_ids'].eq(1)):
-                    output = model.generate(**inputs, do_sample=False, max_new_tokens=spec.max_new_tokens,
-                        use_cache=True, pad_token_id=processor.tokenizer.pad_token_id)
-                text = processor.tokenizer.decode(output[0, inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-                score = score_prediction(metric=spec.metric, prediction_text=text, answer=row.get('answer'),
-                    answers=row.get('answers'), choices=row.get('choices'), question=row.get('question'))
-                result = {'index': index, 'benchmark': benchmark, 'prediction_text': text, **score,
+                    generated = generate_evaluation_answer(model, processor, inputs, row, spec, config,
+                                                          max_new_tokens=info['max_new_tokens'])
+                result = {'index': index, 'benchmark': benchmark, **generated,
                     'input_ids_sha256': __import__('hashlib').sha256(inputs['input_ids'].cpu().numpy().tobytes()).hexdigest(),
-                    'image_grid_thw': inputs['image_grid_thw'].tolist(),
-                    'generated_tokens': output.shape[1]-inputs['input_ids'].shape[1]}
+                    'image_grid_thw': inputs['image_grid_thw'].tolist()}
                 handle.write(json.dumps(result, ensure_ascii=False)+'\n')
                 handle.flush()
                 if index % 80 < 8:

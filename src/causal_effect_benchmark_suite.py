@@ -201,7 +201,7 @@ def report(root, plans):
         '- Five independent scopes × ranks0/32/64/128, plus native and full-effect identity:22 conditions per model/benchmark.',
         '- Each model/dataset has its own uncentered shared per-layer basis. FP64 second moments/eigendecomposition; FP32 projection; no TF32. Full channel widths: Qwen2560, LLaVA4096.',
         '- Bases use the selected evaluation prompts (no gold answers). This is transductive compression analysis, not held-out generalization. No adapter or backbone training.',
-        '- Native model-specific processor/templates/images. BF16/SDPA, greedy max8, option/EOS early stop, fresh no-cache forward on every generated token. Qwen native DeepStack retained.',
+        '- Native model-specific processor/templates/images. BF16/SDPA, greedy max8, option/EOS early stop, fresh no-cache forward on every generated token. Qwen DeepStack disabled.',
         '- All four baselines finish before compression evaluation begins. Eval repeats the baseline and requires exact text equality; full-effect reconstruction also requires exact answer-text equality per sample.',
         '- Same subset order for both models, stored data/selection/code hashes. Existing training processes are not stopped.',
         '- Intermediate numerical choices match the prior RealWorldQA experiment; earlier historical FA2/other precision baselines should not be substituted for this suite’s measured baselines.', '',

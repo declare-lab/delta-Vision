@@ -214,7 +214,7 @@ def run(args):
     intervene = VisualIntervention(model)
     target_layers = list(range(len(intervene.layers))) if args.layers == 'all' else [int(x) for x in args.layers.split(',')]
     conditions = [('full', -1)] + [(mode, li) for li in target_layers for mode in ('reconstructed', 'self_only', 'cross_only')]
-    # Native image encoder + native DeepStack features are identical for all
+    # Native image encoder features (DeepStack disabled) are identical for all
     # single-layer variants of an image. Cache the unchanged native output.
     original_features = model.model.get_image_features
     image_cache = []
@@ -411,12 +411,12 @@ def merge(args):
     table=['# RealWorldQA：视觉 cross-token mixing 消融','',
            f'Qwen3-VL-4B-Instruct，完整 {n} 条。Full 原生准确率 **{base.mean()*100:.2f}%**。', '',
            '## 口径','',
-           '- 无训练、无 adapter；原生 DeepStack、图像预处理和文本路径保留。层号 0–35。',
+           '- 无训练、无 adapter；DeepStack 关闭，原生图像预处理和文本路径保留。层号 0–35。',
            '- 每个实验只干预一层的视觉 query。所有文本 query 不改；视觉 query 对此前可见文本/模板的读取保留。',
            '- Full = text + visual-self + visual-cross；Self-only = text + visual-self；Cross-only = text + visual-cross。',
            '- 使用原始 causal softmax 权重及原始分母，不对剩余边重新归一化；残差和 FFN 不删。',
            '- 改动发生在各 head 输出拼接后、原生 W_O 之前。decode 新文本 token 不干预；其 KV cache 来自对应干预后的 prefill。',
-           '- 同样本各变体缓存原生视觉编码器/DeepStack 特征；单层干预处逐次检查原生输入与 Full 缓存逐位相同。',
+           '- 同样本各变体缓存原生视觉编码器特征（DeepStack 关闭）；单层干预处逐次检查原生输入与 Full 缓存逐位相同。',
            '- BF16 原生 FlashAttention；分项用 FP32 重算，转回 BF16 交给原生 W_O。每条样本、每个目标层额外跑一次 Full 重构：所有分项相加、不删除任何边，作为相同计算精度的数值对照。',
            '- 沿用现有 RealWorldQA prompt、贪心生成（最多 8 tokens）及本仓库 scorer，不用选项 logits 代替生成。',
            '- 下表 Drop = 同层 Full 重构 − 干预准确率，单位百分点；原生 Full 与重构 Full 同时列出。相对原生的 Drop 另存 CSV/JSON。95% CI 为样本配对 bootstrap（10000 次，seed 44），逐层区间未作多重比较校正。',
@@ -450,7 +450,7 @@ def launch(args):
     manifest = {'model': MODEL, 'benchmark': 'realworldqa', 'samples': args.limit or 765,
                 'layers': args.layers, 'max_new_tokens': args.max_new_tokens, 'dtype': 'bfloat16',
                 'attention': 'native flash_attention_2; intervention components FP32, cast to BF16 before native W_O',
-                'scope': 'single-layer visual query -> visual key, native DeepStack, text keys preserved',
+                'scope': 'single-layer visual query -> visual key, DeepStack disabled, text keys preserved',
                 'denominator': 'unchanged full causal denominator; no edge renormalization',
                 'numeric_control': 'reconstructed Full at every layer on every sample; paired drops vs native and reconstructed Full',
                 'seed': 44, 'args': vars(args), 'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

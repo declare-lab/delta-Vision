@@ -1006,6 +1006,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
 
 def run_qwen(args: argparse.Namespace) -> None:
+    args.teacher_deepstack = False
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
     if distributed:

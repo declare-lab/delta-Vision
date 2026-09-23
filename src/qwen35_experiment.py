@@ -27,6 +27,40 @@ def dump(path, value):
     tmp.replace(path)
 
 
+def score_evaluation_prediction(prediction, row, metric):
+    from src.benchmarks import score_prediction
+    score = score_prediction(metric=metric, prediction_text=prediction['prediction_text'],
+        answer=row.get('answer'), answers=row.get('answers'), choices=row.get('choices'),
+        question=row.get('question'))
+    if prediction.get('stopped_by_eos') is False:
+        score.update(prediction=None, score=0.0, invalid=True)
+    return score
+
+
+def generate_evaluation_answer(model, processor, inputs, row, spec, config, *, max_new_tokens=None):
+    """One pinned generation/scoring path for native, adapter and pruning.
+
+    Store token IDs and actual EOS status. An unfinished response at the length
+    cap is invalid; do not extract a convenient letter from its reasoning.
+    """
+    protocol = config['evaluation_generation']
+    cap = int(protocol['max_new_tokens'] if max_new_tokens is None else max_new_tokens)
+    assert cap > 0
+    assert protocol['do_sample'] is False and protocol['unfinished_response'] == 'invalid_zero'
+    output = model.generate(**inputs, do_sample=False, max_new_tokens=cap, use_cache=True,
+                            pad_token_id=processor.tokenizer.pad_token_id)
+    tokens = output[0, inputs['input_ids'].shape[1]:].tolist()
+    eos = model.generation_config.eos_token_id
+    eos = [eos] if isinstance(eos, int) else eos
+    finished = bool(tokens and eos is not None and tokens[-1] in eos)
+    text = processor.tokenizer.decode(tokens, skip_special_tokens=True)
+    score = score_evaluation_prediction(dict(prediction_text=text, stopped_by_eos=finished), row, spec.metric)
+    return dict(prediction_text=text, **score, generated_tokens=len(tokens),
+                generated_token_ids=tokens, stopped_by_eos=finished,
+                hit_generation_limit=not finished and len(tokens) >= cap,
+                max_new_tokens=cap)
+
+
 def load_model(config, device):
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
     kernels = install_fast_kernels()
@@ -34,6 +68,8 @@ def load_model(config, device):
     model = Qwen3_5ForConditionalGeneration.from_pretrained(config['model_path'],
         dtype=torch.bfloat16, attn_implementation='flash_attention_2',
         device_map={'': str(device)}, local_files_only=True).eval().requires_grad_(False)
+    from src.qwen_deepstack import disable_qwen_deepstack
+    disable_qwen_deepstack(model)
     c = model.config.text_config
     assert c.hidden_size == 2560 and c.num_hidden_layers == 32
     assert c.layer_types.count('linear_attention') == 24 and c.layer_types.count('full_attention') == 8

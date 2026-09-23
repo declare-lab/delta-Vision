@@ -322,7 +322,7 @@ def run_comparison(args):
         "warmup_complete_requests_per_sample": args.metric_prefill_warmup,
         "dtype": args.dtype, "native_attention": attention, "adapter_prefix_attention": "sdpa",
         "base_pruning_deepstack": args.comparison_deepstack,
-        "adapter_deepstack": "not consumed by embedding_adapter, as in the original fast path",
+        "adapter_deepstack": "off",
         "adapter_prefill": "build_qwen_fast_adapter_prefill (shared with legacy metric table)",
         "adapter_cuda_graph": args.cuda_graph, "adapter_cuda_graph_context": args.cuda_graph_context,
         "base_baseline_execution": "native forward + cached decode",
@@ -399,7 +399,7 @@ def run_comparison(args):
                        "benchmark": spec.name, "input_sha256": input_hash.hexdigest(), "decode_mode": args.comparison_decode_mode if adapter else "native_cached",
                        "execution": "adapter_cuda_graph" if adapter is not None and args.cuda_graph else "eager",
                        "cuda_graph_context": bool(adapter is not None and args.cuda_graph and args.cuda_graph_context),
-                       "attention": attention, "deepstack": args.comparison_deepstack if adapter is None else "adapter_architecture"}
+                       "attention": attention, "deepstack": "off"}
                 for key in ("total_time_s", "prefill_time_s", "decode_time_s"):
                     row[key] = sum(r[key] for r in method_records)
                 for key in ("kv_cache_mb", "decode_cache_mb", "final_kv_cache_mb", "flops", "text_tokens", "image_tokens"):

@@ -12,11 +12,13 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.benchmarks import DEFAULT_BENCHMARK_NAMES, get_benchmark_spec, score_prediction
-from src.qwen35_experiment import dump, sha
+from src.qwen35_experiment import dump, sha, score_evaluation_prediction
+from src.evaluation_sampling import sample_evaluation_rows
 
 PRIOR = ROOT/'artifacts/experiments/document_continued_recurrent_adapter/qwen3vl4b_document_continue_recurrent128_2000_20260920_052526'
 DEPS = ROOT/'artifacts/dependencies/qwen35_python'
-SOURCE = ['src/__init__.py', 'src/qwen35_embedding.py', 'src/qwen35_experiment.py',
+SOURCE = ['src/__init__.py', 'src/qwen35_embedding.py', 'src/qwen35_experiment.py', 'src/qwen_deepstack.py',
+          'src/evaluation_sampling.py',
           'src/benchmarks.py', 'scripts/qwen35_worker.py', 'scripts/queue_qwen35_pixmo.py',
           'configs/qwen35_adapter_requirements.txt', 'test/diagnostics/test_qwen35_embedding.py']
 
@@ -45,11 +47,15 @@ def prepare(run):
         accumulation_normalization='answer-token weighted across four samples per rank; then DDP rank mean, matching original PixMo microbatch4',
         batch_sampling='pixel_bucket', pixel_bucket_size=512, enable_thinking=False,
         input_resolution='native processor defaults, no custom pixel or token caps',
-        wandb=True, wandb_mode='online', evaluation={})
+        wandb=True, wandb_mode='online', evaluation_sampling_seed=44,
+        evaluation_sampling='uniform_without_replacement',
+        evaluation_generation=dict(max_new_tokens=64, do_sample=False, unfinished_response='invalid_zero'),
+        evaluation={})
     for name in DEFAULT_BENCHMARK_NAMES:
         spec = get_benchmark_spec(name)
         source = ROOT/spec.default_data
-        rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()][:1000]
+        all_rows = [json.loads(line) for line in source.read_text().splitlines() if line.strip()]
+        rows, source_indices = sample_evaluation_rows(all_rows, limit=1000, seed=44)
         assert rows
         for row in rows:
             root = Path(row.get('image_root') or source.parent)
@@ -59,8 +65,9 @@ def prepare(run):
         selected.parent.mkdir(exist_ok=True)
         selected.write_text(''.join(json.dumps(row, ensure_ascii=False)+'\n' for row in rows))
         config['evaluation'][name] = dict(path=str(selected), sha256=sha(selected), samples=len(rows),
+            sampling='uniform_without_replacement', seed=44, source_indices=source_indices,
             source=str(source), source_sha256=sha(source), image_root=str(source.parent),
-            max_new_tokens=spec.max_new_tokens, metric=spec.metric,
+            max_new_tokens=config['evaluation_generation']['max_new_tokens'], metric=spec.metric,
             reported_metric='question_accuracy' if name in ('mme', 'pope') else spec.metric)
     dump(run/'config.json', config)
     sources = {}
@@ -130,9 +137,7 @@ def report(run, config):
             rows = [json.loads(line) for line in Path(info['path']).read_text().splitlines()]
             scores = []
             for pred, original in zip(predictions, rows):
-                scored = score_prediction(metric=info['metric'], prediction_text=pred['prediction_text'],
-                    answer=original.get('answer'), answers=original.get('answers'),
-                    choices=original.get('choices'), question=original.get('question'))
+                scored = score_evaluation_prediction(pred, original, info['metric'])
                 assert scored['score'] == pred['score']
                 scores.append(scored['score'])
             row[benchmark] = 100*sum(scores)/len(scores)

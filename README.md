@@ -371,9 +371,9 @@ These are the repository's Qwen ports. Methods can also be selected individually
   equality with eager FA2 before timing. Graph preparation is separately reported;
   timed capture or a missing warmed shape fails the run. ZooPrune random state is
   restored around preparation so warmup does not change its selections.
-- DeepStack is disabled by default for this comparison: vision side mergers are
+- DeepStack is disabled project-wide for training, evaluation, and timing: auxiliary vision mergers are
   skipped and language injection is forbidden, including on the adapter's vision
-  path. `--comparison-deepstack native` explicitly restores the older setting.
+  path. Both adapter teachers and students follow this policy. Only `--comparison-deepstack off` is accepted. Historical frozen runs and results retain their original settings.
   Base and pruning use original HF `generate`, stopping
   at EOS or the generation limit. Adapter retains the original metric-table
   structured-answer early stop. MMStar defaults to an 8-token limit. These original

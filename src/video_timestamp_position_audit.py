@@ -25,6 +25,8 @@ def worker(shard):
     os.environ.update(QWEN_VIDEO_SAMPLING='full_timestamp_v1', QWEN_VIDEO_NUM_FRAMES='8')
     model = Qwen3VLForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16,
         device_map='cuda', attn_implementation='sdpa').eval().requires_grad_(False)
+    from src.qwen_deepstack import disable_qwen_deepstack
+    disable_qwen_deepstack(model)
     processor = AutoProcessor.from_pretrained(MODEL)
     adapter, meta = ref.load_qwen_embedding_adapter_checkpoint(CHECKPOINT,
         model.model.language_model, torch.device('cuda'), torch.bfloat16)

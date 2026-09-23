@@ -52,13 +52,16 @@ class VQADataset(Dataset):
         question = str(row["question"]).strip()
         answer = str(row.get("answer", "")).strip()
 
-        prompt = f"USER: <image>\n{question}\nASSISTANT:"
-        full_text = f"{prompt} {answer}" if answer else prompt
+        prompt = llava_chat_text(self.processor, question)
+        full_text = llava_chat_text(self.processor, question, answer=answer)
 
-        image = Image.open(image_path).convert("RGB")
-        inputs = self.processor(text=full_text, images=image, return_tensors="pt")
-
-        prompt_inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        try:
+            inputs = self.processor(text=full_text, images=image, return_tensors="pt")
+            prompt_inputs = self.processor(text=prompt, images=image, return_tensors="pt")
+        finally:
+            image.close()
         # prompt_len counts all tokens including image tokens
         # We want the text-only prompt length (excluding image tokens)
         image_token_id = getattr(self.processor, "image_token_id", 32000)
@@ -115,6 +118,32 @@ def collate_fn(batch: list[dict]) -> dict:
     return result
 
 
+def llava_chat_text(processor, question: str, answer: str | None = None, template: str = "auto") -> str:
+    """Render training and generation with the same LLaVA conversation template."""
+    if template not in {"auto", "legacy", "checkpoint"}:
+        raise ValueError(f"Unknown LLaVA prompt template: {template}")
+    native = getattr(processor, "chat_template", None)
+    use_native = template == "checkpoint" or (
+        template == "auto" and isinstance(native, str) and "[INST]" in native
+    )
+    if use_native:
+        if not native:
+            raise ValueError("Checkpoint prompt requested but processor has no chat template")
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": question},
+        ]}]
+        if answer:
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": answer}]})
+        return processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=not bool(answer))
+    prompt = f"USER: <image>\n{question}\nASSISTANT:"
+    return f"{prompt} {answer}" if answer else prompt
+
+
+def llava_benchmark_prompt(processor, question: str, template: str = "auto") -> str:
+    """Use the training conversation template, ending at the assistant prefix."""
+    return llava_chat_text(processor, question, template=template)
+
+
 class LlavaBenchmarkDataset(Dataset):
     """Generic LLaVA benchmark dataset using the unified benchmark JSONL schema."""
 
@@ -126,11 +155,13 @@ class LlavaBenchmarkDataset(Dataset):
         data_root: str | None = None,
         max_samples: int | None = None,
         answer_instruction: str | None = None,
+        prompt_template: str = "auto",
     ):
         self.processor = processor
         self.spec = get_benchmark_spec(benchmark)
         self.data_root = Path(data_root) if data_root else Path(jsonl_path).parent
         self.answer_instruction = answer_instruction
+        self.prompt_template = prompt_template
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
             self.rows = [json.loads(line) for line in f if line.strip()]
@@ -145,7 +176,7 @@ class LlavaBenchmarkDataset(Dataset):
         row = self.rows[idx]
         image_path = self._image_path(row)
         question = build_benchmark_prompt(row, self.spec, self.answer_instruction)
-        prompt = f"USER: <image>\n{question}\nASSISTANT:"
+        prompt = llava_benchmark_prompt(self.processor, question, self.prompt_template)
 
         image = Image.open(image_path).convert("RGB")
         try:

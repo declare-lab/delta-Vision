@@ -6,8 +6,9 @@ from src.qwen_adapter_shared_graph import SharedVisualDecodeGraphs
 
 
 class NativeAdapterDecodeGraphs:
-    def __init__(self, model, adapter, max_shapes=12, packed_kv=False):
+    def __init__(self, model, adapter, max_shapes=8, packed_kv=False):
         self.model, self.adapter = model, adapter
+        # Match the native/base speed benchmark decode-graph budget.
         self.max_shapes = max_shapes
         self.native = NativeDecoderGraphs(model, max_shapes=max_shapes, vision=False, prefill_layers=False, packed_kv=packed_kv)
         self.native.enabled = False  # Teacher/prefill calls retain their own execution path.

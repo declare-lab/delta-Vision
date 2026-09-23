@@ -188,7 +188,7 @@ if __name__=='__main__':
     parser.add_argument('--output',required=True)
     parser.add_argument('--reference',default=str(suite.ROOT/'artifacts/diagnostics/causal_effect_2models_2bench_20260912'))
     parser.add_argument('--backend',choices=['flash_attention_2','sdpa'],default='flash_attention_2')
-    parser.add_argument('--deepstack',choices=['on','off'],default='off')
+    parser.add_argument('--deepstack',choices=['off'],default='off')
     parser.add_argument('--fresh',action='store_true')
     parser.add_argument('--baseline',default='')
     parser.add_argument('--world',type=int,default=8)

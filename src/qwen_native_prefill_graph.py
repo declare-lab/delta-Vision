@@ -49,7 +49,7 @@ class LanguagePrefillGraph:
 
 
 class QwenWholePrefillGraphs:
-    def __init__(self, model, max_shapes=2):
+    def __init__(self, model, max_shapes=1):
         if model.model.language_model.config._attn_implementation != 'flash_attention_2':
             raise ValueError('Whole prefill graphs require FA2')
         self.language = model.model.language_model
@@ -103,7 +103,8 @@ class QwenWholePrefillGraphs:
         return entry.replay(prepared, cache)
 
     def stats(self):
-        return dict(captures=self.captures, replays=self.replays, fallbacks=self.fallbacks)
+        return dict(captures=self.captures, replays=self.replays, fallbacks=self.fallbacks,
+                    max_shapes=self.max_shapes, retained_shapes=len(self.entries))
 
     def remove(self):
         self.language.forward = self.original

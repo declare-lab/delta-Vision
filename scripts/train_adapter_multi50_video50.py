@@ -11,7 +11,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-WORK = ROOT.parent / 'vision-kv-inject-attention-sink'
+WORK = ROOT
 SOURCE = ROOT / 'data/train/multimodal_subset_20260911'
 REFERENCE = ROOT / 'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/config.json'
 
@@ -76,7 +76,8 @@ def main():
                   max_steps=4000, mixture_ratios='multi_image:0.5,video:0.5',
                   init_checkpoint='', resume_weights_only=False, wandb_run_id=None,
                   wandb=True, wandb_mode='online', wandb_run_name=run_name,
-                  experiment='embedding_kl_multi50_video50')
+                  experiment='embedding_kl_multi50_video50', teacher_deepstack=False,
+                  deepspeed_config=str(ROOT/'configs/ds_zero2.json'))
     assert config['micro_batch_size_per_gpu'] == 4 and config['gradient_accumulation_steps'] == 1
     assert config['required_world_size'] == 8 and config['visual_adapter_rank'] == 128
     assert config['output_mode'] == 'embedding_adapter' and config['native_prefix_memory'] == 'legacy'
@@ -92,10 +93,12 @@ def main():
         sampler='Modality-homogeneous global batches; shuffled multi/video pair per two optimizer steps. Exact sample ratio 50:50.',
         no_pixmo=True, initialization='new adapter, no checkpoint resume',
         trainable_parameters=23592960, frozen='entire Qwen backbone; only adapter down/up trained',
-        deepstack='Unchanged reference: native teacher; legacy embedding-adapter student has no DeepStack injection.',
+        deepstack='DeepStack off for both frozen teacher and adapter student.',
         video='8 full-window frames, original timestamps, max262144 pixels/frame',
         multi_image='all2–5images in source order, max1048576 pixels/image; existing training formatter unchanged',
         warmup_steps=120, save_every=500, manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest()))
+    entry = dest/'run_config.py'
+    entry.write_text('import argparse,json\nfrom pathlib import Path\nfrom src import train\np=argparse.ArgumentParser();p.add_argument("--config",required=True);a=p.parse_args()\nargs=argparse.Namespace(**json.loads(Path(a.config).read_text()))\nassert args.supervision_loss == "distill"\ntrain.run_qwen(args)\n')
     print(f'RUN_DIR={dest}', flush=True)
     print(f'SAMPLING={dict(scheduled)}; global_batch=32; trainable=23592960', flush=True)
     if args.prepare_only:
@@ -122,7 +125,7 @@ def main():
                QWEN_VIDEO_SAMPLING='full_timestamp_v1', QWEN_VIDEO_NUM_FRAMES='8', WANDB_MODE='online')
     env.pop('WANDB_RUN_ID',None)
     command = [sys.executable, '-m','torch.distributed.run','--standalone','--nproc_per_node','8',
-               '-m','src.pixmo_objective_comparison','--config',str(dest/'config.json')]
+               str(entry),'--config',str(dest/'config.json')]
     started = time.monotonic()
     with (dest / 'train.log').open('w') as log:
         child = subprocess.Popen(command, cwd=WORK, env=env, stdout=log, stderr=subprocess.STDOUT)

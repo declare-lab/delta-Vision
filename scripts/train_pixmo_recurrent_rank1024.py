@@ -5,6 +5,7 @@ import hashlib
 from io import BytesIO
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -32,8 +33,9 @@ def prepare(run):
     archive=subprocess.check_output(['git','archive',TRAIN_COMMIT,'src','configs'],cwd=ROOT)
     with tarfile.open(fileobj=BytesIO(archive)) as tar:
         tar.extractall(source,filter='data')
+    shutil.copy2(ROOT/'src/qwen_deepstack.py', source/'src/qwen_deepstack.py')
     old=json.loads(REFERENCE.read_text());config=dict(old)
-    config.update(visual_adapter_rank=1024,
+    config.update(visual_adapter_rank=1024, teacher_deepstack=False,
         output_dir=str(run/'checkpoints'),metrics_jsonl=str(run/'checkpoints/train_metrics.jsonl'),
         wandb_run_name=run.name,wandb_run_id=None,init_checkpoint='',resume_weights_only=False,
         deepspeed_config=str(source/'configs/ds_zero2.json'),experiment='recurrent_kl_rank1024')
@@ -54,6 +56,13 @@ def prepare(run):
 from pathlib import Path
 import torch
 from src import train
+from src.qwen_deepstack import disable_qwen_deepstack
+original_loader = train.load_frozen_qwen3vl
+def load_off(*args, **kwargs):
+    processor, model = original_loader(*args, **kwargs)
+    disable_qwen_deepstack(model)
+    return processor, model
+train.load_frozen_qwen3vl = load_off
 p=argparse.ArgumentParser();p.add_argument('--config',required=True);a=p.parse_args()
 args=argparse.Namespace(**json.loads(Path(a.config).read_text()))
 assert args.output_mode=='recurrent_embedding_adapter' and args.visual_adapter_rank==1024
@@ -79,7 +88,7 @@ train.run_qwen(args)
         initialization='From scratch; per-layer down projection default initialization, up projection zero; no rank128 resume.',
         architecture='36 separate recurrent residual MLPs: h_l = h_(l-1) + up_l(SiLU(down_l(h_(l-1)))); 2560 -> 1024 -> 2560.',
         trainable_parameters=188743680,backbone='Entire Qwen3-VL-4B, vision encoder and LM frozen.',
-        teacher_deepstack='Native teacher, unchanged from reference rank128 training. Student legacy adapter has no DeepStack injection.',
+        teacher_deepstack='DeepStack off for both frozen teacher and adapter student.',
         eval_deepstack='off for all methods, same completed document benchmark protocol',
         training_data_sha256=sha(config['data']),training_samples=len(rows),global_batch=32,
         steps=2000,wandb='online',eval_after=['chartqa','docvqa','infographicvqa'],eval_samples_each=1000,

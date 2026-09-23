@@ -79,7 +79,7 @@ def worker(args):
     if args.full_cuda_graphs:
         from src.qwen_native_graph import NativeDecoderGraphs
         graphs = NativeDecoderGraphs(model, max_shapes=args.graph_max_shapes, vision=True, full_decode=True,
-            prefill_layers=True, packed_kv=bool(args.packed_decode_kv))
+            prefill_layers=True, packed_kv=bool(args.packed_decode_kv), max_prefill_shapes=1)
     elif args.selector_graphs and args.method in ('dart', 'divprune', 'zoo'):
         from src.qwen_native_graph import NativeDecoderGraphs
         graphs = NativeDecoderGraphs(model, max_shapes=args.graph_max_shapes, vision=False, full_decode=False, prefill_layers=False)
@@ -159,6 +159,8 @@ def worker(args):
 
     with torch.inference_mode(), patch('torch.nn.functional.scaled_dot_product_attention', forbid_sdpa), rows_path.open('w', buffering=1) as file:
         for ordinal, index in enumerate(indices):
+            if graphs is not None:
+                graphs.begin_request()
             item = dataset[index]
             inputs = _qwen_inputs_from_item(item, device)
             assert inputs['attention_mask'].bool().all()
@@ -446,7 +448,7 @@ def main():
     parser.add_argument('--compare-native-timing',action='store_true',help='Paired native/metadata timings for the same model and input; pilot diagnosis only')
     parser.add_argument('--selector-graphs',action='store_true',help='Replay original DART/DivPrune/Zoo selector operations only; vision and decoder stay ungraphed')
     parser.add_argument('--full-cuda-graphs',action='store_true',help='Replay original vision, prefill-layer, full decode and selector tensor operations with CUDA Graphs')
-    parser.add_argument('--graph-max-shapes',type=int,default=16)
+    parser.add_argument('--graph-max-shapes',type=int,default=8)
     parser.add_argument('--fixed-greedy',action='store_true',help='Use the same fixed-length greedy loop as optimized base instead of HF generate')
     parser.add_argument('--packed-decode-kv',action='store_true',help='Use packed KV input/output for full decode CUDA Graphs when layer cache shapes match')
     parser.add_argument('--exact-rope-projections',action='store_true',help='Use the same exact RoPE/projection runtime fusion as optimized base')

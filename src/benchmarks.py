@@ -433,11 +433,24 @@ def vqa_consensus_score(prediction: Any, answers: list[Any]) -> float:
     return sum(scores) / max(len(scores), 1)
 
 
+def _answer_surface(text: str) -> str:
+    return text.rsplit("</think>", 1)[-1].replace('**', '').replace('__', '').replace('`', '').strip()
+
+
+def _final_answer_segment(text: str) -> str:
+    """Select the last explicit answer/correction without consulting the gold."""
+    clean = _answer_surface(text)
+    markers = list(re.finditer(
+        r"(?i:\b(?:final\s+|correct\s+)?answer\b|\bcorrection\b|正确答案|最终答案|答案|更正)"
+        r"\s*(?:(?i:is)\b\s*[:：]?|(?:是|为)\s*[:：]?|[:：])\s*", clean))
+    return clean[markers[-1].end():].strip() if markers else clean
+
+
 def extract_yes_no(text: str) -> str | None:
-    clean = text.strip().lower()
-    match = re.search(r"\b(yes|no)\b", clean)
-    if match:
-        return match.group(1)
+    clean = _final_answer_segment(text).lower()
+    found = set(re.findall(r"\b(yes|no)\b", clean))
+    if found:
+        return next(iter(found)) if len(found) == 1 else None
     if clean.startswith(("是", "对", "有")):
         return "yes"
     if clean.startswith(("否", "不", "没有")):
@@ -461,7 +474,8 @@ def canonical_choice(value: Any, choices: list[Any] | None = None) -> str | None
     upper = text.upper()
     if len(upper) == 1 and upper in string.ascii_uppercase:
         return upper
-    match = re.match(r"^\s*([A-Z])\s*[\.\):：、]?", upper)
+    # A textual answer such as "blue" must not be interpreted as option B.
+    match = re.fullmatch(r"\s*[\(\[]?([A-Z])[\)\]]?\s*[\.\):：、]?\s*", upper)
     if match:
         return match.group(1)
     if choices:
@@ -473,30 +487,41 @@ def canonical_choice(value: Any, choices: list[Any] | None = None) -> str | None
 
 
 def extract_choice(text: str, choices: list[Any] | None = None) -> str | None:
+    """Read an explicit answer label or an unambiguous whole option text.
+
+    Never uppercase prose and search it for isolated letters: the article 'a'
+    is not an answer A. Merely mentioning an option inside reasoning also does
+    not constitute selecting that option.
+    """
     choices = _choice_list(choices)
     num_choices = len(choices or []) or 6
     letters = _choice_letters(num_choices)
-    clean = text.strip()
-    candidates = [clean]
-    if "</think>" in clean:
-        candidates.insert(0, clean.rsplit("</think>", 1)[-1].strip())
-    patterns = [
-        r"(?:ANSWER|OPTION|CHOICE|答案|选项)\s*(?:IS|是|:|：)?\s*[\(\[]?\s*([A-Z])(?:\b|[\)\]\.。,:：])",
-        r"^[\s\(\[]*([A-Z])(?:[\)\]\.。,:：\s]|$)",
-        r"(?<![A-Z])([A-Z])(?![A-Z])",
-    ]
-    for candidate in candidates:
-        upper = candidate.upper()
-        for pattern in patterns:
-            match = re.search(pattern, upper)
-            if match and match.group(1) in letters:
-                return match.group(1)
+    clean = _answer_surface(text)
+    # Permit normal Markdown answer formatting, e.g. **B** or `B`.
+    clean = clean.replace('**', '').replace('__', '').replace('`', '').strip()
+    explicit = list(re.finditer(
+        r"(?i:\b(?:final\s+)?answer\b|\b(?:correct|final)\s+(?:option|choice)\b|正确答案|最终答案|正确选项|答案)"
+        r"\s*(?:(?i:is)|是|为)?\s*[:：]?\s*[\(\[]?\s*([A-Z])(?:\b|[\)\]\.。,:：、])", clean))
+    valid = [(match.start(1), match.group(1)) for match in explicit if match.group(1) in letters]
+    # Final standalone answer labels can follow a paragraph of reasoning.
+    # Never scan arbitrary intermediate sentences for single letters.
+    last_line = next((line.strip() for line in reversed(clean.splitlines()) if line.strip()), '')
+    labeled_lines = re.findall(r"(?m)^\s*[\(\[]?([A-Za-z])[\)\]\.。,:：、]", clean)
+    for candidate, offset in ((last_line, clean.rfind(last_line)), (clean, 0)):
+        match = re.match(r"^\s*[\(\[]?([A-Za-z])(?:[\)\]\.。,:：、]|\s*$|\s*\n)", candidate)
+        if match and match.group(1).upper() in letters:
+            # A reproduced list of alternatives is not a chosen answer.
+            bare_label = re.fullmatch(r"[\(\[]?[A-Za-z][\)\]\.。]?", candidate.strip())
+            if len(set(labeled_lines)) <= 1 or bare_label:
+                valid.append((offset + match.start(1), match.group(1).upper()))
+    if valid:
+        return max(valid, key=lambda item: item[0])[1]
     if choices:
         norm = normalize_answer(clean)
-        for idx, choice in enumerate(choices):
-            choice_norm = normalize_answer(choice)
-            if choice_norm and (norm == choice_norm or choice_norm in norm):
-                return string.ascii_uppercase[idx]
+        matches = [letters[idx] for idx, choice in enumerate(choices[:len(letters)])
+                   if normalize_answer(choice) and norm == normalize_answer(choice)]
+        if len(matches) == 1:
+            return matches[0]
     return None
 
 
@@ -521,7 +546,7 @@ def score_realworldqa_prediction(
     choices = _choice_list(choices) or _realworldqa_choices_from_question(question)
     pred_text = _stringify(prediction_text).strip()
     gold_text = _stringify(answer).strip()
-    clean = pred_text.rsplit("</think>", 1)[-1].strip()
+    clean = _final_answer_segment(pred_text)
     pred_norm = normalize_answer(clean)
     gold_norm = normalize_answer(gold_text)
 
@@ -535,34 +560,24 @@ def score_realworldqa_prediction(
             matches = [letters[i] for i, c in enumerate(choices)
                        if normalize_answer(c) == gold_norm and gold_norm]
             gold_letter = matches[0] if len(matches) == 1 else None
-        pred_letter = None
-        patterns = [
-            r"^\s*[\(\[]?([A-Z])(?:[\)\]\.。,:：]|\s*$|\s*\n)",
-            r"(?:ANSWER|OPTION|CHOICE|答案|选项)\s*(?:IS|是|:|：)?\s*[\(\[]?([A-Z])(?:\b|[\)\]\.。,:：])",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, clean.upper())
-            if match and match.group(1) in letters:
-                pred_letter = match.group(1)
-                break
-        if pred_letter is None:
-            matches = [letters[i] for i, c in enumerate(choices)
-                       if contains_phrase(pred_norm, normalize_answer(c))]
-            if len(matches) == 1:
-                pred_letter = matches[0]
+        pred_letter = extract_choice(clean, choices)
         return {"prediction": pred_letter, "gold": gold_letter or gold_text,
                 "score": float(pred_letter is not None and pred_letter == gold_letter),
                 "invalid": pred_letter is None}
 
     if gold_text.lower() in {"yes", "no"}:
-        found = set(re.findall(r"\b(?:yes|no)\b", clean.lower()))
-        prediction = next(iter(found)) if len(found) == 1 else None
+        prediction = extract_yes_no(clean)
         return {"prediction": prediction, "gold": gold_text.lower(),
                 "score": float(prediction == gold_text.lower()), "invalid": prediction is None}
-    # Preserve acceptance of short explanatory answers, with whole-token boundaries.
+    # Preserve short explanations, but do not award points for a negated answer
+    # or an unresolved enumeration of multiple different numeric answers.
+    negated = bool(gold_norm and re.search(
+        r"\b(?:not|no|isnt|arent)\s+(?:(?:a|an|the)\s+)?" + re.escape(gold_norm) + r"\b", pred_norm))
+    conflicting_numbers = bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", gold_text) and
+                               len(set(re.findall(r"[+-]?\d+(?:\.\d+)?", clean))) > 1)
     return {"prediction": pred_norm, "gold": gold_norm,
-            "score": float(contains_phrase(pred_norm, gold_norm)),
-            "invalid": not bool(pred_norm)}
+            "score": float(not negated and not conflicting_numbers and contains_phrase(pred_norm, gold_norm)),
+            "invalid": not bool(pred_norm) or negated or conflicting_numbers}
 
 
 def _answer_list(answer: Any, answers: Any = None) -> list[Any]:
@@ -631,11 +646,12 @@ def score_prediction(
             "invalid": pred is None,
         }
 
-    pred_norm = normalize_answer(prediction_text)
+    answer_segment = _final_answer_segment(prediction_text)
+    pred_norm = normalize_answer(answer_segment)
     if metric == "vqa":
         gold_values = _answer_list(None, answers) if answers is not None else _answer_list(answer)
-        pred_vqa = normalize_vqa_answer(prediction_text)
-        score = vqa_consensus_score(prediction_text, gold_values)
+        pred_vqa = normalize_vqa_answer(answer_segment)
+        score = vqa_consensus_score(answer_segment, gold_values)
         gold = normalize_vqa_answer(answer if answer is not None else (gold_values[0] if gold_values else ""))
         return {"prediction": pred_vqa, "gold": gold, "score": score, "invalid": not bool(pred_vqa)}
 

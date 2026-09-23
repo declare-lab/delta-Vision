@@ -1,0 +1,23 @@
+task: "vqav2_local"
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    validation: /lustre-data/leijingdi/code/vision-kv-inject/data/benchmarks/vqav2/validation.jsonl
+output_type: generate_until
+doc_to_visual: !function utils.vqav2_local_doc_to_visual
+doc_to_text: !function utils.vqav2_local_doc_to_text
+doc_to_target: "answer"
+generation_kwargs:
+  max_new_tokens: 16
+metadata:
+  - version: 0.0
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\nAnswer with only one word or a short phrase. Do not explain your answer."
+test_split: validation
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+process_results: !function utils.vqav2_local_process_results

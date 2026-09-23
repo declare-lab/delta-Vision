@@ -1,0 +1,166 @@
+diff --git a/Qwen2-VL/Qwen2VL_DART/modeling_qwen2_vl_self.py b/Qwen2-VL/Qwen2VL_DART/modeling_qwen2_vl_self.py
+index 9d1e4da..f9704ae 100644
+--- a/Qwen2-VL/Qwen2VL_DART/modeling_qwen2_vl_self.py
++++ b/Qwen2-VL/Qwen2VL_DART/modeling_qwen2_vl_self.py
+@@ -408,7 +408,7 @@ class DART(Qwen2VLModel):
+         pivot_text_token = DART_config['pivot_text_token']
+ 
+         reduction_ratio = DART_config['reduction_ratio']
+-        TOKEN_TOPK = int(image_token_length * (1 - reduction_ratio) / (pivot_image_token + pivot_text_token))
++        TOKEN_TOPK = max(1, round(image_token_length * (1 - reduction_ratio) / (pivot_image_token + pivot_text_token)))
+ 
+         device = last_layer_state.device
+ 
+@@ -1314,4 +1314,3 @@ class Qwen2VLDecoderLayer(nn.Module):
+         outputs += (query_states, key_states, value_states)  # ! debug
+ 
+         return outputs
+-
+diff --git a/Qwen2_5-VL/Qwen2_5VL_DART/modeling_qwen2_5_vl_self.py b/Qwen2_5-VL/Qwen2_5VL_DART/modeling_qwen2_5_vl_self.py
+index eb7995b..75ff01e 100644
+--- a/Qwen2_5-VL/Qwen2_5VL_DART/modeling_qwen2_5_vl_self.py
++++ b/Qwen2_5-VL/Qwen2_5VL_DART/modeling_qwen2_5_vl_self.py
+@@ -1560,7 +1560,7 @@ class DART(Qwen2_5_VLTextModel):
+         pivot_text_token = DART_config['pivot_text_token']
+ 
+         reduction_ratio = DART_config['reduction_ratio']
+-        TOKEN_TOPK = int(image_token_length * (1 - reduction_ratio) / (pivot_image_token + pivot_text_token))
++        TOKEN_TOPK = max(1, round(image_token_length * (1 - reduction_ratio) / (pivot_image_token + pivot_text_token)))
+ 
+         device = last_layer_state.device
+ 
+diff --git a/llava/__init__.py b/llava/__init__.py
+index 4d1f016..46bf21f 100644
+--- a/llava/__init__.py
++++ b/llava/__init__.py
+@@ -1 +1 @@
+-from .model import LlavaLlamaForCausalLM
++from .model.language_model.llava_llama import LlavaLlamaForCausalLM
+diff --git a/llava/model/language_model/modeling_llama_self.py b/llava/model/language_model/modeling_llama_self.py
+index 897f892..4831825 100644
+--- a/llava/model/language_model/modeling_llama_self.py
++++ b/llava/model/language_model/modeling_llama_self.py
+@@ -2,7 +2,6 @@ import torch
+ from typing import Tuple, Callable
+ from transformers import AutoConfig
+ # from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaDecoderLayer, LlamaModel, _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa, Cache, DynamicCache
+-from transformers.models.llama.modeling_llama import _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa, Cache, DynamicCache
+ # from transformers.models.llama import LlamaConfig
+ from .configuration_llama import LlamaConfig
+ from transformers.modeling_outputs import BaseModelOutputWithPast
+@@ -406,7 +405,8 @@ class DART(LlamaModel):
+ 
+ 
+         reduction_ratio = DART_config['reduction_ratio']
+-        TOKEN_TOPK = math.ceil((MAX_NUM_TRUNCTION if MAX_NUM_TRUNCTION is not None else (image_token_length * (1 - reduction_ratio))) // (pivot_image_token + pivot_text_token))
++        target_keep = MAX_NUM_TRUNCTION if MAX_NUM_TRUNCTION is not None else round(image_token_length * (1 - reduction_ratio))
++        TOKEN_TOPK = max(1, round(target_keep / max(1, pivot_image_token + pivot_text_token)))
+ 
+         device = last_layer_state.device
+ 
+@@ -414,7 +414,12 @@ class DART(LlamaModel):
+             text_length = config.text_length
+             image_token_length = any_states.shape[2] - text_length
+             retain_token_num_for_llava_next = min(DART_config['retain_token_num_for_llava_next'], image_token_length - pivot_image_token)
+-            TOKEN_TOPK = int((retain_token_num_for_llava_next if retain_token_num_for_llava_next is not None else (image_token_length * (1 - reduction_ratio)))  // (pivot_image_token + pivot_text_token))
++            target_keep = (
++                retain_token_num_for_llava_next
++                if retain_token_num_for_llava_next is not None
++                else round(image_token_length * (1 - reduction_ratio))
++            )
++            TOKEN_TOPK = max(1, round(target_keep / max(1, pivot_image_token + pivot_text_token)))
+ 
+         any_states = any_states.permute(0, 2, 1, 3).reshape(any_states.shape[0], any_states.shape[2], -1)
+ 
+@@ -1172,5 +1177,3 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
+             }
+         )
+         return model_inputs
+-
+-
+diff --git a/lmms-eval/lmms_eval/tasks/mmbench/cn_utils.py b/lmms-eval/lmms_eval/tasks/mmbench/cn_utils.py
+index 6e4cb15..f8e4a05 100755
+--- a/lmms-eval/lmms_eval/tasks/mmbench/cn_utils.py
++++ b/lmms-eval/lmms_eval/tasks/mmbench/cn_utils.py
+@@ -101,7 +101,7 @@ def mmbench_process_results(doc, results):
+ 
+ def mmbench_aggregate_dev_results_eval(results, args):
+     print(f"============= MMBench-CN(Dev) Detailed Results =============")
+-    overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="openai")
++    overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="rule")
+     file = generate_submission_file("mmbench_cn_dev_results.json", args)
+     details_info = {
+         "overall_acc": overall_acc,
+diff --git a/lmms-eval/lmms_eval/tasks/mmbench/en_utils.py b/lmms-eval/lmms_eval/tasks/mmbench/en_utils.py
+index e4ed039..cc1539f 100755
+--- a/lmms-eval/lmms_eval/tasks/mmbench/en_utils.py
++++ b/lmms-eval/lmms_eval/tasks/mmbench/en_utils.py
+@@ -102,7 +102,7 @@ def mmbench_process_results(doc, results):
+ 
+ def mmbench_aggregate_dev_results_eval(results, args):
+     print(f"============= MMBench-EN(Dev) Detailed Results =============")
+-    overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="openai")
++    overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="rule")
+     file = generate_submission_file("mmbench_en_dev_results.json", args)
+     details_info = {
+         "overall_acc": overall_acc,
+diff --git a/lmms-eval/lmms_eval/tasks/mmbench/mmbench_evals.py b/lmms-eval/lmms_eval/tasks/mmbench/mmbench_evals.py
+index ab44c80..5facd4a 100755
+--- a/lmms-eval/lmms_eval/tasks/mmbench/mmbench_evals.py
++++ b/lmms-eval/lmms_eval/tasks/mmbench/mmbench_evals.py
+@@ -174,7 +174,7 @@ class MMBench_Evaluator:
+ 
+         return "Failed to obtain answer via API"
+ 
+-    def extract_answer_from_item(self, item):
++    def extract_answer_from_item(self, item, use_openai=True):
+         options = self.extract_options(item)
+         option_str = self.build_option_str(options)
+ 
+@@ -186,6 +186,9 @@ class MMBench_Evaluator:
+         if ret:
+             return ret, item["prediction"]
+ 
++        if not use_openai:
++            return None, "Failed to infer answer locally."
++
+         while retry:
+             ans = self.get_chat_response(prompt)
+             if "Failed to obtain answer via API" in ans:
+@@ -210,7 +213,7 @@ class MMBench_Evaluator:
+                     return chars[tmp], "Failed to predict, thus randomly generate one. "
+ 
+     # Extract answer from multiple rolling records
+-    def eval_sub_data(self, sub_data, answer_map):
++    def eval_sub_data(self, sub_data, answer_map, use_openai=True):
+         lt = len(sub_data)
+         GT, PRED = [], []
+         for i in range(lt):
+@@ -225,7 +228,7 @@ class MMBench_Evaluator:
+             if PRED[i]:
+                 continue
+             else:
+-                ret, _ = self.extract_answer_from_item(sub_data.iloc[i])
++                ret, _ = self.extract_answer_from_item(sub_data.iloc[i], use_openai=use_openai)
+                 PRED[i] = ret
+                 if PRED[i] != GT[i]:
+                     return 0
+@@ -249,7 +252,8 @@ class MMBench_Evaluator:
+     # Evaluate Results
+     def eval_result(self, results, eval_method):
+         rd.seed(2680)
+-        assert eval_method == "openai"
++        assert eval_method in ("openai", "rule")
++        use_openai = eval_method == "openai"
+         # Set a large retry number to avoid failure
+         # model = OpenAI('gpt-3.5-turbo-0613', retry=99)
+ 
+@@ -293,7 +297,7 @@ class MMBench_Evaluator:
+                 continue
+ 
+             sub_data = data[data["index"] % int(1e6) == idx]
+-            ret = self.eval_sub_data(sub_data, answer_map)
++            ret = self.eval_sub_data(sub_data, answer_map, use_openai=use_openai)
+             result[idx] = ret
+             hit += ret
+             tot += 1

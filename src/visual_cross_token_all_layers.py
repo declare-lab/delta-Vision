@@ -112,7 +112,7 @@ def run(args):
     ds = QwenBenchmarkDataset(str(data), processor, 'realworldqa', data_root=str(data.parent), max_samples=args.limit or None)
     sha = hashlib.sha256(json.dumps(ds.rows, sort_keys=True).encode()).hexdigest()
     intervention = AllLayerIntervention(model)
-    # Only cache unchanged native image encoder + DeepStack features, NEVER LM states.
+    # Only cache unchanged native image encoder features (DeepStack disabled), NEVER LM states.
     original_features = model.model.get_image_features
     features = []
     def get_features(*a, **kw):
@@ -207,7 +207,7 @@ def merge(args):
             '- Cross-only：全部语言层删除视觉 query 对自己的读取，保留其他视觉 token 和前置模板标记。',
             '- 前置模板实际为 `<|im_start|>user\\n<|vision_start|>` 共 4 个 token；图片后的问题不可见，仍严格因果。',
             '- 每层基于该条件当前的 hidden 重新计算 Q/K/V、RoPE 和原始 causal softmax 分母，随后删除对应边；不重新归一化。绝不复用原生逐层分项缓存。',
-            '- 在原生 W_O 前只替换视觉 query 行；文本 query 行、原生 residual/FFN 和 DeepStack 都保留。后续文本状态可因读取已改变的视觉状态而变化。',
+            '- 在原生 W_O 前只替换视觉 query 行；文本 query 行、原生 residual/FFN 保留，DeepStack 关闭。后续文本状态可因读取已改变的视觉状态而变化。',
             '- native decode 使用各变体自己的 prefill KV cache，不干预新生成的文本 query。沿用原有 prompt、greedy、最多 8 tokens 和 scorer。',
             '- Full 重构在全部层保留 self+cross+prefix，控制 FP32 分项重算、BF16 输出的数值差异。',
             '- 各条件逐样本断言全部 36 层实际执行干预，且非视觉 query 行未被直接改写。首样本进一步检查第 0 层输入不变、第 1 层已受到上层干预影响。',
@@ -221,7 +221,7 @@ def merge(args):
 def launch(args):
     root=Path(args.output);root.mkdir(parents=True,exist_ok=True)
     manifest={'model':MODEL,'samples':args.limit or 765,'scope':'all 36 layers simultaneously',
-              'modes':MODES,'shards':args.shards,'max_new_tokens':8,'native_deepstack':True,
+              'modes':MODES,'shards':args.shards,'max_new_tokens':8,'native_deepstack':False,
               'current_state_recompute':True,'layer_component_cache':False,
               'source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               'decomposition_source_sha256':hashlib.sha256((ROOT/'src/visual_cross_token_ablation.py').read_bytes()).hexdigest()}

@@ -55,7 +55,7 @@ def report(run):
         w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
     lines=['# Recurrent rank1024 vs rank128','',
         'Qwen3-VL-4B-Instruct; FA2; DeepStack off at evaluation. Same 1000 questions and identical processed inputs per benchmark. ChartQA relaxed accuracy, DocVQA and InfographicVQA ANLS, all x100; AVG is their unrounded arithmetic mean.',
-        'Rank1024 trained from scratch on PixMo for 2000 steps using the reference recurrent KL settings, global batch32, lr5e-5. Native training teacher retains DeepStack as in the old rank128 run; only adapter projections are trained.',
+        'Rank1024 trained from scratch on PixMo for 2000 steps using the reference recurrent KL settings, global batch32, lr5e-5; only adapter projections are trained. Training teacher DeepStack: ' + str(json.loads((run/'plan.json').read_text()).get('teacher_deepstack', 'not recorded')),
         'Base/rank128 rows are verified existing results from document_benchmarks_1000_20260918; rank1024 is newly evaluated.','',
         '| Method | ChartQA | DocVQA | InfographicVQA | AVG |','|---|---:|---:|---:|---:|']
     for r in rows:

@@ -2325,7 +2325,8 @@ def run_llava(args: argparse.Namespace) -> None:
         image_path = Path(args.data_root) / image_path
     with Image.open(image_path) as image:
         img = image.convert("RGB")
-    prompt = "USER: <image>\n" + str(row["question"]).strip() + "\nASSISTANT:"
+    from src.data import llava_benchmark_prompt
+    prompt = llava_benchmark_prompt(processor, str(row["question"]).strip())
     inputs = processor(text=prompt, images=img, return_tensors="pt").to(device)
 
     checkpoint_specs = collect_checkpoint_specs(args)
@@ -2648,8 +2649,8 @@ def parse_args() -> argparse.Namespace:
                         help="Compare original metric-table adapter fast path and baseline evaluation entry points: all, base, embedding_adapter, fastv, dart, divprune, zoo/zooprune, sparsevlm, visionzip.")
     parser.add_argument("--comparison-protocol", choices=("original", "fixed-work"), default="original",
                         help="original preserves each entry point's generation and timing rules; fixed-work is a separate forced-token diagnostic.")
-    parser.add_argument("--comparison-deepstack", choices=("native", "off"), default="off",
-                        help="off (default) skips vision DeepStack mergers and language injection for all comparison methods; native restores the original model branches.")
+    parser.add_argument("--comparison-deepstack", choices=("off",), default="off",
+                        help="DeepStack is disabled project-wide: skip auxiliary vision mergers and language injection.")
     parser.add_argument("--retentions", nargs="+", type=float, default=[0.2, 0.05],
                         help="Visual retention budgets for --compare-methods.")
     parser.add_argument("--comparison-runs", type=int, default=3,

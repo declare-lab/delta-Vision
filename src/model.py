@@ -1547,6 +1547,9 @@ def load_frozen_qwen3vl(
         )
     else:
         model = model_cls.from_pretrained(model_path, **kwargs)
+    from .qwen_deepstack import disable_qwen_deepstack
+
+    disable_qwen_deepstack(model)
     if device_map is None and move_to_device:
         model = model.to(device)
     model.eval()

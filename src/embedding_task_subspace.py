@@ -491,7 +491,7 @@ def report(root):
         l,r,e,space=k.split('/');ci=v['drop_ci95_pp']
         lines.append(f'| {l} | {r} | {e} | {space} | {v["accuracy_pct"]:.4f} | {v["drop_pp"]:.4f} | [{ci[0]:.4f}, {ci[1]:.4f}] | {v["kl"]:.6g} | {v["ce"]:.6g} | {v["actual_norm_ratio_mean"]:.4f} |')
     lines+=['','![扰动](causal_perturbations.png)','','## 定义与核查','',
-        '- Native H：目标层 attention RMSNorm 前的视觉 hidden；完整原生前缀与 DeepStack 保留。',
+        '- Native H：目标层 attention RMSNorm 前的视觉 hidden；完整原生前缀保留，DeepStack 关闭。',
         '- Predicted H：确认的完整 adapter 以初始 merged embedding E 为锚点生成的对应层 memory；使用原 checkpoint 的参考实现，不是单层 MSE predictor。',
         '- 梯度：原模型对正确 A/B/C/D 单 token 的 full-vocab CE，在提示最后位置求导；不改变参数。各层梯度为所有视觉位置未经中心化的二阶矩。',
         '- R²：所有样本/视觉 token 汇总的每通道中心化 SST；cosine 逐 token 平均。relative error = Frobenius error / teacher norm。补空间 MSE 除以其内在维度 D-r。',

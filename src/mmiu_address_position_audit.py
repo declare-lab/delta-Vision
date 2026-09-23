@@ -29,6 +29,8 @@ def worker(shard):
     torch.manual_seed(42)
     model = Qwen3VLForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16,
         device_map='cuda', attn_implementation='sdpa').eval().requires_grad_(False)
+    from src.qwen_deepstack import disable_qwen_deepstack
+    disable_qwen_deepstack(model)
     processor = AutoProcessor.from_pretrained(MODEL)
     adapter, meta = ref.load_qwen_embedding_adapter_checkpoint(CHECKPOINT,
         model.model.language_model, torch.device('cuda'), torch.bfloat16)

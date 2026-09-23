@@ -97,7 +97,7 @@ def prepare_data(args):
           'replacement':'single target layer only; full native prefix retained in BOTH experiment families',
           'architecture':'cross: down(2560,128), SiLU, up(128,4096), no identity; hidden: E+up(SiLU(down(E)))',
           'loss':'per-image mean elementwise MSE, averaged over images; no CE/KL/OPD/cosine term',
-          'teacher':'frozen native Qwen3-VL-4B, native DeepStack enabled',
+          'teacher':'frozen native Qwen3-VL-4B, DeepStack disabled',
           'distributed':'DDP on trainable probe only; frozen teacher replicated, BF16 compute / FP32 probe parameters',
           'unseen_scope':'excluded exact decoded-pixel matches and near pHash matches from this adapter training; not a claim about backbone pretraining',
           'source_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -384,7 +384,7 @@ def update_report(root):
             '- cross：输入目标层 RMSNorm 前的当前视觉 hidden；预测各 head 的视觉 j≠i contribution，拼接为 4096 维，在 W_O 前替换。self 和前置模板读取保留，原分母不变。',
             '- hidden：输入初始 2560 维 merged visual embedding；预测目标层输入 hidden。只替换该层视觉输入，原生前缀继续计算，不宣称跳过或加速。',
             '- Cross head 不加 x 的 identity：它预测的是 attention contribution，不是 residual hidden。hidden head 沿用 E + up(SiLU(down(E)))。无 bias，无额外 norm。',
-            '- Teacher 保留 native DeepStack，输出与输入均冻结。仅 MSE 训练，无最终答案损失、KL、OPD 或 LoRA。',
+            '- Teacher 关闭 DeepStack，输出与输入均冻结。仅 MSE 训练，无最终答案损失、KL、OPD 或 LoRA。',
             '- R² = 1−SSE/SST，SST 使用测试集每通道均值，汇总所有视觉 token/channel；MSE 为同一总体的元素平均，另存每图平均 MSE。cosine 逐 token 平均，零范数项单独计数。',
             '- 测试图像不参与 adapter 训练；按解码像素 SHA256 和 DCT pHash 距离≤4 筛除训练重叠/近重复。这不是关于 backbone 预训练数据未见过这些图像的声明。',
             '- cross-35 在最后一层 W_O 前只改视觉输出，结构上不能影响文本答案；其准确率不作为预测有效性的证据，但拟合指标仍有效。hidden-35 在最后一层 attention 之前改视觉 K/V 来源，能影响文本预测。',

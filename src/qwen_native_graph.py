@@ -1,7 +1,7 @@
 """CUDA Graph replay of native Qwen decoder layers, preserving pruning and kernels.
 
 Only explicit warmup may capture a new shape. Timed calls replay warmed graphs or
-fall back to the original forward. Selection and DeepStack remain in native code.
+fall back to the original forward. Selection remains in native code; DeepStack is disabled by the model loader.
 """
 from collections import OrderedDict
 import copy
@@ -156,7 +156,7 @@ class LayerGraph:
 
 
 class NativeDecoderGraphs:
-    def __init__(self, model, max_shapes=12, vision=True, full_decode=True, prefill_layers=True, fused_norms=False, packed_kv=False):
+    def __init__(self, model, max_shapes=8, vision=True, full_decode=True, prefill_layers=True, fused_norms=False, packed_kv=False, max_prefill_shapes=1):
         if model.model.language_model.config._attn_implementation not in (
             "flash_attention_2", "flash_attention_3", "flash_attention_4",
             "kernels-community/vllm-flash-attn3", "kernels-community/flash-attn4",
@@ -174,12 +174,19 @@ class NativeDecoderGraphs:
         self.originals = []
         self.entries = []
         self.max_shapes = max_shapes
+        # A prefill shape owns full-sequence activations at every layer. Its
+        # cache must not inherit the larger growing-KV decode-shape budget.
+        # Keep only the current prefill/vision shape, as the adapter does.
+        if max_shapes < 1 or max_prefill_shapes < 1:
+            raise ValueError('Graph cache capacities must be positive')
+        self.max_prefill_shapes = max_prefill_shapes
         self.position_metadata = {}
         self.model = model
         self.in_full_decode = False
         self.decode_handles = []
         self.model_forward = None
         self.function_originals = []
+        self.selector_entries = []
         self.audit_flags = []
         for module in (model.model, model.model.language_model):
             self.audit_flags.append((module, getattr(module, "_pruning_audit_enabled", None)))
@@ -190,6 +197,7 @@ class NativeDecoderGraphs:
             if hasattr(implementation, name):
                 original = getattr(implementation, name)
                 entries = OrderedDict()
+                self.selector_entries.append(entries)
                 self.entries.append(entries)
                 self.function_originals.append((implementation, name, original))
                 setattr(implementation, name, self._wrap_function(original, entries))
@@ -305,7 +313,7 @@ class NativeDecoderGraphs:
                 entry = PlainGraph(lambda h, grid, kw: original(h, grid, **kw), values)
                 entries[key] = entry
                 self.captures += 1
-                while len(entries) > 2:
+                while len(entries) > self.max_prefill_shapes:
                     entries.popitem(last=False)
             entries.move_to_end(key)
             self.replays += 1
@@ -370,15 +378,28 @@ class NativeDecoderGraphs:
                 entry = LayerGraph(original, hidden_states, graph_kwargs, layer, index)
                 entries[key] = entry
                 self.captures += 1
-                while len(entries) > self.max_shapes:
+                limit = self.max_prefill_shapes if hidden_states.shape[1] > 1 else self.max_shapes
+                while len(entries) > limit:
                     entries.popitem(last=False)
             entries.move_to_end(key)
             self.replays += 1
             return entry.replay(hidden_states, graph_kwargs, layer)
         return forward
 
+    def begin_request(self):
+        """Drop selector graphs belonging to earlier requests before warmup.
+
+        DART can need multiple helper shapes within one request. Keep those
+        during its warmup/replays, without retaining prior-request helpers.
+        """
+        for entries in self.selector_entries:
+            entries.clear()
+
     def stats(self):
-        return dict(captures=self.captures, layer_replays=self.replays, cold_layer_fallbacks=self.fallbacks)
+        return dict(captures=self.captures, layer_replays=self.replays, cold_layer_fallbacks=self.fallbacks,
+                    max_decode_shapes=self.max_shapes, max_prefill_shapes=self.max_prefill_shapes,
+                    max_vision_shapes=self.max_prefill_shapes,
+                    selector_shapes=[len(entries) for entries in self.selector_entries])
 
     def remove(self):
         if self.norm_optimizer is not None:

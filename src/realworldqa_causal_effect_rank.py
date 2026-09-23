@@ -240,7 +240,7 @@ def merge(args):
         'Delta = native attention output minus text-to-visual-blocked output, AFTER W_O and BEFORE residual. Both are computed from the current intervened trajectory.',
         'Text outputs = blocked + delta projected onto shared per-layer channel basis. Visual query outputs are untouched. Rank0 is blocked attention, with softmax renormalization.',
         'Bases: uncentered FP64 second moments on all evaluation prompts, no gold answer tokens. This is a transductive diagnostic, NOT held-out basis generalization and NOT adapter training.',
-        'Full native prefix, native DeepStack, SDPA/BF16, fresh no-cache greedy forward each step, at most8 generated tokens. Only vision-encoder features are reused within an image.',
+        'Full native prefix, DeepStack disabled, SDPA/BF16, fresh no-cache greedy forward each step, at most8 generated tokens. Only vision-encoder features are reused within an image.',
         'Earlier HotpotQA basis collection included answer trajectories; this run is prompt-only, so it is not an exact reproduction of that calibration protocol.',
         '[Configuration](plan.json) · [Detailed results](results.json) · [Basis energy](basis_energy.json)']
     (root/'README.md').write_text('\n'.join(lines)+'\n')
@@ -251,7 +251,7 @@ def launch(args):
     plan = {'model': MODEL, 'data': str(DATA), 'data_sha256': hashlib.sha256(DATA.read_bytes()).hexdigest(),
         'samples': args.samples, 'world': args.world, 'scopes': SCOPES, 'ranks': RANKS,
         'basis': 'shared per layer; uncentered prompt-only second moments on this evaluation subset; transductive oracle',
-        'native_deepstack': True, 'source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+        'native_deepstack': False, 'source_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     (root/'plan.json').write_text(json.dumps(plan, indent=2))
     env = dict(os.environ, OMP_NUM_THREADS='4', TOKENIZERS_PARALLELISM='false', PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True')
     status = {'state': 'running'}
