@@ -24,11 +24,11 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = args.physical_gpu
     import torch
     from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
-    from src.benchmark_prefill import set_global_seed
+    from src.benchmarking.common.prefill import set_global_seed
     from src.data import QwenBenchmarkDataset
-    from src.generation_timing import GenerationStageTimer
-    from src.qwen_attention_metadata import optimize_qwen_attention_metadata
-    from src.qwen_native_graph import NativeDecoderGraphs
+    from src.benchmarking.common.generation_timing import GenerationStageTimer
+    from src.attention import optimize_qwen_attention_metadata
+    from src.graphs import NativeDecoderGraphs
 
     torch.set_num_threads(4)
     out = ROOT / args.output_dir

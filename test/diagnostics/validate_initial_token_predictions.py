@@ -5,9 +5,9 @@ import time
 
 import torch
 
-from src.initial_token_prediction_probe import Capture, LAYERS, KEYS, OLD
-from src.initial_token_mlp_probe import PathHook, Bank, teacher, runtime, inputs_for, run_model, TRAIN
-from src.visual_channel_native_cache import load_rows, dump_json
+from analysis.fig01b_hidden_prediction.initial_token_prediction_probe import Capture, LAYERS, KEYS, OLD
+from analysis.fig01b_hidden_prediction.initial_token_mlp_probe import PathHook, Bank, teacher, runtime, inputs_for, run_model, TRAIN
+from analysis.fig01a_hidden_channels.visual_channel_native_cache import load_rows, dump_json
 
 
 def main():

@@ -8,10 +8,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT/'artifacts/dependencies/qwen35_python'))
 import torch
-from src.qwen35_experiment import load_model, prepare_inputs, initial_context, dump
-from src.qwen35_pruning import VisualPruningController, visual_budget
+from src.qwen35 import load_model, prepare_inputs, initial_context, dump
+from baselines.qwen35_pruning import VisualPruningController, visual_budget
 from src.benchmarks import get_benchmark_spec, build_benchmark_prompt
-from scripts.qwen35_worker import compare_caches, read_rows
+from src.training.qwen35 import compare_caches, read_rows
 
 
 def predictions(run, method, name):

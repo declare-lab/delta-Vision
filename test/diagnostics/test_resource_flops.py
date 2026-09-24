@@ -1,7 +1,7 @@
 """Independent matrix-size checks for the Video-MME FLOP accounting."""
 import unittest
 import torch
-from src.resource_flops import _flash_dense, _flash_varlen, matrix_flop_counter
+from src.benchmarking.common.resource_flops import _flash_dense, _flash_varlen, matrix_flop_counter
 
 
 class ResourceFlopsTest(unittest.TestCase):

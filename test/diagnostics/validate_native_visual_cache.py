@@ -4,10 +4,7 @@ from pathlib import Path
 
 import torch
 
-from src.visual_channel_native_cache import (
-    NativeVisualHook, _layers, _to_device_item, configure_runtime, dataset,
-    dump_json, extend, forward, generate, get_model, positions,
-)
+from analysis.fig01a_hidden_channels.visual_channel_native_cache import NativeVisualHook, _layers, _to_device_item, configure_runtime, dataset, dump_json, extend, forward, generate, get_model, positions
 
 
 @torch.inference_mode()

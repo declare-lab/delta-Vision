@@ -6,8 +6,8 @@ import torch
 from torch.nn import functional as F
 from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
-from src.qwen35_embedding import StaticVisualAdapter, VisualAdapterController
-from src.qwen35_experiment import teacher_targets, student_loss
+from src.qwen35 import StaticVisualAdapter, VisualAdapterController
+from src.qwen35 import teacher_targets, student_loss
 
 
 class Qwen35Tests(unittest.TestCase):
@@ -54,7 +54,7 @@ class Qwen35Tests(unittest.TestCase):
         controller.close()
 
     def test_original_topk_kl_value_and_gradient(self):
-        from src.train import masked_topk_kl_stats
+        from src.training.engine import masked_topk_kl_stats
         hidden_teacher = torch.randn(1, 42, 16)
         hidden_student = torch.randn(1, 42, 16, requires_grad=True)
         head = torch.nn.Linear(16, 70, bias=False).requires_grad_(False)
@@ -74,7 +74,7 @@ class Qwen35Tests(unittest.TestCase):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-7)
 
     def test_accumulation_preserves_original_token_weighting(self):
-        from src.train import masked_topk_kl_stats
+        from src.training.engine import masked_topk_kl_stats
         logits = torch.randn(4, 13, 70, requires_grad=True)
         teacher = torch.randn_like(logits)
         ids = torch.randint(0, 70, (4, 13))

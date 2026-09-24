@@ -1,635 +1,323 @@
-# Vision KV Inject
+# Vision KV Inject / δ-Vision
 
-## Diagnostic Boundary
+视觉 embedding adapter 的训练、评测、效率测量与论文分析。项目说明统一维护在本文件。
 
-All diagnostic experiments must live under `test/`.
+## 目录
 
-- Put diagnostic scripts in `test/diagnostics/`.
-- Put diagnostic configs in `test/configs/`.
-- Put diagnostic outputs in `test/results/`.
-- Do not put diagnostic scripts, temporary configs, logs, plots, JSON/CSV outputs, or scratch
-  experiment results under `src/`, `scripts/`, or `artifacts/`.
+| 位置 | 用途 |
+|---|---|
+| `src/model.py`、`src/model_setup.py` | Qwen3-VL／LLaVA adapter、模型构造和 checkpoint 加载 |
+| `src/qwen35.py` | Qwen3.5 adapter 与 Full Attention／Gated DeltaNet 接入 |
+| `src/training/` | 训练执行；Qwen3.5 当前训练和评测共用 worker 也在这里 |
+| `src/evaluate.py` | 普通 benchmark 生成、逐题判分和汇总 |
+| `src/benchmarking/` | Video-MME 计时、FLOPs、Peak Memory 和结果汇总 |
+| `src/data.py`、`src/benchmarks.py`、`src/video.py` | 数据、prompt、评分、抽样与视频输入 |
+| `src/attention.py`、`src/kernels.py`、`src/graphs.py` | FA2、底层算子、CUDA Graph 加速 |
+| `baselines/` | baseline 方法仓库、模型接入、视觉 token 裁剪和专用 worker |
+| `analysis/` | 按论文 Figure／Table 组织的分析实验 |
+| `scripts/` | `train.sh`、`eval_benchmark.sh` 两个兼容启动脚本 |
+| `configs/` | ZeRO2／ZeRO3、Qwen3.5 依赖版本、统一入口示例配置 |
+| `test/diagnostics/` | 正确性回归和诊断工具 |
+| `data/`、`model/` | 本地训练／评测数据与底座权重 |
+| `artifacts/`、`test/results/`、`wandb/` | 实验产物、缓存、参考快照和日志 |
 
-This repository trains and evaluates lightweight visual adapters for VLM prefill acceleration.
-The current maintained scope is intentionally small:
+`baselines/` 与 `artifacts/` 按当前仓库设置由 Git 忽略，本地运行仍会使用其中内容。
+当前共用模型加载关闭 DeepStack。历史实验可能采用不同设置，复现时以其冻结配置为准。
 
-- LLaVA `kv_adapter`
-- LLaVA `embedding_adapter`
-- Qwen3-VL `embedding_adapter`
+## 环境
 
-Training is unified through `scripts/train.sh`. Benchmark evaluation is unified through
-`scripts/eval_benchmark.sh`. Prefill speed and small metric tables are handled by
-`src/benchmark_prefill.py`.
+从项目根目录运行，使用 `.venv/bin/python`。基础依赖见 `pyproject.toml` 和 `uv.lock`。
+Qwen3.5 的 FLA、causal-conv1d、Triton 版本见 `configs/qwen35_adapter_requirements.txt`；
+其独立依赖位于 `artifacts/dependencies/qwen35_python`，统一入口在导入模型前加入路径。
 
-## Architecture Scope
-
-| Model family | Adapter mode | Status | Main idea |
-| --- | --- | --- | --- |
-| LLaVA | `kv_adapter` | maintained | Project vision-encoder K/V into LLM-layer visual K/V. |
-| LLaVA | `embedding_adapter` | maintained | Use projected image embeddings as visual memory and inject them through the adapter path. |
-| Qwen3-VL | `embedding_adapter` | maintained | Use Qwen visual embeddings as adapter memory with frozen Qwen native projections. |
-
-### LLaVA `kv_adapter`
-
-This is the LLaVA-specific KV adapter path. The vision encoder provides source K/V tensors,
-and each language-model layer uses a small adapter to map source visual K/V into that layer's
-KV space.
-
-Properties:
-
-- Input source: selected CLIP vision transformer K/V layers.
-- Adapter output: per-layer visual K/V for the LLM attention blocks.
-- Text path: original LLM text tokens remain unchanged.
-- Visual-token MLP work is skipped, which is the main prefill speed win.
-- Checkpoints are saved as `step_N.pt` or `final.pt`.
-
-Default training mode:
+## 训练与准确率评测
 
 ```bash
-MODEL_KIND=llava OUTPUT_MODE=kv_adapter scripts/train.sh
+.venv/bin/python -m src.run train --family qwen -- --help
+.venv/bin/python -m src.run eval --family qwen -- --help
+.venv/bin/python -m src.run train --config configs/unified_qwen.example.json --dry-run
+.venv/bin/python -m src.run eval --config configs/unified_qwen.example.json --dry-run
 ```
 
-### LLaVA `embedding_adapter`
+`--family` 支持 `qwen`、`llava`、`qwen35`。`--` 后传对应实现的参数。
+统一 JSON 的优先级为共用 `model` 配置、当前任务配置、命令行显式参数。
+示例配置用于展示格式，正式训练须填写实际模型、清单和输出路径。
+Adapter 类型、rank 从 checkpoint 恢复；模型架构由训练／测评共同使用。
 
-This is the shared embedding-adapter style applied to LLaVA. Instead of using raw vision
-K/V as the source, it uses the LLaVA-projected image embeddings as visual memory.
-
-Properties:
-
-- Input source: LLaVA projected image embeddings.
-- Adapter output: per-layer visual memory injected through the adapter attention path.
-- This mode shares more structure with the Qwen `embedding_adapter` path.
-- Checkpoints are loaded through the same LLaVA checkpoint loader, with `output_mode`
-  recorded in checkpoint metadata.
-
-Training:
+分布式训练示例（补齐已确认的实验参数后运行）：
 
 ```bash
-MODEL_KIND=llava OUTPUT_MODE=embedding_adapter scripts/train.sh
+.venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  -m src.run train --family qwen -- --output-dir RUN/checkpoints <实验参数>
 ```
 
-### Qwen3-VL `embedding_adapter`
+默认 DeepSpeed 配置为 `configs/ds_zero2.json`；ZeRO3 通过 `--deepspeed-config configs/ds_zero3.json` 选择。
 
-This is the only maintained Qwen training architecture. It uses Qwen's own visual embedding
-stream as the adapter memory and keeps the base Qwen3-VL model frozen.
-
-Properties:
-
-- Input source: Qwen3-VL image-token hidden states after the native visual path.
-- Adapter output: trainable adapter visual memory for language-model layers.
-- Base model: frozen.
-- Default loss normalization: token mean.
-- Checkpoints are saved as `qwen_embedding_adapter_stepN.pt` and
-  `qwen_embedding_adapter_final.pt`.
-
-Default training:
+Qwen3.5 沿用 `RUN/config.json`，其中定义数据、模型、训练和生成协议：
 
 ```bash
-MODEL_KIND=qwen scripts/train.sh
+.venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 \
+  -m src.run train --family qwen35 -- --run-dir RUN
+.venv/bin/python -m src.run eval --family qwen35 -- \
+  --run-dir RUN --method adapter --shard 0
 ```
 
-Useful Qwen defaults:
+`--method native` 测原生模型；现有 Qwen3.5 worker 保留原来的 8 卡训练／8 分片评测和 checkpoint 约束。
+普通判分实现位于 `src/benchmarks.py`；不同历史实验的生成上限、答案提取和评分版本可能不同，不能混合汇总。
 
-```text
-OUTPUT_MODE=embedding_adapter
-LOSS_NORMALIZATION=token
-LAMBDA_LOGIT=2.0
-KL_TOPK=1024
-MAX_STEPS=500
-SAVE_EVERY=500
-```
-
-## Qwen Mask Semantics
-
-The old `022e580` training code used an all-visual-visible prefix mask: every text token could
-attend to every visual token. That reproduces the old 12k checkpoint behavior, but it is not the
-mask semantics used by the current code.
-
-The current Qwen `embedding_adapter` uses position-aware masking:
-
-- text tokens attend causally to previous text tokens;
-- text tokens attend only to visual tokens whose original sequence positions are not in the future;
-- this is the intended training/evaluation path going forward.
-
-## Training
-
-The supported training entry is:
+### Baseline
 
 ```bash
-scripts/train.sh
+.venv/bin/python -m src.run eval --family qwen --workflow baseline -- \
+  --run RUN --model qwen3-vl-4b --method dart --suite image --shard 0
 ```
 
-Common environment variables:
+`RUN` 需包含 config、jobs、固定清单、scoring_reference、source_hashes 和冻结源码。
+`image` 是单图，`multimodal` 是多图／视频。入口按已准备任务选择算法，在独立进程执行冻结 worker。
+新快照使用 `source/baselines/`，旧 `source/evaluation/baselines/` 与 scripts 布局仍支持。
 
-```text
-MODEL_KIND=qwen|llava
-MODEL_PATH=/path/to/base/model
-DATA=/path/to/train.jsonl
-DATA_ROOT=/path/to/data/root
-RUN_NAME=my_run
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-MAX_STEPS=12000
-SAVE_EVERY=1000
-WANDB=1
-```
-
-Qwen 500-step Pixmo-clean smoke training:
+## Video-MME 测速
 
 ```bash
-MODEL_KIND=qwen \
-RUN_NAME=qwen_pixmo_clean_500 \
-MAX_STEPS=500 \
-SAVE_EVERY=500 \
-WANDB=1 \
-scripts/train.sh
+.venv/bin/python -m src.benchmarking videomme --list
+.venv/bin/python -m src.benchmarking videomme llm -- --help
+.venv/bin/python -m src.benchmarking videomme llm -- queue \
+  --run artifacts/diagnostics/video_llm_NEW \
+  --previous artifacts/diagnostics/video_adapter_layer_ablation_999_20260923 \
+  --cases base adapter --gpus 0 1 2 3 4 5 6 7
 ```
 
-Qwen3-VL-235B train/eval:
+| Profile | 用途 |
+|---|---|
+| `llm` | base／adapter／去掉视觉 token／关闭部分层视觉注入的统一计时 |
+| `resources` | base、adapter 和六种 baseline 的资源复测 |
+| `vision-removed` | 去掉视觉 token，prefill 包含视觉编码的复测 |
+| `flops-removed` | 去掉视觉 token 后的 LLM FLOPs |
+| `resource-report`、`layer-report` | 资源与层屏蔽实验汇总 |
+| `base-diagnostic`、`adapter-diagnostic`、`pruning-diagnostic` | 各执行路径的数值和性能诊断 |
+| `prefill` | 共用 prefill 工具接口 |
+
+`llm` 的固定协议：Video-MME 999 条、8 帧，FA2／BF16／DeepStack 关闭／CUDA Graph，adapter fast-path 开启。
+视觉 embedding 在计时前准备，prefill／decode 不包含视觉编码。固定生成 8 token：prefill 产生第一个 token，随后 7 次 decode。
+单次 total=prefill+decode；各输入预热后测 3 次，先取该输入中位数，再对输入平均。
+`continuous_trials` 包含选 token，decode 末尾同步；`trials` 保留逐 forward 同步且不含选 token 的旧口径，二者分开。
+主 report 使用 continuous；`layer-report` 保留其历史汇总口径。独立求 total 中位数时，汇总值可能与阶段中位数之和略有差异。
+
+Peak 使用 `max_memory_allocated`、单位 GiB，包含驻留权重、输入和图池。FLOPs 独立统计，不在计时中挂统计 hook。
+`resources` 的原计时包含视觉编码；其排除视觉编码 FLOPs 字段及不同 profile 不能混报。
+`--run` 使用新目录，`--previous` 指向冻结协议和数值参考。队列可暂停已知 RAM 空转负载并在结束后恢复，不终止未知任务。
+
+## 论文分析
+
+对应根目录 `ICLR_2027_Visual_KV.pdf` 当前版本，机器可读入口在 `analysis/catalog.json`。
 
 ```bash
-scripts/train_eval_qwen235b_kl_only.sh
+.venv/bin/python -m analysis --list
+.venv/bin/python -m analysis fig05_hybrid_attention --describe
+.venv/bin/python -m analysis fig01a_hidden_channels run -- --help
 ```
 
-This script downloads `Qwen/Qwen3-VL-235B-A22B-Instruct` to
-`model/Qwen3-VL-235B-A22B-Instruct`, then trains the Qwen `embedding_adapter` with the same
-KL settings as `scripts/train_eval_five_models_kl_only.sh`. Because the 235B backbone cannot
-be replicated per rank, it uses `QWEN_DEVICE_MAP=auto`, `NPROC_PER_NODE=1`, `NUM_SHARDS=1`,
-`MICRO_BATCH_SIZE_PER_GPU=1`, and `GRADIENT_ACCUMULATION_STEPS=32` to keep the effective
-global batch at 32 while one process shards the frozen backbone over all visible GPUs.
+| 论文位置 | 目录 | 实验 |
+|---|---|---|
+| Figure 1(a), Appendix H | `analysis/fig01a_hidden_channels/` | 视觉 hidden-channel 压缩 |
+| Figure 1(b) | `analysis/fig01b_hidden_prediction/` | 独立残差 MLP 预测 |
+| Table 5 | `analysis/table05_native_rank/` | 原生 Q / QKᵀ / attention output 秩统计 |
+| Figure 3 | `analysis/fig03_visual_effect/` | 原生轨迹的视觉作用低秩恢复 |
+| Table 6 | `analysis/table06_layer_effect/` | 选定层的因果视觉作用干预 |
+| Table 10, Appendix E | `analysis/table10_training_objective/` | Init / SFT / OPD / Supervised KD |
+| Figure 4, Appendix G | `analysis/fig04_adapter_rank/` | Adapter bottleneck rank |
+| Table 13, Appendix I | `analysis/table13_pruning_adapter/` | DART / DivPrune + embedding adapter |
+| Tables 14–15, Appendix J | `analysis/table14_15_layer_skipping/` | 关闭部分层视觉注入：准确率与资源 |
+| Figure 5, Appendix K | `analysis/fig05_hybrid_attention/` | Qwen3.5 recurrent state 与 full attention 路径 |
 
-Continue download or reuse the same run paths:
+下面保留各项实验定义、原始协议与入口。历史成绩与当前 DeepStack-off 重跑须区分。
+
+<!-- analysis:fig01a_hidden_channels -->
+### Figure 1(a), Appendix H：视觉 hidden-channel 压缩
+
+Qwen3-VL-4B（hidden=2560）和 LLaVA-1.5-7B（4096）。1024 张 PixMo-AMA 图像拟合每层不中心化 PCA 基底；同层基底跨 token、样本共享，rank=0/32/64/128/256/512/1024。SQA、RealWorldQA、MMStar 各最多1000题。
+
+每层视觉 hidden 从原生轨迹缓存恢复，再做通道投影；文本状态继续传播。视觉 token 数不变。`visual_channel_rank_grid.py` 同时含早期级联实验工具，论文的缓存恢复版本以 `visual_channel_native_cache.py` 为准。
+
+运行：`python -m analysis fig01a_hidden_channels run -- launch --output NEW_RUN`。先用 `--help` 查看分片和模型参数。
+<!-- /analysis:fig01a_hidden_channels -->
+
+<!-- analysis:fig01b_hidden_prediction -->
+### Figure 1(b)：独立残差 MLP 预测
+
+36 个独立逐 token MLP，以初始视觉 embedding E 为输入。目标为第 l 层 input RMSNorm 输出；预测为 `RMSNorm_l(E)+MLP_l(E)`，训练的是残差，不是直接比较 E 和目标。2000 step，冻结 teacher，预测不注入 teacher。逐图、逐层平均 MSE；评测完整预测的 cosine/MSE。
+
+数据：PixMo 训练，RealWorldQA 765、MMStar 1000、SQA 1000。运行：`python -m analysis fig01b_hidden_prediction run -- launch --output NEW_RUN`。
+
+结果来源：`artifacts/diagnostics/initial_token_postnorm_all36_20260916/results.csv`。`plot` 按原脚本写入 `artifacts/figures/layerwise_residual_mlp_20260917`。辅助文件中更早的 prenorm/mixing probe 及 report_initial_token_mlp.py 不等于论文这张图。论文数值汇总使用 run -- report --output RUN。
+<!-- /analysis:fig01b_hidden_prediction -->
+
+<!-- analysis:table05_native_rank -->
+### Table 5：原生 Q / QKᵀ / attention output 秩统计
+
+计算实现已恢复：[visual_rank_statistics.py](analysis/table05_native_rank/visual_rank_statistics.py)。最初只搜索现存文件/Git，误判为源码缺失；随后从原始编辑记录恢复完整脚本及后续补丁。**恢复前的原文件 SHA256 与原实验 provenance 完全一致**：
+
+`5fd6ab4650aae23164ea05a88f19c3a174c63a4eba8b7667e9e847e9e7960594`
+
+#### 实验定义
+
+Qwen3-VL-4B / LLaVA-1.5-7B，MMStar1000、RealWorldQA765、SQA1000，逐样本、逐层、逐head统计，没有 token/head 下采样。
+
+- Q：原生 QNorm/RoPE 后视觉行，既统计拼接 heads，也逐 head 统计。
+- QKᵀ：缩放后、加 causal mask 前的 visual-to-visual 分数矩阵；各 head 分开计算。
+- Attention output：Wo 后、残差前的视觉行。
+- r95 使用平方奇异值能量；effective rank 使用归一化奇异值的熵指数。
+- 数值计算使用 FP64 Gram 特征值/QR；先平均样本，再等权平均层，QKᵀ 另外等权平均 head。
+- 只挂观察 hook，原脚本会检查挂/卸 hook 后 logits 逐位一致。
+
+#### 入口
 
 ```bash
-DOWNLOAD=0 STAMP=<same_stamp> scripts/train_eval_qwen235b_kl_only.sh
+.venv/bin/python -m analysis table05_native_rank run -- --help
+### 8卡分片计算；新输出目录，避免覆盖原始结果
+.venv/bin/python -m analysis table05_native_rank run -- launch --output NEW_RUN
+.venv/bin/python -m analysis table05_native_rank run -- merge --output NEW_RUN
+.venv/bin/python -m analysis table05_native_rank report
 ```
 
-The Hugging Face download resumes automatically. Training restarts from step 0 unless an
-`INIT_CHECKPOINT` is supplied; use `SKIP_TRAIN=1` or `SKIP_EVAL=1` to run only one stage.
-For 235B adapter evaluation, `COMPILE_ADAPTER=0`, `ADAPTER_DECODE_CACHE=0`, and
-`EVAL_BATCH_SIZE=1` are the safe defaults.
+原结果：`artifacts/diagnostics/native_visual_rank_20260912/`。历史原生模型保留 DeepStack；现在调用共用 loader 遵守项目的 DeepStack-off 设置。因此恢复的是原统计算法，当前重新计算必须单列模型协议，不能直接声称全量数字已重新复现。
 
-Qwen 12k-style mixed run:
+#### 恢复与验证
+
+`artifacts/maintenance/paper_source_recovery_20260924/` 保存原文件、恢复来源及验证。规范路径版本只修改子进程模块路径，数值函数和 observer 不变。原始3项公式测试覆盖 r95/ER、QR 后 QKᵀ 谱、Gram/SVD 等价；另对完整历史逐题记录重新汇总并与原结果比较。具体结果见该目录 RESULTS.md。
+<!-- /analysis:table05_native_rank -->
+
+<!-- analysis:fig03_visual_effect -->
+### Figure 3：原生轨迹的视觉作用低秩恢复
+
+每层使用原生轨迹采集的文本 attention 视觉作用差值，投影后恢复到文本流。共享逐层基底由校准 token 的差值矩阵 SVD 得到。文本受干预后继续传播，但每层差值来自原生轨迹。
+
+`native_trajectory.py` 及匹配 helper `native_effect_core.py` 从 Git **28bc51c** 恢复，保留原 generation 测评实现。先运行 `python -m analysis fig03_visual_effect native -- --help`，设置模型、benchmark、数据、rank、输出目录。
+
+`rerun` 是后续 shared-rank 重测，不冒充原图数值：`artifacts/diagnostics/visual_effect_uncentered_20260920_104024/summary.json`。历史图与后续重测的模型协议/基准成绩有差别；本次只验证代码迁移，不宣称复跑全量论文成绩。
+<!-- /analysis:fig03_visual_effect -->
+
+<!-- analysis:table06_layer_effect -->
+### Table 6：选定层的因果视觉作用干预
+
+在当前已受前层干预影响的状态上，重新算正常文本 attention 与屏蔽视觉 KV 后的差值；投影并恢复该差值。与 Figure 3 的原生轨迹差值不同。基底按模型/数据集/层共享，在不含答案的 benchmark prompts 上校准（transductive oracle）。
+
+rank=0/32/64/128；First5、First10、Middle10、Last10、All。Qwen 中间13–22、末尾26–35；LLaVA 中间11–20、末尾22–31（0起编号）。
+
+历史结果：`artifacts/diagnostics/causal_effect_2models_2bench_20260912`。当时 SDPA / DeepStack 开启、生成上限8，RWQA765、MMStar前1000。当前项目模型加载关闭 DeepStack；不能直接把当前重跑称为历史数字的原协议复现。
+
+入口：`python -m analysis table06_layer_effect run -- --help`。不自动启动旧目录任务。
+<!-- /analysis:table06_layer_effect -->
+
+<!-- analysis:table10_training_objective -->
+### Table 10 / Appendix E：Init、SFT、OPD、Supervised KD
+
+原始训练入口已找回：[pixmo_objective_comparison.py](analysis/table10_training_objective/pixmo_objective_comparison.py)。来自原始编辑记录的完整 Add File 补丁，连同原配套测试和实验说明一并恢复。恢复文件另与两次独立历史完整读回逐字节核对一致。此前“旧 objective trainer 缺失”的判断已撤回。
+
+#### 原训练方法
+
+Qwen3-VL-4B frozen backbone，rank128，全36层 adapter，PixMo-AMA，2000 step，seed44，8卡、每卡batch4、GA1。AdamW LR5e-5，betas(.9,.95)，WD .01，clip1；cosine，3%warmup，末端10%LR；BF16/FA2/ZeRO2。
+
+- **Init**：不训练，逐层注入初始视觉 embedding，走原生完整 forward。
+- **SFT**：gold answer 的 next-token CE，包含模板EOS，不跑 teacher。
+- **Supervised KD**：gold answer 轨迹上的 teacher→student top1024 KL，temperature2，按答案token平均，系数1。
+- **OPD**：当前 student 从初始视觉/问题输入采样，temperature1、无top-k/p、最多128token、EOS停止。直接回放采样的 token ID，不decode/re-tokenize、不把真实答案填回轨迹、不在截断处伪造EOS。原生 teacher 评估相同轨迹，计算 teacher→student KL。采样无梯度，回放更新 adapter。
+- OPD 的 `FullVocabKL` 使用完整词表、FP32归一化、按token分块并使用解析梯度。旧配置另支持top1024，不能把两者混报；实际设置以各组config为准。
+
+Static与recurrent是不同的记忆参数化，训练核心继续共用 src/training/engine.py；这里仅保留原实验的OPD loss/采样插件，不复制优化器或训练循环。
+
+#### 入口与配置
 
 ```bash
-MODEL_KIND=qwen \
-RUN_NAME=qwen_mixed_pixmo_ocrvqa_embedding_adapter_12k \
-DATA=data/pixmo_clean_ocrvqa/train.jsonl \
-MAX_STEPS=12000 \
-SAVE_EVERY=1000 \
-LR=5e-5 \
-LR_SCHEDULER=cosine \
-WARMUP_RATIO=0.2 \
-MIN_LR_RATIO=0.1 \
-LOSS_NORMALIZATION=token \
-LAMBDA_TRAJECTORY=0.5 \
-scripts/train.sh
+.venv/bin/python -m analysis table10_training_objective train -- --help
+.venv/bin/python -m analysis table10_training_objective train -- --config NEW_CONFIG.json
+.venv/bin/python -m analysis table10_training_objective init -- --help
 ```
 
-LLaVA KV adapter training:
+正式8卡训练在上述分析入口外加 torch.distributed.run。普通训练/测评仍通过 `python -m src.run train|eval`。
+
+历史配置/日志/结果：`artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/`。重跑应复制配置到新目录，更新 output_dir、metrics_jsonl、W&B标识以及指向已删除工作目录的 deepspeed_config（本项目 configs/ds_zero2.json）。不要覆盖原实验。
+
+规范入口补充当前共用 trainer 必需的 `teacher_deepstack=False` 缺省字段，沿用全项目关闭 DeepStack 的要求；没有更换 loss。原实验 teacher 的DeepStack设置与现在不同，历史完整训练成绩未在本次重跑。
+
+#### 恢复与验证
+
+原实现/原测试/当时实验说明保存在 `artifacts/maintenance/paper_source_recovery_20260924/reference/`。验证涵盖完整词表KL及梯度、EOS/padding轨迹、采样来自student而非gold，以及原实现与迁移实现的精确数值对照。结果见同目录 RESULTS.md。
+<!-- /analysis:table10_training_objective -->
+
+<!-- analysis:fig04_adapter_rank -->
+### Figure 4, Appendix G：Adapter bottleneck rank
+
+rank32/64/128/256/512/1024 的 PixMo static KL adapter，2000 step；rank128 使用对应参考实验。训练快照固定 Git28bc51c；测评使用已确认的7f266415答案提取。不要修改归档源码或把新判分偷偷代入旧结果。
+
+训练：`artifacts/experiments/pixmo_static_rank_sweep/qwen3vl4b_pixmo_static_kl_rank_sweep_2000_20260921`。测评：`artifacts/eval/pixmo_static_rank_sweep_9image_7f266415_20260922`。
+
+入口：`python -m analysis fig04_adapter_rank train -- --help` / `eval -- --help`。这些是论文批量实验编排；模型 forward 与通用训练实现不另复制。
+<!-- /analysis:fig04_adapter_rank -->
+
+<!-- analysis:table13_pruning_adapter -->
+### Table 13, Appendix I：DART / DivPrune + embedding adapter
+
+Qwen3-VL-4B；50%、20%、5%；九个单图 benchmark。DART 先进入 LLM 再裁剪；DivPrune 在进入 LLM 前选择。后续 adapter 对保留位置的初始 embedding 生成视觉 hidden。
+
+结果：`artifacts/eval/qwen4b_pruned_embedding_adapter_20260923`。固定题目清单与评分源码，不改变 retention 口径。`qwen_pruned_embedding_adapter.py` 是唯一组合实现，被评测、测试共用。
+
+入口：`python -m analysis table13_pruning_adapter run -- --help`。
+<!-- /analysis:table13_pruning_adapter -->
+
+<!-- analysis:table14_15_layer_skipping -->
+### Tables 14–15, Appendix J：关闭部分层视觉注入：准确率与资源
+
+关闭层0–4和26–35，或0–9和26–35的视觉 KV 注入；文本 attention/FFN 正常，中间层使用 adapter。准确率九个单图 benchmark，速度使用固定 Video-MME 999题。
+
+历史 Table15 时间包含视觉编码，FLOPs 不包含视觉编码；报告必须写明两个口径，不因目录重构改变统计。资源执行复用 src/benchmarking/common/prefill.py。
+
+准确率：`artifacts/eval/qwen4b_adapter_first5_last10_off_20260923` 及 first10 对应目录。资源：`artifacts/diagnostics/video_adapter_layer_ablation_999_20260923` 与 `artifacts/reports/video_adapter_layers_including_vision_20260923`。
+
+入口：`python -m analysis table14_15_layer_skipping eval -- --help`，measure/profile/report 各沿用自己的参数。
+<!-- /analysis:table14_15_layer_skipping -->
+
+<!-- analysis:fig05_hybrid_attention -->
+### Figure 5, Appendix K：Qwen3.5 recurrent state 与 full attention 路径
+
+Qwen3.5-4B，24个LA、8个FA，DeepStack关闭。Boundary rank0 在视觉段结束时恢复该层视觉段前的 recurrent state；视觉 hidden/FFN 与 FA 保留，不能叫删除视觉 token 或 beta=0。
+
+FA 干预只阻断 text query 对视觉 KV 的访问：关键11/15两层，或其余6层3/7/19/23/27/31。RWQA765、MMStar1500，seed44。论文比较使用 **8-token** 结果。boundary 脚本按历史逻辑生成64 token，并分别报告 cap64 与经过独立短生成核验的 cap8 前缀；本次整理未改这段逻辑。论文对照取 cap8，不能将默认主报告 cap64 混入。
+
+结果：`artifacts/experiments/qwen35_fa_ablation/key11_15_vs_other6_full_cap8_20260923`；`artifacts/experiments/qwen35_memory/boundary_rank0_full_rwqa765_mmstar1500_cap64_20260923` 内 cap8 结果。
+
+入口：`python -m analysis fig05_hybrid_attention boundary -- --help` 或 full-attention。共享状态与mask逻辑在本目录两个 qwen35 模块。
+
+#### 同一机制问题的补充实验
+
+原先散在 src/scripts 的 23 个机制分析与调度文件已归入本目录，不再保留旧副本。
+这些是 Figure 5 的探索和控制实验，**不是论文新增的 Table/Figure**：
+
+| 补充问题 | 统一入口 runner |
+|---|---|
+| recurrent state 秩、功能相似性、扰动敏感性 | `memory-queue` / `memory-worker` / `memory-report` |
+| full-attention 视觉读取干预 | `fa-queue` / `fa-worker` |
+| 视觉位置 beta=0，保留 decay 和 conv | `no-write-queue` / `no-write-worker` |
+| 原生轨迹下 visual/text state 来源拆分 | `sources-queue` / `sources-worker` / `sources-report` |
+| 正确选项与错误选项方向的投影 | `projection-queue` / `projection-worker` / `projection-report` |
+| delta write 与 subtraction 拆分 | `cancellation-queue` / `cancellation-worker` / `cancellation-report` |
+| no-write / no-forget / state-skip、双轨 readout 和分组控制 | `write-forget` / `write-forget-report` |
+
+例如：`python -m analysis fig05_hybrid_attention write-forget -- --help`。
+沿用各实验原参数、公式、清单和生成长度；不把这些不同干预都叫 boundary rank0。
+迁移记录：`artifacts/maintenance/source_cleanup_20260924/`。
+<!-- /analysis:fig05_hybrid_attention -->
+
+## 验证
 
 ```bash
-MODEL_KIND=llava \
-OUTPUT_MODE=kv_adapter \
-RUN_NAME=llava_kv_adapter \
-scripts/train.sh
+.venv/bin/python -m unittest discover -s test/diagnostics -p 'test_*.py' -v
 ```
 
-LLaVA embedding adapter training:
-
-```bash
-MODEL_KIND=llava \
-OUTPUT_MODE=embedding_adapter \
-RUN_NAME=llava_embedding_adapter \
-scripts/train.sh
-```
-
-## Benchmark Evaluation
-
-The supported benchmark evaluation entry is:
-
-```bash
-scripts/eval_benchmark.sh
-```
-
-Default benchmark names:
-
-```text
-mmstar, gqa, mmb, mmb-cn, mme, pope, sqa, vqav2, realworldqa
-```
-
-Additional benchmark names can be run explicitly:
-
-```text
-perceptionbench, rendered-context-qa
-```
-
-PerceptionBench expects a converted JSONL file at
-`data/benchmarks/perceptionbench/test.jsonl`.
-Each item should follow the shared VQA schema with `image` or `images`, `question`,
-and `answer`, `answers`, or `choices`.
-
-PerceptionBench uses an OpenAI-compatible LLM judge. Run it with the same
-benchmark entrypoint:
-
-```bash
-LLM_JUDGE_BASE_URL=http://127.0.0.1:8001/v1 \
-LLM_JUDGE_MODEL=qwen3.5-4b-judge \
-MODEL_KIND=qwen \
-scripts/eval_benchmark.sh perceptionbench --teacher-only --model-path /path/to/qwen3-vl-model
-```
-
-PerceptionBench local evaluation note:
-
-- Official judge configuration uses `MAX_TOKENS=65536` with `gpt-oss-120b`.
-- Local runs use `/lustre-data/leijingdi/models/Qwen3.5-4B` as the judge.
-- For `Qwen3-VL-4B-Instruct`, full PerceptionBench with `MAX_NEW_TOKENS=128`
-  took about 30-31 minutes wall time on 8 GPUs: about 23 minutes for answer
-  generation plus about 7.5 minutes for batched judging.
-- The local `Qwen3.5-4B` judge score from that run was `0.156` on 3000 samples
-  (`468/3000`, invalid rate `0.0`). This is not directly comparable to the
-  official `gpt-oss-120b` judge score.
-- PerceptionBench uses the same benchmark entrypoint as the other benchmarks:
-  `scripts/eval_benchmark.sh perceptionbench`.
-
-Single Qwen benchmark:
-
-```bash
-MODEL_KIND=qwen \
-COMPILE_ADAPTER=0 \
-scripts/eval_benchmark.sh sqa \
-  --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/RUN_NAME \
-  --step 12000 \
-  --max-samples 1000 \
-  --num-shards 8
-```
-
-Three-benchmark Qwen eval:
-
-```bash
-MODEL_KIND=qwen \
-COMPILE_ADAPTER=0 \
-scripts/eval_benchmark.sh --benchmarks mmstar,sqa,vqav2 \
-  --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/RUN_NAME \
-  --step 500 \
-  --max-samples 1000 \
-  --num-shards 8
-```
-
-Compiled adapter eval:
-
-```bash
-MODEL_KIND=qwen \
-COMPILE_ADAPTER=1 \
-COMPILE_VERIFY=0 \
-scripts/eval_benchmark.sh --benchmarks mmstar,sqa,vqav2 \
-  --run-dir artifacts/experiments/qwen_topk1024_freezeqkv/RUN_NAME \
-  --step 500 \
-  --max-samples 1000 \
-  --num-shards 8
-```
-
-LLaVA benchmark eval uses the same wrapper:
-
-```bash
-MODEL_KIND=llava \
-COMPILE_ADAPTER=0 \
-scripts/eval_benchmark.sh mmstar \
-  --run-dir artifacts/RUN_NAME \
-  --step 4000 \
-  --num-shards 8
-```
-
-Outputs include per-shard files plus a merged `results.json`. For batch runs, the wrapper also
-writes aggregate CSV/JSON summaries with:
-
-- teacher score or F1;
-- adapter score or F1;
-- total generation time;
-- prefill time;
-- prefill FLOPs;
-- KV cache size;
-- agreement and retention metrics when available.
-
-## Prefill Speed / Metric Table
-
-`src/benchmark_prefill.py` is the unified prefill benchmark utility. The old
-`src/qwen_benchmark_utils.py` path has been removed.
-
-Qwen adapter and pruning speed comparison using the original evaluation entry points:
-
-```bash
-OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=0 \
-.venv/bin/python -m src.benchmark_prefill \
-  --model-path /lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct \
-  --checkpoint artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt \
-  --compare-methods all --comparison-protocol original \
-  --comparison-deepstack off \
-  --cuda-graph --cuda-graph-context --attn-implementation flash_attention_2 \
-  --native-cuda-graphs --optimize-attention-metadata --measure-decode-steps \
-  --retentions 0.05 0.2 --benchmark mmstar \
-  --sample-jsonl data/benchmarks/mmstar/mmstar_speedtest_200.jsonl \
-  --data-root data/benchmarks/mmstar --metric-samples 200 \
-  --metric-prefill-warmup 1 --max-new-tokens 8 \
-  --adapter-decode-cache-mode fast --log-every 25 \
-  --output-json test/results/all_fa2_mmstar200/table.json
-```
-
-`--compare-methods` defaults to `--comparison-protocol original`. It runs
-`benchmark_prefill --metric-table` for base + adapter, then `baselines.eval_baselines`
-for base + FastV, DART, DivPrune, ZooPrune, SparseVLM and VisionZip at each retention.
-These are the repository's Qwen ports. Methods can also be selected individually.
-
-- Adapter prefill uses the original vision-context and prefill-cache CUDA Graphs.
-  Graph capture and warmup occur outside timing; vision runs for every request.
-  In this fast path, `--attn-implementation flash_attention_2` selects FA2 for
-  adapter text attention as well as native vision attention. Text queries are
-  grouped by their original sequence positions so text before an image cannot
-  attend that image. Both cached decode modes also use FA2. This FA2 adapter
-  benchmark currently requires unpadded batch-size-one inputs.
-  `fast` is the decode default: each step processes one new token with growing KV,
-  using a warmed whole-decode CUDA Graph. It omits saved prefix layer activations.
-  `shape_exact` retains the older full-text-prefix recomputation for BF16 shape
-  comparisons. It is not the fast decode path. Unpadded cached queries that see
-  the entire prefix use native dense FA2 without gathering K/V or rereading the
-  mask on the CPU each step; other masks retain the varlen FA2 path.
-  For this unpadded FA2 path, prefill constructs an owned native Qwen cache once;
-  subsequent steps call the same native Qwen decoder used by base. Cache preparation
-  is included in prefill timing. Explicit sequence and M-RoPE positions preserve
-  the adapter's original logits. Masked prefixes retain the manual FA2 decoder,
-  whose graphs share immutable visual K/V across steps. Returned caches retain
-  their own data across later requests.
-- `--native-cuda-graphs` also graphs the native vision and decoder layers for base
-  and all six pruning methods, plus the whole native forward during cached decode.
-  In FA2 `--compare-methods --comparison-protocol original` runs, this now defaults
-  on whenever adapter CUDA Graphs are enabled; attention metadata reuse also defaults
-  on. This avoids comparing the adapter's graph replay against native Python dispatch.
-  Use `--no-native-cuda-graphs --no-optimize-attention-metadata` only when explicitly
-  measuring that older execution path.
-  DivPrune/ZooPrune selection and DART neighbor tensor work use warmed graphs;
-  pruning audit CPU copies are disabled during benchmark execution. DART retains
-  its original candidate order and top-k tie behavior. Every sample checks exact token, logit and KV
-  equality with eager FA2 before timing. Graph preparation is separately reported;
-  timed capture or a missing warmed shape fails the run. ZooPrune random state is
-  restored around preparation so warmup does not change its selections.
-- DeepStack is disabled project-wide for training, evaluation, and timing: auxiliary vision mergers are
-  skipped and language injection is forbidden, including on the adapter's vision
-  path. Both adapter teachers and students follow this policy. Only `--comparison-deepstack off` is accepted. Historical frozen runs and results retain their original settings.
-  Base and pruning use original HF `generate`, stopping
-  at EOS or the generation limit. Adapter retains the original metric-table
-  structured-answer early stop. MMStar defaults to an 8-token limit. These original
-  stop policies can produce different output lengths; total speedup includes that effect.
-  For equal-work prefill/decode comparisons, run
-  `test/diagnostics/paired_runtime_execution.py --tokens 8`: it alternates each
-  method with base on the same GPU, suppresses EOS for all methods, and checks all
-  eight logits and the final growing KV against eager execution before timing.
-  Its totals are a separate fixed-output protocol, not the historical stopping run.
-- Times are sums across the selected samples. Image loading, preprocessing,
-  CPU-to-GPU copies and warmup are excluded. Prefill includes vision and the
-  method's processing through first-token logits. Adapter total adds continuation
-  to its measured prefill; native total measures the original `generate` call.
-- Each retention group and adapter run records its own measured base denominator.
-  Total speedup is paired base total / method total; prefill speedup is paired base
-  prefill / method prefill. The output retains all base rows and reference values.
-  With native graphs enabled, the adapter uses the optimized native base reference
-  from the baseline run; the legacy eager teacher row remains in raw adapter output.
-- Adapter `kv_cache_mb` uses measured prefill K/V storage when available; the old
-  estimate is retained as `analytic_kv_cache_mb`. Adapter
-  `actual_prefill_kv_cache_mb` counts retained text and visual K/V tensors;
-  `actual_prefill_decode_cache_mb` includes additional decoding state. The old
-  analytic text-KV-plus-one-visual-memory estimate is not actual runtime cache usage.
-- FLOPs preserve the original analytical decoder prefill formula (2 FLOPs/MAC),
-  excluding vision, selection, LM head, normalization and softmax. They are mean
-  per-sample prefill FLOPs, not whole-model or complete-generation FLOPs.
-- `Peak Memory` / `peak_memory_mb` is the maximum per-request CUDA allocated
-  memory over the dataset, in MiB. It includes the evaluation process's weights,
-  retained graph pools, KV and activations. Capture itself is excluded; other
-  processes' memory is not counted. Per-stage maxima, mean per-request peaks and
-  reserved memory are also saved. Native evaluation enables this with
-  `--measure-peak-memory`; the comparison orchestrator enables it automatically.
-
-Outputs include JSON/CSV/Markdown tables, a protocol JSON with commands and hashes,
-raw entry-point logs, paired references, and per-sample results. `--metric-table`
-also writes a `.details.json` sidecar when `--output-json` is provided.
-
-`--comparison-protocol fixed-work` explicitly selects the earlier fixed-token
-benchmark with a custom cached decode loop. Its `--comparison-runs`,
-`--comparison-decode-mode` and `--comparison-deepstack` options belong to that
-separate protocol. It does not reproduce the historical MMStar speed table.
-
-### Corrected prefill / decode accounting
-
-Add `--optimize-attention-metadata --measure-decode-steps` to the comparison command
-above to enable the FA2 metadata fix and direct decode measurements. The original
-baseline entry supports the equivalent flags `--optimize-attention-metadata
---measure-decode`.
-
-The metadata fix preserves original RoPE, padding masks, caches, **and the original
-varlen/dense kernel choice**. It caches sequence metadata once per pruned position
-tensor instead of re-inferring it at every layer. Simply switching the varlen kernel
-to a dense kernel can change BF16 near-tie answers and is not the implemented fix.
-
-For baselines, `generation_prefill_time_s` measures the first forward inside native
-`generate`; `decode_time_s` measures subsequent cached one-token forwards directly.
-`generation_overhead_s` accounts for the remaining generation work. Thus total equals
-generation prefill + decode forwards + overhead. `prefilling_time_s` still records
-the separately measured standalone prefill and must not be subtracted from total to
-claim a decode time. Reports also include `decode_steps`, `decode_ms_per_step`,
-`generated_tokens`, and actual retained K/V storage.
-
-For the adapter, direct decode-step timing is optional and separate from its existing
-continuation timer. Structured-answer early stopping can finish at the first token:
-zero decode steps means decode ms/token is **not applicable**, not zero-cost decoding.
-Shared-GPU measurements include contention and must be labelled separately from
-isolated speed measurements.
-
-The focused **screenshot reproduction: adapter and FastV 5%** is in
-[`test/results/screenshot_adapter_fastv_20260915/README.zh.md`](test/results/screenshot_adapter_fastv_20260915/README.zh.md).
-It contains recovered historical commands/CSV/forward code, the measured FA2 and
-DeepStack-off results, Peak Memory, and the remaining protocol differences.
-
-The earlier **FA2, DeepStack-off** MMStar 200 comparison is in
-[`test/results/deepstack_off_20260915/README.zh.md`](test/results/deepstack_off_20260915/README.zh.md).
-It includes Peak Memory, actual KV, the native adapter decoder, and same-input
-5%/20% interleaving. The JSON/CSV retain the distinct measured base denominators.
-
-The earlier MMStar 200 stage report is in
-[`test/results/prefill_decode_corrected_20260915/README.zh.md`](test/results/prefill_decode_corrected_20260915/README.zh.md).
-It includes actual KV storage, direct decode steps, all requested resource/speed
-columns, and output parity against the original run. The accompanying
-[`FA2 diagnosis`](test/results/prefill_slowdown_investigation_20260915/README.zh.md)
-records the preserved kernels and removed repeated metadata operations.
-The [decode operator breakdown](test/results/decode_operator_breakdown_20260915/README.zh.md)
-also measures actual attention shapes, attributes GPU kernels, and uses an exact
-fixed-step CUDA Graph diagnostic to distinguish attention savings from native
-dispatch cost. The diagnostic graph timings are not complete-generation results.
-
-Legacy base-versus-adapter quality/metric table:
-
-```bash
-.venv/bin/python -m src.benchmark_prefill \
-  --model-kind qwen \
-  --model-path /path/to/Qwen3-VL-4B-Instruct \
-  --checkpoint /path/to/qwen_embedding_adapter_step500.pt \
-  --metric-table \
-  --benchmark pope \
-  --metric-samples 100 \
-  --data-root /path/to/data/root
-```
-
-Single-sample prefill timing:
-
-```bash
-.venv/bin/python -m src.benchmark_prefill \
-  --model-kind qwen \
-  --model-path /path/to/Qwen3-VL-4B-Instruct \
-  --checkpoint /path/to/qwen_embedding_adapter_step500.pt \
-  --sample-jsonl /path/to/eval.jsonl \
-  --sample-index 0 \
-  --data-root /path/to/data/root \
-  --n-runs 20 \
-  --warmup 5
-```
-
-For LLaVA:
-
-```bash
-.venv/bin/python -m src.benchmark_prefill \
-  --model-kind llava \
-  --model-path /path/to/llava-1.5-7b-hf \
-  --checkpoint /path/to/step_4000.pt \
-  --output-mode kv_adapter \
-  --sample-jsonl /path/to/eval.jsonl \
-  --sample-index 0 \
-  --data-root /path/to/data/root
-```
-
-## Source Layout
-
-```text
-src/train.py              Unified trainer.
-src/eval_benchmarks.py    Unified benchmark generation/evaluation.
-src/benchmark_prefill.py  Prefill speed benchmark and small metric tables.
-src/model.py              Frozen model loaders, adapter modules, adapter forward paths.
-src/data.py               Training and benchmark datasets.
-src/benchmarks.py         Benchmark registry and scoring configuration.
-src/chat_qwen_adapter.py  Qwen adapter chat/debug utility.
-```
-
-Shell entries:
-
-```text
-scripts/train.sh          Unified training wrapper.
-scripts/eval_benchmark.sh Unified benchmark evaluation wrapper.
-```
-
-## Current Compatibility Policy
-
-- New code should use `kv_adapter` for the LLaVA KV adapter.
-- New code should use `embedding_adapter` for the shared embedding-memory adapter path.
-- Legacy checkpoint names with `qwen_visual_delta_*` are still resolved by the eval wrapper for
-  compatibility, but new checkpoints should use `qwen_embedding_adapter_*`.
-- `eval-mode=logits` has been removed.
-
-## OCR Training And Evaluation
-
-OCR adapter training uses the Qwen3-VL path and DeepSpeed ZeRO-2 by default:
-
-```bash
-scripts/ocr_train.sh
-```
-
-Default training inputs and hyperparameters:
-
-```text
-MODEL_PATH=/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct
-OCR_DATASET=ocr_overlap_allcopy_only_1024
-DATA=data/train/$OCR_DATASET/paired_train.jsonl
-NPROC_PER_NODE=8
-MICRO_BATCH_SIZE_PER_GPU=1
-GRADIENT_ACCUMULATION_STEPS=4
-MAX_STEPS=1824
-SAVE_EVERY=500
-LR=5e-5
-LR_SCHEDULER=cosine
-WARMUP_RATIO=0.05
-DS_CONFIG=configs/ds_zero2.json
-WANDB_MODE=online
-```
-
-To resume or initialize from an adapter checkpoint:
-
-```bash
-INIT_CHECKPOINT=/path/to/qwen_embedding_adapter_stepXXXX.pt scripts/ocr_train.sh
-```
-
-OCR copy-style evaluation uses `scripts/ocr_eval.sh`:
-
-```bash
-CHECKPOINT=/path/to/qwen_embedding_adapter_stepXXXX.pt scripts/ocr_eval.sh
-```
-
-Default OCR eval inputs:
-
-```text
-OCR_DATASET=ocr_overlap_allcopy_only_1024
-DATA=data/train/$OCR_DATASET/paired_eval.jsonl
-IMAGE_ROOT=data/train/rendered_text
-MAX_SAMPLES=1000
-MAX_NEW_TOKENS=1024
-```
-
-Without `CHECKPOINT`, `ocr_eval.sh` runs teacher-only paths by passing
-`--no-eval-adapter`.
-
-Rendered-context QA evaluation uses the normal benchmark wrapper through
-`scripts/ocr_qa_eval.sh`:
-
-```bash
-RUN_DIR=/path/to/run/checkpoints scripts/ocr_qa_eval.sh
-```
-
-Defaults:
-
-```text
-BENCHMARK=rendered-context-qa
-DATA=data/benchmarks/rendered_qa_300_msmarco/msmarco_200_400_span_100.jsonl
-STEP=500
-MAX_SAMPLES=100
-MAX_NEW_TOKENS=512
-NUM_SHARDS=8
-COMPILE_ADAPTER=0
-```
-## Qwen3.5 hybrid-attention adapter workflow
-
-The Qwen3.5-4B integration is in `src/qwen35_embedding.py` and
-`src/qwen35_experiment.py`. Each of the 32 layers has an independent
-2560 → 128 → 2560 residual MLP taking the initial visual embedding. The
-24 GatedDeltaNet layers preserve original-order causal convolution and all
-visual/text recurrent-state updates. Visual mixer outputs are discarded;
-the FFN processes text only. This implementation still computes visual
-query/readout work and is not a maximum-speed implementation.
-
-Training freezes the native model and uses the existing answer-token top-1024
-KL objective at temperature 2. No hidden-state, attention or recurrent-state
-loss is added. Microbatch-one accumulation preserves the original PixMo
-microbatch-four answer-token weighting. DeepStack and thinking are disabled.
-
-- `scripts/queue_qwen35_pixmo.py`: the local experiment queue, with a preceding
-  run dependency, correctness checks, native nine-benchmark evaluation,
-  2000-step PixMo-AMA training and adapter evaluation. Inspect its local paths
-  and predecessor before launching it on another machine.
-- `scripts/qwen35_worker.py`: validation, distributed training and sharded
-  evaluation entrypoints, configured by the prepared run's `config.json`.
-- `configs/qwen35_adapter_requirements.txt`: isolated FLA/causal-conv1d/Triton
-  dependencies. Install with `python -m pip install --no-deps --no-build-isolation
-  --target artifacts/dependencies/qwen35_python -r configs/qwen35_adapter_requirements.txt`.
-  Triton 3.7.1 is required here to avoid the older gated-backward issue on H200.
-- `test/diagnostics/test_qwen35_embedding.py`: CPU checks for hybrid-cache
-  equivalence and KL value/gradient/accumulation parity with the existing loss.
-
-The document continuation workflows are `scripts/train_document_embedding128.py`
-and `scripts/train_document_recurrent128.py`, with data preparation in
-`scripts/prepare_document_training.py`. They use the training splits of ChartQA,
-DocVQA and InfographicVQA, excluding exact encoded-image or decoded-RGB matches
-to the held-out data. The evaluation uses ChartQA relaxed accuracy and
-DocVQA/InfographicVQA ANLS, implemented in `src/document_metrics.py`.
+2026-09-24 最新目录迁移验证：94 项测试中 93 通过；1 项依赖已删除外部历史目录，跳过。
+真实 Qwen3-VL-4B 两步训练的 loss、全部 adapter 梯度和更新后参数，以及 base／adapter 各 8 步 logits 完全一致，最大差 0。
+CUDA Graph 捕获／回放的 logits、tokens、KV hash 也一致。16 项入口检查通过。
+记录和脚本在 `artifacts/maintenance/runtime_into_src_20260924/`。
+
+这些是有限输入的代码回归，不代表完整 benchmark 或 2000-step 训练重跑；本次也没有在共享 GPU 上据此宣称速度数值完全相同。
+Qwen3.5 和 LLaVA 的本轮测试范围为现有单元测试／入口检查，真实底座数值验证以各历史报告为准。

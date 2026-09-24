@@ -8,7 +8,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from src.benchmark_adapter_optimizations import dump, file_sha
+from src.benchmarking.engines.adapter import dump, file_sha
 
 
 def main():
@@ -16,15 +16,15 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob('native_*.jsonl')):
         raise FileExistsError(output)
-    sources = ['src/benchmark_video_base.py', 'src/generation_timing.py', 'baselines/eval_baselines.py',
-        'src/qwen_deepstack.py', 'src/data.py', 'src/benchmarks.py', 'src/video_benchmark_inputs.py',
-        'src/benchmark_video_sampling.py', 'src/benchmark_comparison.py']
+    sources = ['src/benchmarking/engines/base.py', 'src/benchmarking/common/generation_timing.py', 'baselines/eval_baselines.py',
+        'src/model_setup.py', 'src/data.py', 'src/benchmarks.py', 'src/video.py',
+        'src/video.py', 'src/benchmarking/common/comparison.py']
     hashes = {p:file_sha(ROOT/p) for p in sources}
     dump(output/'source_start.json', hashes)
     running = {}
     try:
         for shard in range(8):
-            command = [sys.executable, '-m', 'src.benchmark_video_base', '--variant', 'native',
+            command = [sys.executable, '-m', 'src.benchmarking.engines.base', '--variant', 'native',
                 '--shard', str(shard), '--shards', '8', '--runs', '3', '--tokens', '8',
                 '--input-cache', 'test/results/qwen3vl4b_embedding_m4multi64k_video64k_rank128_4000_20260915_step3000_8gpu/videomme/processed/videomme',
                 '--output', str(output)]
@@ -49,7 +49,7 @@ def main():
     changed = [p for p,h in hashes.items() if file_sha(ROOT/p) != h]
     dump(output/'source_validation.json', dict(all_sources_unchanged=not changed, changed=changed))
     assert not changed, changed
-    subprocess.run([sys.executable, '-m', 'src.benchmark_video_base', '--aggregate', '--variant', 'native',
+    subprocess.run([sys.executable, '-m', 'src.benchmarking.engines.base', '--aggregate', '--variant', 'native',
         '--runs', '3', '--tokens', '8', '--output', str(output)], cwd=ROOT, check=True)
 
 

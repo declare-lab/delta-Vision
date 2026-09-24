@@ -10,14 +10,14 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
-from src.benchmark_adapter_optimizations import MODEL,MANIFEST,tensor_sha
-from src.benchmark_video_pruning import INPUT_CACHE,layer_kv,label
+from src.benchmarking.engines.adapter import MODEL, MANIFEST, tensor_sha
+from src.benchmarking.engines.pruning import INPUT_CACHE, layer_kv, label
 from src.data import QwenBenchmarkDataset
-from src.generation_timing import GenerationStageTimer
-from src.qwen_attention_metadata import optimize_qwen_attention_metadata
-from src.qwen_deepstack import disable_qwen_deepstack
-from src.qwen_fused_norm import FusedQwenNorms
-from src.qwen_native_graph import NativeDecoderGraphs
+from src.benchmarking.common.generation_timing import GenerationStageTimer
+from src.attention import optimize_qwen_attention_metadata
+from src.model_setup import disable_qwen_deepstack
+from src.kernels import FusedQwenNorms
+from src.graphs import NativeDecoderGraphs
 
 
 def main():

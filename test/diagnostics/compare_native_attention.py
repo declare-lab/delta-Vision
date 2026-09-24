@@ -11,8 +11,8 @@ sys.path.insert(0, str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
-from src.generation_timing import GenerationStageTimer
-from src.qwen_native_graph import NativeDecoderGraphs
+from src.benchmarking.common.generation_timing import GenerationStageTimer
+from src.graphs import NativeDecoderGraphs
 
 
 def main():

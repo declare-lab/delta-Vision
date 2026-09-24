@@ -11,12 +11,12 @@ sys.path.insert(0, str(ROOT))
 os.environ.update(QWEN_VIDEO_SAMPLING='full_timestamp_v1', QWEN_VIDEO_NUM_FRAMES='8', HF_HUB_DISABLE_PROGRESS_BARS='1')
 import torch
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
-from src.benchmark_adapter_optimizations import MODEL, CHECKPOINT, MANIFEST
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
+from src.benchmarking.engines.adapter import MODEL, CHECKPOINT, MANIFEST
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
 from src.data import QwenBenchmarkDataset
 from src.model import load_qwen_embedding_adapter_checkpoint, build_qwen_initial_context, prepare_qwen_embedding_adapter_inputs
-from src.qwen_adapter_kernels import exact_rope
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.kernels import exact_rope
+from src.model_setup import disable_qwen_deepstack
 
 OUTPUT = ROOT/'test/results/adapter_max_20260915/visual_batch_probe.json'
 INPUT_CACHE = ROOT/'test/results/qwen3vl4b_embedding_m4multi64k_video64k_rank128_4000_20260915_step3000_8gpu/videomme/processed/videomme'

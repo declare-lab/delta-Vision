@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
-from src.qwen35_full_attention_ablation import block_visual_readout, text_indices
+from analysis.fig05_hybrid_attention.qwen35_full_attention_ablation import block_visual_readout, text_indices
 
 
 def reference(q, k, v, visual=None):

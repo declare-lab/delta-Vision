@@ -4,21 +4,22 @@ import unittest
 from unittest.mock import Mock, patch
 
 import torch
-from src.benchmark_comparison import cache_metrics, decoder_flops, native_cached_step, parse_methods, tensor_storage_bytes
+from src.benchmarking.common.comparison import cache_metrics, decoder_flops, native_cached_step, parse_methods, tensor_storage_bytes
 
 
 class ComparisonTest(unittest.TestCase):
     def test_fast_prefill_replays_both_original_graph_runners(self):
-        from src.benchmark_prefill import build_qwen_fast_adapter_prefill
-        from src.benchmark_comparison import RequestRunner
+        from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
+        from src.benchmarking.common.comparison import RequestRunner
         args = SimpleNamespace(last_logits_only=True, cuda_graph=True, cuda_graph_context=True,
                                cuda_graph_warmup=3, compile_verify=True, compile_max_diff=0.)
         inputs = {key: torch.ones(1) for key in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids")}
         hidden, positions, logits, mask = [torch.ones(1) for _ in range(4)]
         cache = {"layers": [], "layer_inputs": [], "layer_after_attention": []}
-        model = SimpleNamespace(model=SimpleNamespace(rope_deltas=None))
-        with patch("src.benchmark_prefill.QwenContextCudaGraphRunner") as context_cls, \
-             patch("src.benchmark_prefill.QwenAdapterPrefillCacheCudaGraphRunner") as prefill_cls:
+        model = SimpleNamespace(model=SimpleNamespace(rope_deltas=None,
+            language_model=SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))))
+        with patch("src.benchmarking.common.prefill.QwenContextCudaGraphRunner") as context_cls, \
+             patch("src.benchmarking.common.prefill.QwenAdapterPrefillCacheCudaGraphRunner") as prefill_cls:
             context_cls.return_value = Mock(return_value=(hidden, positions))
             prefill_cls.return_value = Mock(return_value=(logits, mask, cache))
             fn = build_qwen_fast_adapter_prefill(model, object(), args)
@@ -28,7 +29,7 @@ class ComparisonTest(unittest.TestCase):
             self.assertIs(actual_cache, cache)
             context_cls.return_value.assert_called_once()
             prefill_cls.return_value.assert_called_once_with(inputs["input_ids"], inputs["attention_mask"],
-                inputs["mm_token_type_ids"], hidden, positions)
+                inputs["mm_token_type_ids"], hidden, positions, topology=None)
 
     def test_aliases_and_reference(self):
         self.assertEqual(parse_methods(["zooprune,visionzup", "fastv"]), ["base", "zoo", "visionzip", "fastv"])

@@ -2,19 +2,18 @@ __pycache__/
 test/results/*
 !test/results/.gitignore
 test/__pycache__/
-artifacts/
+/artifacts/
 *.pyc
 .venv/
 data/
 model/
-artifacts/
 wandb/
 *.pt
 *.pyc
 __pycache__/
 
 # Local baseline artifacts
-baselines/
+/baselines/
 
 # Downloaded models and local diagnostic dependencies/output
 /models/

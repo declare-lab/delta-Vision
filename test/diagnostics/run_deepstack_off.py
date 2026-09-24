@@ -44,7 +44,7 @@ def baseline_worker(gpu, method):
 
 def adapter_worker():
     native(3, ["base"], 1., "adapter_reference")
-    run([sys.executable, "-m", "src.benchmark_prefill", "--model-path", MODEL,
+    run([sys.executable, "-m", "src.benchmarking.common.prefill", "--model-path", MODEL,
         "--checkpoint", str(CHECKPOINT), "--metric-table", "--benchmark", "mmstar",
         "--sample-jsonl", str(DATA), "--data-root", str(DATA.parent), "--metric-samples", "200",
         "--max-new-tokens", "8", "--cuda-graph", "--cuda-graph-context", "--adapter-decode-cache-mode", "fast",
@@ -55,10 +55,10 @@ def adapter_worker():
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    sources = ["src/model.py", "src/benchmark_prefill.py", "src/eval_benchmarks.py", "src/generation_timing.py",
-        "src/qwen_deepstack.py", "src/qwen_adapter_fa2.py", "src/qwen_adapter_graph.py", "src/qwen_native_graph.py",
-        "src/qwen_adapter_native_graph.py", "src/qwen_adapter_shared_graph.py",
-        "src/qwen_attention_metadata.py", "baselines/eval_baselines.py", "baselines/multimodal_pruning_utils.py"]
+    sources = ["src/model.py", "src/benchmarking/common/prefill.py", "src/evaluate.py", "src/benchmarking/common/generation_timing.py",
+        "src/model_setup.py", "src/attention.py", "src/graphs.py", "src/graphs.py",
+        "src/graphs.py", "src/graphs.py",
+        "src/attention.py", "baselines/eval_baselines.py", "baselines/multimodal_pruning_utils.py"]
     sources += [f"baselines/{m}/qwen3_vl/modeling_qwen3_vl_{m}.py" for m in ["fastv","dart","divprune","zoo","sparsevlm","visionzip"]]
     protocol = dict(samples=200, attention="flash_attention_2", deepstack="off: no vision side mergers or language injection",
         adapter="genuine fast decode; vision-context and prefill-cache graphs; whole decode graph",

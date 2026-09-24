@@ -7,7 +7,7 @@ import unittest
 import torch
 from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
-from src import qwen35_pruning as pruning
+from baselines import qwen35_pruning as pruning
 
 
 class PruningTests(unittest.TestCase):

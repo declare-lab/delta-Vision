@@ -21,7 +21,7 @@ def main():
                 "legacy_prefill": "separate standalone prefill retained as prefilling_time_s for comparison",
                 "metadata_fix": "cache FA2 sequence metadata per pruned position tensor; preserve original varlen/dense kernel choice and rotary embeddings",
                 "commands": [], "source_sha256": {p: hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in [
-                    "src/generation_timing.py", "src/qwen_attention_metadata.py", "baselines/eval_baselines.py",
+                    "src/benchmarking/common/generation_timing.py", "src/attention.py", "baselines/eval_baselines.py",
                     "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"]}}
     for retention in [.05, .2]:
         output = OUT / f"ret{int(retention*100):02d}"

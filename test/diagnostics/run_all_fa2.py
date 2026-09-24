@@ -33,8 +33,8 @@ def run_gpu(gpu, methods):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    sources = ["src/model.py", "src/qwen_native_graph.py", "src/qwen_attention_metadata.py",
-        "src/generation_timing.py", "baselines/eval_baselines.py",
+    sources = ["src/model.py", "src/graphs.py", "src/attention.py",
+        "src/benchmarking/common/generation_timing.py", "baselines/eval_baselines.py",
         "baselines/visionzip/qwen3_vl/modeling_qwen3_vl_visionzip.py",
         "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"]
     protocol = dict(samples=200, attention="flash_attention_2", shared_gpu=True,

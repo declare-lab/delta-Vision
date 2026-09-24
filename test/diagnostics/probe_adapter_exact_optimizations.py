@@ -13,8 +13,8 @@ from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
 from src.model import (load_qwen_embedding_adapter_checkpoint, build_qwen_initial_context,
     prepare_qwen_embedding_adapter_inputs, qwen_embedding_adapter_prefill_cache_prepared)
-from src.qwen_deepstack import disable_qwen_deepstack
-from src.qwen_fused_norm import FusedQwenNorms
+from src.model_setup import disable_qwen_deepstack
+from src.kernels import FusedQwenNorms
 
 MODEL = '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
 CHECKPOINT = ROOT / 'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt'

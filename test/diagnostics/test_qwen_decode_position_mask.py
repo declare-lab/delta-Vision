@@ -5,7 +5,8 @@ import unittest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCES = [ROOT/'src/model.py', ROOT.parent/'vision-kv-inject-attention-sink/src/model.py']
+LEGACY_SOURCE = ROOT.parent/'vision-kv-inject-attention-sink/src/model.py'
+SOURCES = [ROOT/'src/model.py'] + ([LEGACY_SOURCE] if LEGACY_SOURCE.exists() else [])
 
 
 def load_function(path, name):
@@ -41,8 +42,9 @@ class DecodePositionMaskTest(unittest.TestCase):
                 self.assertTrue(torch.equal(fn(cache(), torch.zeros(3,2,1,dtype=torch.long)),
                     fn(cache(), torch.full((3,2,1), 10000, dtype=torch.long))))
 
+    @unittest.skipUnless(LEGACY_SOURCE.exists(), 'Historical attention-sink worktree is absent')
     def test_static_preserves_images_and_masks_unused_capacity(self):
-        fn = load_function(SOURCES[1], '_qwen_decode_hf_static_attention_mask')
+        fn = load_function(LEGACY_SOURCE, '_qwen_decode_hf_static_attention_mask')
         c = cache()
         actual = fn(c, torch.zeros(3,2,1,dtype=torch.long), torch.tensor([True,False]))[:,0,0]
         active = torch.cat([c['image_mask'],c['text_mask'],c['hf_generated_mask'],torch.tensor([[True],[False]])],1)

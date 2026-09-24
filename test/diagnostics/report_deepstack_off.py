@@ -8,7 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from src.peak_memory import summarize_peak_memory
+from src.benchmarking.common.peak_memory import summarize_peak_memory
 OUT = ROOT / "test/results/deepstack_off_20260915"
 FULL = OUT / "full"
 METHODS = ["fastv", "dart", "visionzip", "sparsevlm", "divprune", "zoo"]

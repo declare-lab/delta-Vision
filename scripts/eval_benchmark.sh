@@ -626,7 +626,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     shard_cuda="$gpu"
   fi
   echo "Launching shard $shard on CUDA_VISIBLE_DEVICES=$shard_cuda"
-  CUDA_VISIBLE_DEVICES="$shard_cuda" "$PY" -m src.eval_benchmarks \
+  CUDA_VISIBLE_DEVICES="$shard_cuda" "$PY" -m src.run eval --family "$MODEL_KIND" -- \
     --model-kind "$MODEL_KIND" \
     --benchmark "$BENCHMARK" \
     --data "$DATA" \
@@ -661,7 +661,7 @@ for pid in "${pids[@]}"; do
   wait "$pid"
 done
 
-"$PY" -m src.eval_benchmarks \
+"$PY" -m src.run eval --family "$MODEL_KIND" -- \
   --model-kind "$MODEL_KIND" \
   --benchmark "$BENCHMARK" \
   --data "$DATA" \

@@ -1,5 +1,5 @@
 import unittest
-from src.evaluation_sampling import sample_evaluation_rows
+from src.data import sample_evaluation_rows
 
 
 class SamplingTests(unittest.TestCase):

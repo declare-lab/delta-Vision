@@ -330,6 +330,7 @@ def load_adapter_checkpoint(
     language_model: nn.Module | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[nn.Module, list[int], dict]:
+    from src.model_setup import create_qwen_adapter, create_llava_kv_adapter
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     saved_config = ckpt.get("adapter_config", {}) if isinstance(ckpt, dict) else {}
@@ -345,10 +346,8 @@ def load_adapter_checkpoint(
                 ckpt_args.get("visual_adapter_rank", first_down.shape[0] if first_down is not None else 128),
             )
         )
-        adapter = QwenEmbeddingAdapter.from_language_model(
-            language_model,
-            mode=output_mode,
-            visual_adapter_rank=visual_adapter_rank,
+        adapter = create_qwen_adapter(
+            language_model, mode=output_mode, rank=visual_adapter_rank,
         )
         missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
         adapter.to(device=device, dtype=dtype)
@@ -363,7 +362,7 @@ def load_adapter_checkpoint(
         return adapter, list(metadata["source_layers"]), metadata
 
     config, source_layers = infer_adapter_config_from_checkpoint(ckpt, language_model=language_model)
-    adapter = PerLayerKVAdapter(**config)
+    adapter = create_llava_kv_adapter(**config)
     adapter.load_state_dict(ckpt["state_dict"])
     adapter.to(device=device, dtype=dtype)
     adapter.eval()
@@ -588,7 +587,7 @@ def _prefix_causal_attention_heads(
     attention_plan: dict[str, Any] | None = None,
 ) -> Tensor:
     if attention_plan is not None:
-        from src.qwen_adapter_fa2 import attention_heads
+        from src.attention import attention_heads
         return attention_heads(query, torch.cat([visual_key, text_key], dim=2),
             torch.cat([visual_value, text_value], dim=2), scaling=scaling, plan=attention_plan)
     if torch.compiler.is_compiling():
@@ -1547,7 +1546,7 @@ def load_frozen_qwen3vl(
         )
     else:
         model = model_cls.from_pretrained(model_path, **kwargs)
-    from .qwen_deepstack import disable_qwen_deepstack
+    from .model_setup import disable_qwen_deepstack
 
     disable_qwen_deepstack(model)
     if device_map is None and move_to_device:
@@ -2032,6 +2031,26 @@ class QwenEmbeddingAdapter(nn.Module):
             self.visual_adapter_up[layer_idx],
         )
 
+    def visual_memories_for_layers_batched(self, visual_memory: Tensor, layer_indices) -> Tensor:
+        """Inference BMM over active layers only; disabled adapter MLPs do no work."""
+        if self.training or self.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
+            raise ValueError('Layer-subset batching requires a static inference adapter')
+        indices = tuple(layer_indices)
+        if not indices:
+            return visual_memory.new_empty((0, *visual_memory.shape))
+        if not hasattr(self, '_subset_stacked'):
+            self._subset_stacked = {}
+        if indices not in self._subset_stacked:
+            self._subset_stacked[indices] = (
+                torch.stack([self.visual_adapter_down[i].weight for i in indices]),
+                torch.stack([self.visual_adapter_up[i].weight for i in indices]))
+        down, up = self._subset_stacked[indices]
+        layers, (batch, tokens, hidden) = len(indices), visual_memory.shape
+        memory = visual_memory.unsqueeze(0).expand(layers,-1,-1,-1).reshape(layers,batch*tokens,hidden)
+        delta = torch.bmm(memory,down.to(memory.dtype).transpose(1,2))
+        delta = torch.bmm(F.silu(delta),up.to(memory.dtype).transpose(1,2))
+        return visual_memory.unsqueeze(0)+delta.reshape(layers,batch,tokens,hidden)
+
     def base_visual_memory_for_layer(self, visual_memory: Tensor, layer_idx: int) -> Tensor:
         if self.mode != RECURRENT_EMBEDDING_ADAPTER_MODE:
             return visual_memory
@@ -2090,7 +2109,7 @@ def qwen_prefix_causal_attention_heads(
     attention_plan: dict[str, Any] | None = None,
 ) -> Tensor:
     if attention_plan is not None:
-        from src.qwen_adapter_fa2 import attention_heads
+        from src.attention import attention_heads
         return attention_heads(query, key, value, scaling=scaling, plan=attention_plan)
     return F.scaled_dot_product_attention(
         query,
@@ -2172,7 +2191,7 @@ def prepare_qwen_embedding_adapter_inputs(
         visual_position_embeddings = rotary_emb(visual_memory, visual_position_ids)
     attention_plan = None
     if getattr(model, "_adapter_attention_implementation", None) == "flash_attention_2":
-        from src.qwen_adapter_fa2 import prefix_plan
+        from src.attention import prefix_plan
         attention_plan = prefix_plan(text_pos, image_pos, text_mask, image_mask)
     return {
         "attention_plan": attention_plan,
@@ -2307,33 +2326,73 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     exact_kernels: bool = False,
     pack_native_cache: bool = False,
     fused_norm_rope: bool = False,
+    start_layer: int = 0,
+    prefix_layer_caches: list[dict[str, Tensor]] | None = None,
+    blocked_visual_layers: list[int] | tuple[int, ...] | None = None,
+    text_only_attention_plan: dict[str, Any] | None = None,
 ) -> tuple[Tensor, Tensor, dict[str, Any]]:
     language_model = model.model.language_model
     layers = language_model.layers
     rotary_emb = language_model.rotary_emb
-    layer_caches: list[dict[str, Tensor]] = []
+    if not 0 <= start_layer < len(layers):
+        raise ValueError('Invalid adapter start layer')
+    if len(prefix_layer_caches or []) != start_layer:
+        raise ValueError('One native KV cache is required for every prefix layer')
+    if start_layer and (retain_prefix_states or pack_native_cache or adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE):
+        raise ValueError('Partial prefill requires static adapter, fast decode, and unpacked caches')
+    if start_layer and not (attention_plan and attention_plan.get('dense_decode_ready', False)):
+        raise ValueError('Mixed-length prefix caches require unpadded FA2 dense decode')
+    blocked_layers = set(blocked_visual_layers or ())
+    if any(i < start_layer or i >= len(layers) for i in blocked_layers):
+        raise ValueError('Blocked visual layers must belong to the adapter suffix')
+    if blocked_layers and (retain_prefix_states
+                           or adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE
+                           or not (attention_plan and attention_plan.get('dense_decode_ready', False))):
+        raise ValueError('Visual blocking requires static adapter memories and FA2 fast decode')
+    text_only_plan = text_only_attention_plan
+    if blocked_layers and text_only_plan is None:
+        from src.attention import prefix_plan
+        text_only_plan = prefix_plan(text_positions, image_positions[:, :0], text_mask, image_mask[:, :0])
+    layer_caches: list[dict[str, Tensor]] = [dict(c) for c in (prefix_layer_caches or [])]
     layer_inputs: list[Tensor] = []
     layer_after_attention: list[Tensor] = []
     layer_visual_memory = visual_memory
-    all_visual_memories = adapter.all_visual_memories_batched(visual_memory) if batch_visual_memories else None
+    active_layers = tuple(i for i in range(start_layer,len(layers)) if i not in blocked_layers)
+    memory_offsets = {i:j for j,i in enumerate(active_layers)} if blocked_layers else {i:i for i in range(len(layers))}
+    all_visual_memories = None
+    if batch_visual_memories:
+        all_visual_memories = (adapter.visual_memories_for_layers_batched(visual_memory,active_layers)
+            if blocked_layers else adapter.all_visual_memories_batched(visual_memory))
     if exact_kernels:
         if attention_plan is None or h.shape[0] != 1 or torch.is_grad_enabled():
             raise ValueError('Exact adapter kernels require batch-one FA2 inference')
-        from src.qwen_adapter_kernels import exact_rope, split_attention_heads
+        from src.kernels import exact_rope, split_attention_heads
     if fused_norm_rope:
         if not exact_kernels:
             raise ValueError('Fused norm/RoPE requires exact adapter kernels')
-        from src.qwen_native_order_norm import native_order_norm_rope
+        from src.kernels import native_order_norm_rope
     packed_native_kv = None
+    packed_native_groups = []
+    packed_slots = {}
     if pack_native_cache:
         if not exact_kernels or retain_prefix_states:
             raise ValueError('Packed native KV requires the exact fast adapter path')
-        from src.qwen_adapter_kernels import pack_native_layer
-        packed_native_kv = h.new_empty((2, len(layers), 1,
-            language_model.config.num_key_value_heads, visual_memory.shape[1] + h.shape[1],
-            layers[0].self_attn.head_dim))
+        from src.kernels import pack_native_layer
+        if blocked_layers:
+            for indices, length in [(tuple(sorted(blocked_layers)),h.shape[1]),
+                                     (active_layers,visual_memory.shape[1]+h.shape[1])]:
+                if not indices:continue
+                buffer=h.new_empty((2,len(indices),1,language_model.config.num_key_value_heads,length,layers[0].self_attn.head_dim))
+                packed_native_groups.append((indices,buffer))
+                for offset,index in enumerate(indices):packed_slots[index]=(buffer,offset)
+        else:
+            packed_native_kv = h.new_empty((2, len(layers), 1,
+                language_model.config.num_key_value_heads, visual_memory.shape[1] + h.shape[1],
+                layers[0].self_attn.head_dim))
 
     for layer_idx, layer in enumerate(layers):
+        if layer_idx < start_layer:
+            continue
         if retain_prefix_states:
             layer_inputs.append(h)
         attn = layer.self_attn
@@ -2357,40 +2416,53 @@ def qwen_embedding_adapter_prefill_cache_prepared(
         else:
             query, text_key = _compile_exact_qwen_apply_rotary_pos_emb(query, text_key, layer_text_position_embeddings)
 
-        vision_states = (all_visual_memories[layer_idx] if all_visual_memories is not None
-                         else adapter.visual_memory_for_layer(layer_visual_memory, layer_idx))
-        if adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
-            layer_visual_memory = vision_states
-        normed_vision = _compile_exact_module_call(layer.input_layernorm, vision_states)
-        vision_shape = normed_vision.shape[:-1]
-        vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
-        raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
-        visual_key = raw_visual_key.transpose(1, 2) if fused_norm_rope else _compile_exact_module_call(attn.k_norm, raw_visual_key).transpose(1, 2)
-        visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
-        layer_visual_position_embeddings = visual_position_embeddings
-        if layer_visual_position_embeddings is None:
-            layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
-        if fused_norm_rope:
-            visual_key = native_order_norm_rope(visual_key, attn.k_norm.weight, attn.k_norm.variance_epsilon, layer_visual_position_embeddings)
+        layer_attention_plan = attention_plan
+        layer_attention_mask = prefix_attention_mask
+        if layer_idx in blocked_layers:
+            # Empty visual caches remove keys from the softmax denominator too.
+            # Do not execute this layer's adapter, visual norm, or visual K/V projections.
+            visual_key, visual_value = text_key[:, :, :0], text_value[:, :, :0]
+            layer_attention_plan = text_only_plan
+            layer_attention_mask = prefix_attention_mask[..., visual_memory.shape[1]:]
         else:
-            visual_key = (exact_rope(visual_key, layer_visual_position_embeddings) if exact_kernels
-                          else _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings))
+            vision_states = (all_visual_memories[memory_offsets[layer_idx]] if all_visual_memories is not None
+                             else adapter.visual_memory_for_layer(layer_visual_memory, layer_idx))
+            if adapter.mode == RECURRENT_EMBEDDING_ADAPTER_MODE:
+                layer_visual_memory = vision_states
+            normed_vision = _compile_exact_module_call(layer.input_layernorm, vision_states)
+            vision_shape = normed_vision.shape[:-1]
+            vision_hidden_shape = (*vision_shape, -1, attn.head_dim)
+            raw_visual_key = attn.k_proj(normed_vision).view(vision_hidden_shape)
+            visual_key = raw_visual_key.transpose(1, 2) if fused_norm_rope else _compile_exact_module_call(attn.k_norm, raw_visual_key).transpose(1, 2)
+            visual_value = attn.v_proj(normed_vision).view(vision_hidden_shape).transpose(1, 2)
+            layer_visual_position_embeddings = visual_position_embeddings
+            if layer_visual_position_embeddings is None:
+                layer_visual_position_embeddings = rotary_emb(normed_vision, visual_position_ids)
+            if fused_norm_rope:
+                visual_key = native_order_norm_rope(visual_key, attn.k_norm.weight, attn.k_norm.variance_epsilon, layer_visual_position_embeddings)
+            else:
+                visual_key = (exact_rope(visual_key, layer_visual_position_embeddings) if exact_kernels
+                              else _apply_rope_one_from_embeddings(visual_key, layer_visual_position_embeddings))
 
         heads = split_attention_heads(query, visual_key, visual_value, text_key, text_value,
-            scaling=float(attn.scaling), plan=attention_plan) if exact_kernels else _prefix_causal_attention_heads(
+            scaling=float(attn.scaling), plan=layer_attention_plan) if exact_kernels else _prefix_causal_attention_heads(
             query,
             visual_key,
             visual_value,
             text_key,
             text_value,
-            attention_mask=prefix_attention_mask,
+            attention_mask=layer_attention_mask,
             scaling=float(attn.scaling),
-            attention_plan=attention_plan,
+            attention_plan=layer_attention_plan,
         )
-        if packed_native_kv is not None:
-            packed = packed_native_kv[:, layer_idx, 0]
+        if packed_native_kv is not None or packed_native_groups:
+            if packed_native_groups:
+                buffer,offset=packed_slots[layer_idx]
+                packed=buffer[:,offset,0]
+            else:
+                packed = packed_native_kv[:, layer_idx, 0]
             pack_native_layer(visual_key, visual_value, text_key, text_value, packed)
-            visual_length = visual_memory.shape[1]
+            visual_length = visual_key.shape[2]
             layer_caches.append(dict(
                 visual_key=packed[0, :, :visual_length].unsqueeze(0),
                 text_key=packed[0, :, visual_length:].unsqueeze(0),
@@ -2432,6 +2504,10 @@ def qwen_embedding_adapter_prefill_cache_prepared(
     }
     if packed_native_kv is not None:
         cache['_packed_native_kv'] = packed_native_kv
+    if packed_native_groups:
+        cache['_packed_native_groups'] = packed_native_groups
+    if blocked_layers:
+        cache['blocked_visual_layers'] = sorted(blocked_layers)
     return logits, text_mask, cache
 
 
@@ -2511,10 +2587,12 @@ def qwen_embedding_adapter_decode_step(
     token_position_ids = cache["next_position_ids"]
     token_position_embeddings = language_model.rotary_emb(h, token_position_ids)
     dense_decode = cache.get("dense_decode_ready", False) and token_active_mask is None
+    if cache.get('blocked_visual_layers') and not dense_decode:
+        raise ValueError('Layer-wise visual blocking requires unpadded single-request fast decode')
     attention_mask = None if dense_decode else _qwen_decode_attention_mask(cache, token_position_ids, token_active_mask)
 
     if attention_plan is None and cache.get("attention_implementation") == "flash_attention_2":
-        from src.qwen_adapter_fa2 import decode_plan
+        from src.attention import decode_plan
         attention_plan = {"dense_decode": True} if dense_decode else decode_plan(attention_mask)
     for layer_idx, layer in enumerate(language_model.layers):
         attn = layer.self_attn
@@ -2594,7 +2672,7 @@ def qwen_embedding_adapter_decode_step_shape_exact(
 
     attention_plan = None
     if cache.get("attention_implementation") == "flash_attention_2":
-        from src.qwen_adapter_fa2 import prefix_plan
+        from src.attention import prefix_plan
         attention_plan = prefix_plan(full_text_positions, cache["image_positions"], full_text_mask, cache["image_mask"])
     for layer_idx, layer in enumerate(language_model.layers):
         attn = layer.self_attn
@@ -2714,34 +2792,6 @@ def load_qwen_embedding_adapter_checkpoint(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[QwenEmbeddingAdapter, dict[str, Any]]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    checkpoint_args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
-    saved_config = checkpoint.get("adapter_config", {}) if isinstance(checkpoint, dict) else {}
-    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    mode = canonical_adapter_mode(str(saved_config.get("output_mode") or checkpoint_args.get("output_mode", "embedding_adapter")))
-    if mode not in QWEN_EMBEDDING_ADAPTER_MODES:
-        raise ValueError(f"checkpoint output_mode={mode!r} is not a Qwen embedding adapter mode")
-    adapter = QwenEmbeddingAdapter.from_language_model(
-        language_model,
-        mode=mode,
-        visual_adapter_rank=int(
-            saved_config.get(
-                "visual_adapter_rank",
-                checkpoint_args.get(
-                    "visual_adapter_rank",
-                    checkpoint_args.get("visual_transform_rank", 128),
-                ),
-            )
-        ),
-    ).to(device=device, dtype=dtype)
-    missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
-    adapter.eval()
-    for param in adapter.parameters():
-        param.requires_grad_(False)
-    meta = {
-        "args": checkpoint_args,
-        "global_step": checkpoint.get("global_step", checkpoint.get("step", None)) if isinstance(checkpoint, dict) else None,
-        "missing": list(missing),
-        "unexpected": list(unexpected),
-    }
-    return adapter, meta
+    # Compatibility API; training and evaluation share model_setup.
+    from src.model_setup import load_qwen_embedding_adapter_checkpoint as load
+    return load(checkpoint_path, language_model, device, dtype)

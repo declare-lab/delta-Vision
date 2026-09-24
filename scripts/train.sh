@@ -144,7 +144,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
     "$PY" -m torch.distributed.run
     --nproc_per_node "$NPROC_PER_NODE"
     --master_port "$MASTER_PORT"
-    -m src.train
+    -m src.run train --family "$MODEL_KIND" --
     --model-kind qwen
     --data "$DATA"
     --image-root "$IMAGE_ROOT"
@@ -269,7 +269,7 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
     "$PY" -m torch.distributed.run
     --nproc_per_node "$NPROC_PER_NODE"
     --master_port "$MASTER_PORT"
-    -m src.train
+    -m src.run train --family "$MODEL_KIND" --
     --model-kind llava
     --model-path "$MODEL_PATH"
     --data "$DATA"

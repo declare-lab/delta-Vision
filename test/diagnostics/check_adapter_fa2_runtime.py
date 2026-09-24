@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from src.model import load_frozen_qwen3vl, load_qwen_embedding_adapter_checkpoint
 from src.model import qwen_embedding_adapter_decode_step, qwen_embedding_adapter_decode_step_shape_exact
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
 from src.data import QwenBenchmarkDataset
 from baselines.eval_baselines import _qwen_inputs_from_item
 

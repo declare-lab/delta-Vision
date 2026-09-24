@@ -49,9 +49,9 @@ def main():
     from transformers.cache_utils import DynamicCache
     from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
     from src.data import QwenBenchmarkDataset
-    from src.benchmark_prefill import set_global_seed
-    from src.qwen_attention_metadata import optimize_qwen_attention_metadata
-    from src.generation_timing import GenerationStageTimer
+    from src.benchmarking.common.prefill import set_global_seed
+    from src.attention import optimize_qwen_attention_metadata
+    from src.benchmarking.common.generation_timing import GenerationStageTimer
     torch.set_num_threads(4)
     out = ROOT / args.output
     out.mkdir(parents=True, exist_ok=True)
@@ -66,7 +66,7 @@ def main():
             "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
             torch.bfloat16, torch.device("cuda:0"), .05, "flash_attention_2")
         if args.deepstack == 'off':
-            from src.qwen_deepstack import disable_qwen_deepstack
+            from src.model_setup import disable_qwen_deepstack
             disable_qwen_deepstack(model)
         data = ROOT / "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"
         dataset = QwenBenchmarkDataset(str(data), processor, "mmstar", data_root=str(data.parent), max_samples=200)

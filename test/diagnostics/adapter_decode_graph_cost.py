@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
 import torch
-from src.qwen_adapter_graph import AdapterDecodeGraph
-from src.qwen_native_graph import NativeDecodeGraph
+from src.graphs import AdapterDecodeGraph
+from src.graphs import NativeDecodeGraph
 import paired_runtime_execution
 
 rows = []

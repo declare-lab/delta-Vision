@@ -4,10 +4,10 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT));sys.path.insert(0,str(ROOT/'artifacts/dependencies/qwen35_python'))
 import torch
-from src.qwen35_experiment import load_model,prepare_inputs,dump
-from src.qwen35_pruning import VisualPruningController
+from src.qwen35 import load_model,prepare_inputs,dump
+from baselines.qwen35_pruning import VisualPruningController
 from src.benchmarks import get_benchmark_spec,build_benchmark_prompt,score_prediction
-from scripts.qwen35_worker import read_rows
+from src.training.qwen35 import read_rows
 
 @torch.inference_mode()
 def main():

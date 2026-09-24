@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from src.initial_token_mlp_probe import Bank, PathHook, teacher, runtime, inputs_for, run_model
-from src.visual_channel_native_cache import load_rows, dump_json, digest
+from analysis.fig01b_hidden_prediction.initial_token_mlp_probe import Bank, PathHook, teacher, runtime, inputs_for, run_model
+from analysis.fig01a_hidden_channels.visual_channel_native_cache import load_rows, dump_json, digest
 
 
 def main(root):

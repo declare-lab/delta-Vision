@@ -13,12 +13,12 @@ import src.model
 from paired_runtime_execution import MODEL,CHECKPOINT,assert_cache,sync
 from baselines.eval_baselines import load_baseline_model,_qwen_inputs_from_item
 from src.model import load_qwen_embedding_adapter_checkpoint,qwen_embedding_adapter_decode_step
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
-from src.qwen_adapter_graph import QwenAdapterDecodeGraphs
-from src.qwen_adapter_shared_graph import SharedVisualDecodeGraphs
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
+from src.graphs import QwenAdapterDecodeGraphs
+from src.graphs import SharedVisualDecodeGraphs
+from src.model_setup import disable_qwen_deepstack
 from src.data import QwenBenchmarkDataset
-from src.qwen_adapter_prepare import prepare_fa2_inputs
+from src.attention import prepare_fa2_inputs
 
 
 def main():

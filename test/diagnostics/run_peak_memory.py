@@ -38,8 +38,8 @@ def worker(gpu, method):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    sources = ['src/generation_timing.py', 'src/peak_memory.py', 'src/qwen_native_graph.py',
-        'src/qwen_attention_metadata.py', 'src/qwen_deepstack.py', 'baselines/eval_baselines.py']
+    sources = ['src/benchmarking/common/generation_timing.py', 'src/benchmarking/common/peak_memory.py', 'src/graphs.py',
+        'src/attention.py', 'src/model_setup.py', 'baselines/eval_baselines.py']
     sources += [f'baselines/{m}/qwen3_vl/modeling_qwen3_vl_{m}.py' for m in ['fastv','dart','divprune','zoo','sparsevlm','visionzip']]
     protocol = dict(samples=200, deepstack='off', attention='flash_attention_2', shared_with_training=True,
         metric='Maximum warmed CUDA allocated memory across all 200 generation requests; model weights and resident graph pools included; each method/retention in a fresh process; graph capture excluded; MiB',

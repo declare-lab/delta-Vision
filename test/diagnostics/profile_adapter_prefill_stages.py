@@ -12,9 +12,9 @@ sys.path.insert(0, str(ROOT))
 import torch
 import src.model as model_module
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill, QwenContextCudaGraphRunner, QwenAdapterPrefillCacheCudaGraphRunner
-from src.qwen_adapter_native_graph import NativeAdapterDecodeGraphs
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill, QwenContextCudaGraphRunner, QwenAdapterPrefillCacheCudaGraphRunner
+from src.graphs import NativeAdapterDecodeGraphs
+from src.model_setup import disable_qwen_deepstack
 from src.data import QwenBenchmarkDataset
 
 

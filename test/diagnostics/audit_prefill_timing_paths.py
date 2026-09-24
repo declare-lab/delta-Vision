@@ -8,10 +8,10 @@ import statistics
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
 import torch
-from src import benchmark_prefill as bp
+from src.benchmarking.common import prefill as bp
 from src import model as vm
 from src.data import QwenBenchmarkDataset
-from src.benchmark_comparison import RequestRunner
+from src.benchmarking.common.comparison import RequestRunner
 
 OUT=ROOT/'test/results/prefill_timing_audit_20260915'
 OUT.mkdir(parents=True,exist_ok=True)
@@ -73,7 +73,7 @@ with torch.inference_mode():
     measure('new_custom_base_loop_fixed_32',lambda:runner.request(inputs,32),n=3)
     runner=RequestRunner(model,'embedding_adapter',adapter,'fast',cache_prefill)
     measure('new_custom_adapter_loop_fixed_32',lambda:runner.request(inputs,32),n=3)
-    from src.eval_benchmarks import generate_adapter_qwen_decode_cache
+    from src.evaluate import generate_adapter_qwen_decode_cache
     def original_adapter_generate():
         logits,mask,hidden,pos,cache=cache_prefill(inputs)
         return generate_adapter_qwen_decode_cache(model,processor,adapter,inputs,32,

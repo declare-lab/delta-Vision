@@ -4,8 +4,8 @@ from pathlib import Path
 
 import torch
 
-from src.initial_token_mlp_probe import Bank, PathHook, teacher, runtime, inputs_for, run_model, TRAIN
-from src.visual_channel_native_cache import load_rows, dump_json
+from analysis.fig01b_hidden_prediction.initial_token_mlp_probe import Bank, PathHook, teacher, runtime, inputs_for, run_model, TRAIN
+from analysis.fig01a_hidden_channels.visual_channel_native_cache import load_rows, dump_json
 
 root = Path('artifacts/diagnostics/initial_token_mlp_qwen_20260916')
 runtime()

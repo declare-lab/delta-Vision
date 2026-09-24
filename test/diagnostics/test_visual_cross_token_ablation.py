@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from src.visual_cross_token_ablation import decompose, flatten_heads
+from analysis.common.visual_cross_token_ablation import decompose, flatten_heads
 
 
 class VisualEdgesTest(unittest.TestCase):

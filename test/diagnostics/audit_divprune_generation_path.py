@@ -6,7 +6,7 @@ import torch
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
 from baselines.multimodal_pruning_utils import visual_budget
 from src.data import QwenBenchmarkDataset
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.model_setup import disable_qwen_deepstack
 
 
 def independent_select(features, count):

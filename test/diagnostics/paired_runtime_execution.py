@@ -14,11 +14,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
 from src.data import QwenBenchmarkDataset
-from src.generation_timing import GenerationStageTimer
+from src.benchmarking.common.generation_timing import GenerationStageTimer
 from src.model import load_qwen_embedding_adapter_checkpoint, qwen_embedding_adapter_decode_step
-from src.qwen_native_graph import NativeDecoderGraphs, clone_tree
+from src.graphs import NativeDecoderGraphs, clone_tree
 
 MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
 CHECKPOINT = ROOT / "artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt"
@@ -74,7 +74,7 @@ def main():
         stop="Exactly N tokens, EOS suppressed for ALL methods. This is an equal-work speed experiment; not the historical MMStar quality/stop protocol.",
         timing="Wall-clock model forwards synchronized on both sides. Capture/checks outside timing; alternate request order; all slow trials retained."), indent=2))
     base, processor = load_baseline_model("base",MODEL,torch.bfloat16,device,1.,"flash_attention_2")
-    from src.qwen_deepstack import disable_qwen_deepstack
+    from src.model_setup import disable_qwen_deepstack
     if args.deepstack == "off":
         disable_qwen_deepstack(base)
     base_graphs = NativeDecoderGraphs(base,max_shapes=16)

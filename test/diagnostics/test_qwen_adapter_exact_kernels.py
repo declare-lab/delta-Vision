@@ -1,8 +1,8 @@
 """Bitwise regression of fused kernels against the previous BF16 FA2 path."""
 import unittest
 import torch
-from src.qwen_adapter_kernels import exact_rope, split_attention_heads, pack_native_layer
-from src.qwen_adapter_fa2 import attention_heads, prefix_plan_from_positions
+from src.kernels import exact_rope, split_attention_heads, pack_native_layer
+from src.attention import attention_heads, prefix_plan_from_positions
 from src.model import _apply_rope_one_from_embeddings
 
 

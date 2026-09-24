@@ -1,6 +1,6 @@
 import unittest
 from src.benchmarks import score_prediction, get_benchmark_spec
-from src.document_metrics import anls, relaxed_correctness
+from src.benchmarks import anls, relaxed_correctness
 
 
 class DocumentMetricsTests(unittest.TestCase):

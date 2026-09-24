@@ -21,13 +21,13 @@ os.environ.update(QWEN_VIDEO_SAMPLING='full_timestamp_v1', QWEN_VIDEO_NUM_FRAMES
 
 import torch
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
-from src.benchmark_adapter_optimizations import MODEL, CHECKPOINT, MANIFEST, tensor_sha
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
+from src.benchmarking.engines.adapter import MODEL, CHECKPOINT, MANIFEST, tensor_sha
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
 from src.data import QwenBenchmarkDataset
 from src.model import load_qwen_embedding_adapter_checkpoint
-from src.qwen_attention_metadata import optimize_qwen_attention_metadata
-from src.qwen_deepstack import disable_qwen_deepstack
-from src.qwen_native_graph import NativeDecodeGraph, copy_tree, clone_tree, clone_kv_tensors
+from src.attention import optimize_qwen_attention_metadata
+from src.model_setup import disable_qwen_deepstack
+from src.graphs import NativeDecodeGraph, copy_tree, clone_tree, clone_kv_tensors
 from decode_operator_breakdown import analyze_trace
 
 OUTPUT = ROOT / 'test/results/adapter_exact_20260915/decode_base_parity'
@@ -144,7 +144,7 @@ def main():
         # profiler can link every kernel to its exact generating operation.
         from transformers.cache_utils import DynamicCache
         import transformers.integrations.flash_attention as fa
-        import src.qwen_exact_rope as rope_module
+        import src.kernels as rope_module
         profiles = {}
         inputs = _qwen_inputs_from_item(dataset[0], torch.device('cuda:0'))
         for method in ['base', 'adapter']:

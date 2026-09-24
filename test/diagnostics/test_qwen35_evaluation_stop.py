@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 import torch
-from src.qwen35_experiment import generate_evaluation_answer, score_evaluation_prediction
+from src.qwen35 import generate_evaluation_answer, score_evaluation_prediction
 
 
 class EvaluationStopTests(unittest.TestCase):

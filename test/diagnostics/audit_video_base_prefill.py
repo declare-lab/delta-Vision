@@ -17,15 +17,15 @@ os.environ.update(QWEN_VIDEO_SAMPLING='full_timestamp_v1', QWEN_VIDEO_NUM_FRAMES
                   HF_HUB_DISABLE_PROGRESS_BARS='1', TOKENIZERS_PARALLELISM='false')
 import torch
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
-from src.benchmark_adapter_optimizations import MODEL, MANIFEST, tensor_sha, file_sha
+from src.benchmarking.engines.adapter import MODEL, MANIFEST, tensor_sha, file_sha
 from src.data import QwenBenchmarkDataset
-from src.qwen_attention_metadata import optimize_qwen_attention_metadata
-from src.qwen_deepstack import disable_qwen_deepstack
-from src.qwen_fused_norm import FusedQwenNorms
-from src.qwen_exact_rope import QwenExactRoPE
-from src.qwen_fused_projections import QwenFusedProjections
-from src.qwen_native_graph import NativeDecoderGraphs
-from src.qwen_native_prefill_graph import QwenWholePrefillGraphs
+from src.attention import optimize_qwen_attention_metadata
+from src.model_setup import disable_qwen_deepstack
+from src.kernels import FusedQwenNorms
+from src.kernels import QwenExactRoPE
+from src.kernels import QwenFusedProjections
+from src.graphs import NativeDecoderGraphs
+from src.graphs import QwenWholePrefillGraphs
 
 CACHE = ROOT/'test/results/qwen3vl4b_embedding_m4multi64k_video64k_rank128_4000_20260915_step3000_8gpu/videomme/processed/videomme'
 

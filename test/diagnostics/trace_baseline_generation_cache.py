@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration, LogitsProcessor
 from baselines.eval_baselines import configure_baseline
-from src.generation_timing import GenerationStageTimer
+from src.benchmarking.common.generation_timing import GenerationStageTimer
 
 
 class TwoTokens(LogitsProcessor):

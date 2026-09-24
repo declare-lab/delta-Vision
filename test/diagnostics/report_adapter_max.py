@@ -46,7 +46,7 @@ def main():
     assert read(OUTPUT / 'source_validation.json')['all_sources_unchanged']
     rows = {v: load_rows(OUTPUT, v) for v in ['original', 'optimized']}
     previous, base = load_rows(PREVIOUS, 'optimized'), load_rows(BASE, 'optimized')
-    from src.benchmark_adapter_optimizations import EXACT_FIELDS
+    from src.benchmarking.engines.adapter import EXACT_FIELDS
     for index in range(999):
         for variant, data in rows.items():
             row = data[index]
@@ -127,7 +127,7 @@ Total 耗时下降 {(1-b['total_s']/a['total_s'])*100:.2f}%；prefill 耗时下�
 3. **Video prefill 重复打包相同前缀。** 原方案为每段文本重复打包其可见的视觉/文本 KV。本轮仅存一份按原位置排序的 KV，各段传入可见长度 `seqused_k`，仍使用原来的 FA2 非分页内核和因果边界。
 4. **视觉编码之后的 CPU/GPU 同步。** 在发起视觉计算之前读取文本/视觉位置拓扑；视觉计算期间在 CPU 准备索引，通过 pinned memory 异步上传，消除视觉计算后不必要的同步等待。每次请求仍读取当前输入并重新计算视觉特征与 KV。
 
-入口为 `src/benchmark_prefill.py::build_qwen_fast_adapter_prefill` 的 `adapter_max_optimizations=True` 分支。
+入口为 `src/benchmarking/common/prefill.py::build_qwen_fast_adapter_prefill` 的 `adapter_max_optimizations=True` 分支。
 `--adapter-max-optimizations` 自动包含上轮 `--adapter-exact-optimizations`，适用于本次验证的 BF16、FA2、batch size 1 推理。
 配合 `--cuda-graph --cuda-graph-context --adapter-decode-cache --adapter-decode-cache-mode fast --last-logits-only` 使用；比较入口保持 `--comparison-deepstack off`。
 使用 `--adapter-exact-optimizations --no-adapter-max-optimizations` 可回到本轮对照的 v1。
@@ -167,7 +167,7 @@ Total 耗时下降 {(1-b['total_s']/a['total_s'])*100:.2f}%；prefill 耗时下�
 ## 复跑
 
 ```bash
-.venv/bin/python -m src.benchmark_adapter_optimizations \\
+.venv/bin/python -m src.benchmarking.engines.adapter \\
   --gpus 0 1 2 3 4 5 6 7 --runs 3 --tokens 8 \\
   --reference-level exact --optimized-level max \\
   --input-cache {protocol['input_cache']} \\

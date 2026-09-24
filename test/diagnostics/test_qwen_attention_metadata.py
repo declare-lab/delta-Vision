@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 import torch
-from src.qwen_attention_metadata import optimize_qwen_attention_metadata
+from src.attention import optimize_qwen_attention_metadata
 from transformers.modeling_flash_attention_utils import _is_packed_sequence
 
 

@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig, LlamaModel
 
-from src.visual_effect_shared_rank import NativeTraceOracle, project, uncentered_basis, reconstruction_error
+from analysis.fig03_visual_effect.visual_effect_shared_rank import NativeTraceOracle, project, uncentered_basis, reconstruction_error
 
 
 class TinyMultimodal(nn.Module):

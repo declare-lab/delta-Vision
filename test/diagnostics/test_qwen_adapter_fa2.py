@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
-from src.qwen_adapter_fa2 import prefix_plan, decode_plan, attention_heads
+from src.attention import prefix_plan, decode_plan, attention_heads
 
 
 def main():

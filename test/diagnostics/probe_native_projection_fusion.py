@@ -7,9 +7,9 @@ sys.path.insert(0, str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
-from src.qwen_deepstack import disable_qwen_deepstack
-from src.qwen_fused_norm import fused_qwen_rmsnorm
-from src.benchmark_adapter_optimizations import MODEL, MANIFEST
+from src.model_setup import disable_qwen_deepstack
+from src.kernels import fused_qwen_rmsnorm
+from src.benchmarking.engines.adapter import MODEL, MANIFEST
 
 
 def main():

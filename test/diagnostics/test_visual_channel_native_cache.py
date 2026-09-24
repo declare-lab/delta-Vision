@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from src.visual_channel_native_cache import NativeVisualHook, project_cache
+from analysis.fig01a_hidden_channels.visual_channel_native_cache import NativeVisualHook, project_cache
 
 
 class Block(torch.nn.Module):

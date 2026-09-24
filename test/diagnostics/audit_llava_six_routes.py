@@ -14,7 +14,7 @@ from unittest.mock import patch
 import torch
 
 from baselines import llava_hf_baselines as llava
-from src.llava_dart_corrected import select_dart
+from baselines.llava_dart_corrected import select_dart
 
 ROOT=Path(__file__).resolve().parents[2]
 OUT=ROOT/'artifacts/reports/llava_six_author_audit_20260922'
@@ -69,7 +69,7 @@ def main():
     with patch.object(llava,'llava_projected_image_features',return_value=memory), \
          patch.object(llava,'_get_language_model',side_effect=lambda m:m.model.language_model), \
          patch.object(llava,'reduce_visual_memory',side_effect=reduce), \
-         patch('src.llava_dart_corrected.DartDecoder',Decoder):
+         patch('baselines.llava_dart_corrected.DartDecoder',Decoder):
         for m in ['fastv','dart','sparsevlm','visionzip','divprune','zoo']:
             for r in [.05,.2]:
                 events.clear()
@@ -97,7 +97,7 @@ def main():
                         author_count=len(aset),current_count=len(bset),intersection=len(aset&bset),
                         jaccard=len(aset&bset)/len(aset|bset),same_order=bool(torch.equal(aa,bb))))
     current={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest()
-             for p in [ROOT/'baselines/llava_hf_baselines.py',ROOT/'src/llava_dart_corrected.py']}
+             for p in [ROOT/'baselines/llava_hf_baselines.py',ROOT/'baselines/llava_dart_corrected.py']}
     result=dict(scope='active shared HF LLaVA entry; not all historical runs; CPU synthetic selector tests, not accuracy',
                 references=refs,current_hashes=current,routes=route,selectors=comparisons)
     (OUT/'audit.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')

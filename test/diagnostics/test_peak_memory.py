@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
-from src.peak_memory import summarize_peak_memory
+from src.benchmarking.common.peak_memory import summarize_peak_memory
 
 
 class PeakMemoryTest(unittest.TestCase):
@@ -27,7 +27,7 @@ class PeakMemoryTest(unittest.TestCase):
 
     def test_native_stage_boundary_and_request_maximum(self):
         import torch
-        from src.generation_timing import GenerationStageTimer
+        from src.benchmarking.common.generation_timing import GenerationStageTimer
         model = torch.nn.Linear(2, 2)
         timer = GenerationStageTimer(model)
         timer.device, timer.measure_memory = torch.device('cuda:0'), True

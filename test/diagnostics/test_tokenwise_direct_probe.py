@@ -1,7 +1,7 @@
 """CPU checks for probe initialization and pooled regression statistics."""
 import torch
 
-from src.tokenwise_direct_probe import Metrics, Probe
+from analysis.fig01b_hidden_prediction.tokenwise_direct_probe import Metrics, Probe
 
 
 def test_initialization_and_gradient():

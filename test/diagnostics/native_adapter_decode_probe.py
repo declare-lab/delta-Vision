@@ -13,9 +13,9 @@ from transformers.cache_utils import DynamicCache
 from paired_runtime_execution import MODEL,CHECKPOINT,sync
 from baselines.eval_baselines import load_baseline_model,_qwen_inputs_from_item
 from src.model import load_qwen_embedding_adapter_checkpoint,qwen_embedding_adapter_decode_step
-from src.benchmark_prefill import build_qwen_fast_adapter_prefill
-from src.qwen_native_graph import NativeDecoderGraphs
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.benchmarking.common.prefill import build_qwen_fast_adapter_prefill
+from src.graphs import NativeDecoderGraphs
+from src.model_setup import disable_qwen_deepstack
 from src.data import QwenBenchmarkDataset
 
 

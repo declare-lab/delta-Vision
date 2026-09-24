@@ -13,8 +13,8 @@ import torch
 from transformers import LogitsProcessor
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
-from src.generation_timing import GenerationStageTimer
-from src.qwen_native_graph import NativeDecoderGraphs
+from src.benchmarking.common.generation_timing import GenerationStageTimer
+from src.graphs import NativeDecoderGraphs
 
 
 class Capture(LogitsProcessor):
@@ -48,7 +48,7 @@ def main():
         "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct", torch.bfloat16,
         torch.device("cuda:0"), args.retention, args.attention)
     if args.deepstack == 'off':
-        from src.qwen_deepstack import disable_qwen_deepstack
+        from src.model_setup import disable_qwen_deepstack
         disable_qwen_deepstack(model)
     if args.screenshot_fastv and args.method == 'fastv':
         from reproduce_screenshot_fastv import restore_screenshot_forward

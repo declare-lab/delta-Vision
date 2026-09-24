@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from src.initial_token_mlp_probe import TokenMLP, PathHook, Bank, DEPTH
+from analysis.fig01b_hidden_prediction.initial_token_mlp_probe import TokenMLP, PathHook, Bank, DEPTH
 
 
 class Tests(unittest.TestCase):

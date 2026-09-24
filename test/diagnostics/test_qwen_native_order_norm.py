@@ -1,7 +1,7 @@
 import unittest
 import torch
-from src.qwen_native_order_norm import native_order_rmsnorm, native_order_norm_rope
-from src.qwen_adapter_kernels import exact_rope
+from src.kernels import native_order_rmsnorm, native_order_norm_rope
+from src.kernels import exact_rope
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')

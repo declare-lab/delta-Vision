@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from src.initial_token_prediction_probe import Capture, LAYERS, vector_metrics
-from src.initial_token_mlp_probe import TokenMLP
+from analysis.fig01b_hidden_prediction.initial_token_prediction_probe import Capture, LAYERS, vector_metrics
+from analysis.fig01b_hidden_prediction.initial_token_mlp_probe import TokenMLP
 
 
 class Attention(nn.Module):

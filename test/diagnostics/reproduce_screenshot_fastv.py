@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, configure_baseline, evaluate_single, set_global_seed
 from src.data import QwenBenchmarkDataset
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.model_setup import disable_qwen_deepstack
 
 
 def restore_screenshot_forward(model):
@@ -60,10 +60,10 @@ def main():
         configure_baseline(model, method, .05, int(visual[0]), len(visual))
         metadata = graphs = None
         if args.optimize_attention_metadata:
-            from src.qwen_attention_metadata import optimize_qwen_attention_metadata
+            from src.attention import optimize_qwen_attention_metadata
             metadata = optimize_qwen_attention_metadata(model)
         if args.native_cuda_graphs:
-            from src.qwen_native_graph import NativeDecoderGraphs
+            from src.graphs import NativeDecoderGraphs
             graphs = NativeDecoderGraphs(model)
         predictions, summary = evaluate_single(model, processor, data, 'mmstar', 8,
             log_every=25, method=method, retention=.05, measure_prefill=True, speed_warmup=1,

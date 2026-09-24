@@ -10,7 +10,7 @@ import torch
 from transformers import LogitsProcessor
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
-from src.qwen_attention_metadata import optimize_qwen_attention_metadata
+from src.attention import optimize_qwen_attention_metadata
 
 
 class Capture(LogitsProcessor):

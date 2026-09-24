@@ -1,0 +1,110 @@
+{
+  "fig01a_hidden_channels": {
+    "paper": "Figure 1(a), Appendix H",
+    "title": "视觉 hidden-channel 压缩",
+    "runners": {
+      "run": "analysis.fig01a_hidden_channels.visual_channel_native_cache",
+      "report": "analysis.fig01a_hidden_channels.report_native_visual_cache"
+    },
+    "source_status": "available"
+  },
+  "fig01b_hidden_prediction": {
+    "paper": "Figure 1(b)",
+    "title": "独立残差 MLP 预测",
+    "runners": {
+      "run": "analysis.fig01b_hidden_prediction.initial_token_postnorm_probe",
+      "plot": "analysis.fig01b_hidden_prediction.plot_layerwise_residual_mlp"
+    },
+    "source_status": "available"
+  },
+  "table05_native_rank": {
+    "paper": "Table 5",
+    "title": "原生 Q / QKᵀ / attention output 秩统计",
+    "runners": {
+      "report": "analysis.table05_native_rank.report",
+      "run": "analysis.table05_native_rank.visual_rank_statistics"
+    },
+    "source_status": "recovered_exact_provenance_hash"
+  },
+  "fig03_visual_effect": {
+    "paper": "Figure 3",
+    "title": "原生轨迹的视觉作用低秩恢复",
+    "runners": {
+      "native": "analysis.fig03_visual_effect.native_trajectory",
+      "rerun": "analysis.fig03_visual_effect.queue_visual_effect_shared_rank"
+    },
+    "source_status": "available"
+  },
+  "table06_layer_effect": {
+    "paper": "Table 6",
+    "title": "选定层的因果视觉作用干预",
+    "runners": {
+      "run": "analysis.table06_layer_effect.causal_effect_benchmark_suite"
+    },
+    "source_status": "available"
+  },
+  "table10_training_objective": {
+    "paper": "Table 10, Appendix E",
+    "title": "Init / SFT / OPD / Supervised KD",
+    "runners": {
+      "init": "analysis.table10_training_objective.queue_native_initial_visual_eval",
+      "train": "analysis.table10_training_objective.pixmo_objective_comparison"
+    },
+    "source_status": "recovered_original_objective_source"
+  },
+  "fig04_adapter_rank": {
+    "paper": "Figure 4, Appendix G",
+    "title": "Adapter bottleneck rank",
+    "runners": {
+      "train": "analysis.fig04_adapter_rank.train_pixmo_static_rank_sweep",
+      "eval": "analysis.fig04_adapter_rank.eval_pixmo_static_rank_sweep"
+    },
+    "source_status": "available"
+  },
+  "table13_pruning_adapter": {
+    "paper": "Table 13, Appendix I",
+    "title": "DART / DivPrune + embedding adapter",
+    "runners": {
+      "run": "analysis.table13_pruning_adapter.eval_pruned_embedding_adapter"
+    },
+    "source_status": "available"
+  },
+  "table14_15_layer_skipping": {
+    "paper": "Tables 14–15, Appendix J",
+    "title": "关闭部分层视觉注入：准确率与资源",
+    "runners": {
+      "eval": "analysis.table14_15_layer_skipping.eval_adapter_layer_ablation",
+      "measure": "analysis.table14_15_layer_skipping.measure_adapter_layer_resources",
+      "profile": "analysis.table14_15_layer_skipping.profile_adapter_layer_resources",
+      "report": "analysis.table14_15_layer_skipping.report_adapter_layer_resources"
+    },
+    "source_status": "available"
+  },
+  "fig05_hybrid_attention": {
+    "paper": "Figure 5, Appendix K",
+    "title": "Qwen3.5 recurrent state 与 full attention 路径",
+    "runners": {
+      "boundary": "analysis.fig05_hybrid_attention.eval_qwen35_boundary_rank0_full",
+      "full-attention": "analysis.fig05_hybrid_attention.eval_qwen35_fa_key_vs_rest",
+      "memory-queue": "analysis.fig05_hybrid_attention.queue_qwen35_memory_probe",
+      "memory-worker": "analysis.fig05_hybrid_attention.qwen35_memory_probe_worker",
+      "memory-report": "analysis.fig05_hybrid_attention.report_qwen35_memory_probe",
+      "fa-queue": "analysis.fig05_hybrid_attention.queue_qwen35_full_attention_ablation",
+      "fa-worker": "analysis.fig05_hybrid_attention.qwen35_full_attention_ablation_worker",
+      "no-write-queue": "analysis.fig05_hybrid_attention.queue_qwen35_no_visual_write",
+      "no-write-worker": "analysis.fig05_hybrid_attention.qwen35_no_visual_write_worker",
+      "sources-queue": "analysis.fig05_hybrid_attention.queue_qwen35_state_sources",
+      "sources-worker": "analysis.fig05_hybrid_attention.qwen35_state_sources_worker",
+      "sources-report": "analysis.fig05_hybrid_attention.report_qwen35_state_sources",
+      "projection-queue": "analysis.fig05_hybrid_attention.queue_qwen35_answer_projection",
+      "projection-worker": "analysis.fig05_hybrid_attention.qwen35_answer_projection_worker",
+      "projection-report": "analysis.fig05_hybrid_attention.report_qwen35_answer_projection",
+      "cancellation-queue": "analysis.fig05_hybrid_attention.queue_qwen35_delta_cancellation",
+      "cancellation-worker": "analysis.fig05_hybrid_attention.qwen35_delta_cancellation_worker",
+      "cancellation-report": "analysis.fig05_hybrid_attention.report_qwen35_delta_cancellation",
+      "write-forget": "analysis.fig05_hybrid_attention.qwen35_write_forget_suite",
+      "write-forget-report": "analysis.fig05_hybrid_attention.report_qwen35_write_forget"
+    },
+    "source_status": "available"
+  }
+}

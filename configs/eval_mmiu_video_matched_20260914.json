@@ -1,5 +1,0 @@
-{
-  "mmiu": "/lustre-data/leijingdi/code/vision-kv-inject/artifacts/diagnostics/embedding_adapter_corrected_20260914/mmiu_context_and_question_v2.jsonl",
-  "videomme": "/lustre-data/leijingdi/code/vision-kv-inject/artifacts/diagnostics/video_balanced_base_adapter_20260914/videomme_selected.jsonl",
-  "mvbench": "/lustre-data/leijingdi/code/vision-kv-inject/artifacts/diagnostics/video_balanced_base_adapter_20260914/mvbench_selected.jsonl"
-}

@@ -1,7 +1,7 @@
 """KV ownership, layout and storage accounting for graph output copies."""
 import unittest
 import torch
-from src.qwen_native_graph import clone_kv_tensors
+from src.graphs import clone_kv_tensors
 
 
 class CacheCopyTest(unittest.TestCase):

@@ -8,7 +8,7 @@ sys.path.insert(0,str(ROOT))
 import torch
 from flash_attn import flash_attn_varlen_func
 from flash_attn.flash_attn_interface import _wrapped_flash_attn_varlen_forward
-from src.qwen_adapter_fa2 import prefix_plan_from_positions, attention_heads
+from src.attention import prefix_plan_from_positions, attention_heads
 
 
 def main():

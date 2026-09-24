@@ -1,6 +1,8 @@
-"""Dataset for VQA training with image + question + answer."""
+"""Training and evaluation datasets, reproducible sampling and fixed multimodal inputs."""
 from __future__ import annotations
 
+
+# Dataset for VQA training with image + question + answer.
 import hashlib
 import json
 import os
@@ -248,7 +250,7 @@ class QwenBenchmarkDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.rows[idx]
         if row.get("videos") or row.get("video"):
-            from src.video_benchmark_inputs import video_benchmark_item
+            from src.video import video_benchmark_item
             return video_benchmark_item(self, row, idx)
         image_paths = self._image_paths(row)
 
@@ -360,3 +362,40 @@ class QwenBenchmarkDataset(Dataset):
         }
         digest = hashlib.sha1(json.dumps(key, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         return self.cache_dir / self.spec.name / f"{digest}.pt"
+
+
+# Reproducible question sampling shared by all methods in an evaluation.
+def sample_evaluation_rows(rows, *, limit=1000, seed=44):
+    """Uniform sampling without replacement, then original-order evaluation.
+
+    Sorting sampled indices does not change which questions were randomly drawn.
+    Keep all questions when fewer than ``limit`` are available.
+    """
+    if limit <= 0:
+        raise ValueError('Evaluation sample limit must be positive')
+    indices = sorted(random.Random(seed).sample(range(len(rows)), min(limit, len(rows))))
+    return [rows[index] for index in indices], indices
+
+
+# Reconstruct fixed-list media-first inputs and verify against saved hashes.
+from src import benchmarks
+
+for _name in ('muirbench','mvbench'):
+ benchmarks.BENCHMARK_SPECS.setdefault(_name,benchmarks.BenchmarkSpec(name=_name,display_name=_name,
+  metric='multi_choice',default_data=f'data/benchmarks/{_name}/test.jsonl',
+  answer_instruction="Answer with the option's letter from the given choices directly.",max_new_tokens=128))
+
+class FixedMultimodalDataset(QwenBenchmarkDataset):
+ def _qwen_message_content(self,row,question,images):
+  refs=list(re.finditer(r'<\|(image|video)_(\d+)\|>',question))
+  def replace(m):
+   kind,number=m.group(1),int(m.group(2))
+   if kind!='image' or not 1<=number<=len(images):raise ValueError('Invalid image reference '+m.group(0))
+   return f'Image {number}'
+  question=re.sub(r'<\|(image|video)_(\d+)\|>',replace,question)
+  content=[]
+  for i,image in enumerate(images,1):
+   content.append(dict(type='image',image=image))
+   if refs:content.append(dict(type='text',text=f'\n[End of Image {i}]\n'))
+  content.append(dict(type='text',text=question))
+  return content

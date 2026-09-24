@@ -7,7 +7,7 @@ import sys
 from unittest.mock import patch
 import torch
 from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.model_setup import disable_qwen_deepstack
 
 ROOT = Path(__file__).resolve().parents[2]
 

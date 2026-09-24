@@ -11,7 +11,7 @@ sys.path.insert(0,str(ROOT))
 import torch
 from baselines.eval_baselines import load_baseline_model, configure_baseline, _qwen_inputs_from_item
 from src.data import QwenBenchmarkDataset
-from src.qwen_deepstack import disable_qwen_deepstack
+from src.model_setup import disable_qwen_deepstack
 
 
 def main():

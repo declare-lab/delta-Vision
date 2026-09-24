@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT));sys.path.insert(0,str(Path(__file__).parent))
 import torch
 import src.model
-from src.qwen_adapter_prepare import prepare_fa2_inputs
+from src.attention import prepare_fa2_inputs
 import paired_runtime_execution
 
 original=src.model.prepare_qwen_embedding_adapter_inputs

@@ -1,6 +1,6 @@
 """Checks for matching scope definitions and channel-only projection."""
 import torch
-from src.causal_effect_benchmark_suite import configure, MODELS
+from analysis.table06_layer_effect.causal_effect_benchmark_suite import configure, MODELS
 
 
 def test_scopes():

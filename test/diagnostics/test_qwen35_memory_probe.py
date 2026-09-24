@@ -1,6 +1,6 @@
 import unittest
 import torch
-from src.qwen35_memory_probe import spectrum_metrics,decompose,truncate,matrix_similarity,subspace_overlap,next_token_kl
+from analysis.fig05_hybrid_attention.qwen35_memory_probe import spectrum_metrics, decompose, truncate, matrix_similarity, subspace_overlap, next_token_kl
 
 class MemoryProbeTests(unittest.TestCase):
     def test_delta_rule_suffix_is_affine_in_boundary_state(self):

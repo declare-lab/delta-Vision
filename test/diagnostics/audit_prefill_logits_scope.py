@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import torch
-from src.benchmark_prefill import benchmark, configure_torch_runtime
+from src.benchmarking.common.prefill import benchmark, configure_torch_runtime
 from src.data import QwenBenchmarkDataset
 from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
 

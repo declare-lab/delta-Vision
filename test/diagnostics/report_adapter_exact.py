@@ -84,7 +84,7 @@ def main():
 5. **Prefill 后再次整理所有层 KV。** 每层直接写入最终 native decode 布局，Graph 返回后只做一次独立存储复制；后续请求不会覆盖已有 KV。
 6. **Decode 分别启动 Q/K/V、gate/up 投影。** 单 token 时合并矩阵乘法；各权重是同一存储上的独立视图，参数数值不变。
 
-优化接在 `src/benchmark_prefill.py::build_qwen_fast_adapter_prefill` 的 `adapter_exact_optimizations=True` 分支。
+优化接在 `src/benchmarking/common/prefill.py::build_qwen_fast_adapter_prefill` 的 `adapter_exact_optimizations=True` 分支。
 项目原入口可用 `--adapter-exact-optimizations` 开启，配合 `--cuda-graph --cuda-graph-context --adapter-decode-cache --adapter-decode-cache-mode fast --last-logits-only`；该优化要求 BF16、FA2、batch size 1。比较时仍指定 `--comparison-deepstack off`。
 原有路径仍可用 `--no-adapter-exact-optimizations` 做逐位对照，历史截图结果文件未改写。
 
@@ -103,7 +103,7 @@ def main():
 ## 复跑
 
 ```bash
-.venv/bin/python -m src.benchmark_adapter_optimizations \\
+.venv/bin/python -m src.benchmarking.engines.adapter \\
   --gpus 0 1 2 3 4 5 6 7 --runs 3 --tokens 8 \\
   --input-cache {protocol['input_cache']} \\
   --output test/results/adapter_speed_rerun

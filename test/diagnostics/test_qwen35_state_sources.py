@@ -24,7 +24,7 @@ def reference(q, k, v, g, beta, start, end, initial=None):
 
 
 def run_tests():
-    from src.qwen35_state_sources import split_sources
+    from analysis.fig05_hybrid_attention.qwen35_state_sources import split_sources
     from fla.modules.l2norm import l2norm_fwd
     torch.manual_seed(44)
     q,k,v=[torch.randn(1,13,2,128,device='cuda',dtype=torch.bfloat16) for _ in range(3)]
