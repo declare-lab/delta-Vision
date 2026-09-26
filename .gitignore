@@ -5,6 +5,7 @@ test/__pycache__/
 /artifacts/
 *.pyc
 .venv/
+*.egg-info/
 data/
 model/
 wandb/

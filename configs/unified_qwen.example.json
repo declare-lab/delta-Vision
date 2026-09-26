@@ -15,7 +15,7 @@
     "loss_normalization": "token",
     "temperature": 2.0,
     "kl_topk": 1024,
-    "lambda_logit": 2.0,
+    "lambda_logit": 1.0,
     "max_steps": 2000,
     "seed": 44
   },

@@ -65,7 +65,29 @@ class EntrypointTests(unittest.TestCase):
     def test_public_main_dispatches_adapter(self):
         with patch('src.run.execute') as dispatch:
             main(['train','--family','qwen','--','--max-steps','2'])
-            dispatch.assert_called_once_with('train','qwen',['--model-kind','qwen','--max-steps','2'])
+            _,_,expected,_,_ = resolve(['train','--family','qwen','--','--max-steps','2'])
+            dispatch.assert_called_once_with('train','qwen',expected)
+
+    def test_training_defaults_and_explicit_overrides_reach_parser(self):
+        from src.training.engine import parse_args
+        _,_,tokens,_,_ = resolve(['train','--family','qwen','--','--output-dir','/new/run'])
+        args = parse_args(tokens)
+        self.assertEqual((args.max_steps,args.lambda_logit,args.lr_scheduler,args.warmup_ratio),
+                         (2000,1.0,'cosine',0.03))
+        self.assertEqual((args.required_world_size,args.micro_batch_size_per_gpu,args.gradient_accumulation_steps),
+                         (8,4,1))
+        self.assertTrue(args.wandb)
+        self.assertTrue(args.teacher_deepstack)
+        with tempfile.TemporaryDirectory() as d:
+            config=Path(d)/'run.json'
+            config.write_text(json.dumps(dict(family='qwen',train=dict(visual_adapter_rank=256,wandb=False))))
+            _,_,tokens,_,_=resolve(['train','--config',str(config),'--','--output-dir','/new/run',
+                                   '--visual-adapter-rank','512','--max-steps','3'])
+            args=parse_args(tokens)
+            self.assertEqual((args.visual_adapter_rank,args.max_steps,args.lambda_logit),(512,3,1.0))
+            self.assertFalse(args.wandb)
+        _,_,tokens,_,_=resolve(['train','--family','qwen','--','--output-dir','/new/run','--no-teacher-deepstack'])
+        self.assertFalse(parse_args(tokens).teacher_deepstack)
 
     def test_baseline_isolated_frozen_worker_and_family_check(self):
         with tempfile.TemporaryDirectory() as d:

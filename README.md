@@ -8,6 +8,7 @@
 |---|---|
 | `src/model.py`、`src/model_setup.py` | Qwen3-VL／LLaVA adapter、模型构造和 checkpoint 加载 |
 | `src/qwen35.py` | Qwen3.5 adapter 与 Full Attention／Gated DeltaNet 接入 |
+| `src/vllm_adapter.py` | Qwen3-VL / Qwen3.5 embedding adapter 的 vLLM 导出与模型注册（正确性首版） |
 | `src/training/` | 训练执行；Qwen3.5 当前训练和评测共用 worker 也在这里 |
 | `src/evaluate.py` | 普通 benchmark 生成、逐题判分和汇总 |
 | `src/benchmarking/` | Video-MME 计时、FLOPs、Peak Memory 和结果汇总 |
@@ -22,13 +23,84 @@
 | `artifacts/`、`test/results/`、`wandb/` | 实验产物、缓存、参考快照和日志 |
 
 `baselines/` 与 `artifacts/` 按当前仓库设置由 Git 忽略，本地运行仍会使用其中内容。
-当前共用模型加载关闭 DeepStack。历史实验可能采用不同设置，复现时以其冻结配置为准。
+共用模型加载默认关闭 DeepStack；Qwen3-VL adapter 训练的冻结 teacher 显式开启 DeepStack，student 与评测仍关闭。历史实验复现以其冻结配置为准。
 
 ## 环境
 
 从项目根目录运行，使用 `.venv/bin/python`。基础依赖见 `pyproject.toml` 和 `uv.lock`。
 Qwen3.5 的 FLA、causal-conv1d、Triton 版本见 `configs/qwen35_adapter_requirements.txt`；
 其独立依赖位于 `artifacts/dependencies/qwen35_python`，统一入口在导入模型前加入路径。
+
+## vLLM 接入试验：Qwen3-VL / Qwen3.5 + embedding adapter
+
+使用独立环境，避免改变训练依赖：
+
+```bash
+uv venv artifacts/dependencies/vllm023 --python .venv/bin/python
+uv pip install --python artifacts/dependencies/vllm023/bin/python vllm==0.23.0 transformers==5.15.0
+uv pip install --python artifacts/dependencies/vllm023/bin/python --no-deps -e .
+
+artifacts/dependencies/vllm023/bin/python -m src.vllm_adapter \
+  --base /path/to/Qwen3-VL-4B-Instruct \
+  --checkpoint /path/to/qwen_embedding_adapter_step2000.pt \
+  --output /path/to/new-export-directory
+```
+
+导出目录链接底座文件、保存 adapter 权重和来源哈希，并关闭 DeepStack；不修改原 checkpoint。
+安装后的 `delta_vision` entry point 自动注册自定义架构。运行示例：
+
+```bash
+VLLM_PLUGINS=delta_vision CUDA_VISIBLE_DEVICES=0 \
+  artifacts/dependencies/vllm023/bin/vllm serve /path/to/new-export-directory \
+  --dtype bfloat16 --enforce-eager --tensor-parallel-size 1 \
+  --no-async-scheduling --no-enable-prefix-caching --no-enable-chunked-prefill \
+  --max-model-len 4096 --max-num-batched-tokens 4096 --max-num-seqs 2 \
+  --gpu-memory-utilization 0.18 --kv-cache-memory-bytes 1G \
+  --limit-mm-per-prompt '{"image":1,"video":0}' \
+  --attention-config '{"backend":"FLASH_ATTN","flash_attn_version":2}'
+```
+
+Qwen3.5 使用同一个导出命令，将 `--base` 换为 `model/Qwen3.5-4B`，
+`--checkpoint` 换为训练产生的 `qwen35_embedding_adapter_step2000.pt`。
+Qwen3.5 的请求模板需设置 `enable_thinking=False`，与当前测评协议一致。
+Qwen3.5 启动时还需 `--mamba-ssm-cache-dtype float32`；Python API 对应
+`mamba_ssm_cache_dtype='float32'`。原 HF 的 recurrent state 为 FP32，不能沿用
+vLLM 的 `auto`（随 BF16 模型使用 BF16 state），否则 decode 的数值会改变。
+
+首版支持 dense Qwen3-VL / Qwen3.5、static embedding adapter、TP=PP=1 和 eager 执行。
+使用 vLLM 原生分页 KV 与位置编码，每层替换视觉 hidden，只有文本执行 FFN。
+Qwen3.5 的 24 个 linear-attention 层保留全部视觉位置的 Q/K/V、门控、causal convolution
+和 Gated DeltaNet state 更新；8 个 full-attention 层使用原生 gated attention。
+后续文本 decode 继续使用 vLLM 管理的 convolution/recurrent state 和分页 KV。
+视觉位置插值、视觉 RoPE 的 FP32 计算及 Conv3d patch 投影与本项目 Transformers 5.15 参考路径对齐。
+Qwen3.5 另外对齐视觉／文本 RoPE、RMSNorm、gated norm 和 FFN 的 BF16 舍入边界；
+这些兼容运算目前用 eager PyTorch 执行。
+**Qwen3.5 的数值验收尚未通过**：两条真实输入的答案／EOS 一致，但仍有 decode KL
+超过 `1e-3` 的诊断门槛，不能据此声称完整 logits 对齐或九项 benchmark 结果不变。
+**仍计算随后丢弃的视觉 query 输出；尚未移植本项目 text-query-only fast-path，因此不能用此版本声称完整的速度收益。**
+CUDA Graph、分块 prefill、prefix caching、异步调度、量化和多卡模型并行均未验证，当前显式拒绝相关配置。
+Recurrent 递推代码与导出单元检查已接入，但因缺少训练 checkpoint，实际模型验证暂缓；不作为已验证组合。
+CPU 导出回归：`.venv/bin/python -m unittest discover -s test/diagnostics -p test_vllm_adapter.py`。
+
+GPU 对照分两步运行（同一 GPU 顺序执行）；第一步选输入清单前两条作诊断，包含图前文本测试，不是 benchmark 成绩：
+
+```bash
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 artifacts/dependencies/vllm023/bin/python \
+  test/diagnostics/test_vllm_adapter.py --vllm \
+  --export /path/to/new-export-directory --data /path/to/realworldqa.jsonl \
+  --image-root data/benchmarks/realworldqa --output artifacts/diagnostics/vllm_check
+PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 .venv/bin/python \
+  test/diagnostics/test_vllm_adapter.py --reference --output artifacts/diagnostics/vllm_check
+```
+
+Qwen3.5 的第二步使用 `PYTHONPATH=artifacts/dependencies/qwen35_python:.`，加载与现有
+HF 训练／评测相同的 FLA、causal-conv1d、Triton 依赖。第一步仍使用隔离的 vLLM 环境。
+
+检查输入 token 完全一致、单请求／混合批次生成一致，并记录 prefill 和逐步 decode 的完整 logits RMSE、cosine、KL 及 argmax。
+BF16 的跨引擎输出不能以“能生成答案”代替数值对照。此脚本不报告并发训练时的速度。
+2026-09-24 首轮两条 RealWorldQA 诊断：输入像素／M-RoPE 完全一致，单请求／混合批次答案及 EOS 一致；
+prefill KL 为 `1.43e-5 / 2.91e-5`，四个生成位置的 logits cosine 为 `0.99965–0.99991`。
+记录：`artifacts/diagnostics/vllm_qwen_embedding/final_validation/comparison.json`。这不是九项 benchmark 的精度结论，也不是逐位等价证明。
 
 ## 训练与准确率评测
 
@@ -40,16 +112,42 @@ Qwen3.5 的 FLA、causal-conv1d、Triton 版本见 `configs/qwen35_adapter_requi
 ```
 
 `--family` 支持 `qwen`、`llava`、`qwen35`。`--` 后传对应实现的参数。
-统一 JSON 的优先级为共用 `model` 配置、当前任务配置、命令行显式参数。
+参数优先级：训练默认配置 → 用户 JSON 的 `model`／当前任务配置 → 命令行显式参数。
 示例配置用于展示格式，正式训练须填写实际模型、清单和输出路径。
 Adapter 类型、rank 从 checkpoint 恢复；模型架构由训练／测评共同使用。
 
-分布式训练示例（补齐已确认的实验参数后运行）：
+### 默认训练协议（后续未特别说明均沿用）
+
+固定参考：`qwen_static_embedding_2000_wandb_delayed_20260820_145737_kl_only`。
+以后提出 adapter 训练时默认沿用此配置，只覆盖明确指定的模型、rank、数据或实验变量；不自行增加 loss。
+Qwen3-VL 的公开训练入口自动加载 [默认配置](configs/qwen_training.default.json)，`scripts/train.sh` 默认值同步对齐。
+
+| 项目 | 默认设置 |
+|---|---|
+| 模型／结构 | Qwen3-VL-4B-Instruct，所有36层 static embedding adapter，rank128；底座冻结，只训练 adapter；teacher DeepStack 开启，student 关闭 |
+| 数据 | PixMo-AMA，`data/train/pixmo/pixmo_ama_full_valid.clean.jsonl` |
+| 训练规模 | 2000 optimizer steps，8卡，每卡 batch4，梯度累积1，有效 batch32；seed44 |
+| Loss | 仅 logits KL；token mean；top-k1024；temperature2；λ_logit=1；无 hidden MSE／attention 辅助项 |
+| 优化器 | AdamW，LR5e-5，betas=(0.9,0.95)，weight decay0.01，clip1 |
+| 调度 | cosine，warmup3%（60步），起始LR比例0，最终LR比例0.1 |
+| 执行 | BF16，FA2，DeepSpeed ZeRO2；pixel bucket512 |
+| 保存／记录 | 每500步保存，每5步记录；W&B online 开启 |
+
+来源为原实验归档的 W&B 启动参数。旧源码及 `ds_zero2_coeff.json` 可从 Git `32ceeda` 恢复，现用 `configs/ds_zero2.json` 并由训练参数覆盖 batch／梯度累积／clip，AdamW 显式构造。
+**当前 teacher 与旧实验一致，保留 DeepStack；student 使用支持 padding 的 batch FA2，旧实验 student 使用 SDPA，因此不宣称 loss 曲线逐位复现。评测的原生模型与 adapter 仍关闭 DeepStack。**
+更换为 Qwen3.5 等架构时继承训练超参数，通过对应 worker 配置接入。
+
+分布式训练（只需指定新的输出目录）：
 
 ```bash
 .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=8 \
-  -m src.run train --family qwen -- --output-dir RUN/checkpoints <实验参数>
+  -m src.run train --family qwen -- --output-dir RUN/checkpoints
 ```
+
+显式参数可覆盖默认值，例如 `--visual-adapter-rank 256`；关闭 W&B 用 `--no-wandb`。
+两个 `.sh` 的配置直接写在脚本里（如 `TOKENIZERS_PARALLELISM=false`），修改赋值即可；不再读取同名环境变量作默认值。
+默认训练完成后用8卡评测九项单图 benchmark：MMStar、RealWorldQA、GQA、MMB-EN、MMB-CN、MME、POPE、SQA、VQAv2；每项按seed44随机抽最多1000题，不足则全量。
+当前训练任务已串接此评测；独立启动 `eval_benchmark.sh` 时指定 `--run-dir RUN`。
 
 默认 DeepSpeed 配置为 `configs/ds_zero2.json`；ZeRO3 通过 `--deepspeed-config configs/ds_zero3.json` 选择。
 

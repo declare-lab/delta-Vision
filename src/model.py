@@ -1516,6 +1516,7 @@ def load_frozen_qwen3vl(
     move_to_device: bool = True,
     zero3_sharded_load: bool = False,
     deepspeed_config: dict[str, Any] | None = None,
+    deepstack: bool = False,
 ) -> tuple[Any, Qwen3VLForConditionalGeneration | Qwen3VLMoeForConditionalGeneration]:
     processor = AutoProcessor.from_pretrained(model_path)
     if attn_implementation == "auto":
@@ -1548,7 +1549,8 @@ def load_frozen_qwen3vl(
         model = model_cls.from_pretrained(model_path, **kwargs)
     from .model_setup import disable_qwen_deepstack
 
-    disable_qwen_deepstack(model)
+    if not deepstack:
+        disable_qwen_deepstack(model)
     if device_map is None and move_to_device:
         model = model.to(device)
     model.eval()

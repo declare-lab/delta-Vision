@@ -8,6 +8,105 @@ import triton.language as tl
 
 
 @triton.jit
+def _vllm_qk_norm_rope(Q, K, QW, KW, POS, CACHE, QIDX, OQ, OK,
+                       NQ: tl.constexpr, NK: tl.constexpr, HQ: tl.constexpr, HK: tl.constexpr,
+                       D: tl.constexpr, QS: tl.constexpr, KS: tl.constexpr,
+                       PS: tl.constexpr, CS: tl.constexpr, EPSQ: tl.constexpr, EPSK: tl.constexpr,
+                       INDEXED: tl.constexpr, MULTI: tl.constexpr, INTERLEAVED: tl.constexpr,
+                       MT: tl.constexpr, MH: tl.constexpr, MW: tl.constexpr):
+    row = tl.program_id(0)
+    d = tl.arange(0, D)
+    if row < NQ * HQ:
+        token, head = row // HQ, row % HQ
+        pos_token = tl.load(QIDX + token).to(tl.int32) if INDEXED else token
+        x = tl.load(Q + token * QS + head * D + d).to(tl.float32)
+        w = tl.load(QW + d).to(tl.float32)
+        eps = EPSQ
+    else:
+        kr = row - NQ * HQ
+        token, head = kr // HK, kr % HK
+        pos_token = token
+        x = tl.load(K + token * KS + head * D + d).to(tl.float32)
+        w = tl.load(KW + d).to(tl.float32)
+        eps = EPSK
+    scale = tl.rsqrt(tl.sum(x * x, 0) / D + eps)
+    # Preserve the native Qwen/vLLM BF16 normalization boundaries.
+    normalized = (x * scale).to(Q.dtype.element_ty).to(tl.float32)
+    normalized = (normalized * w).to(Q.dtype.element_ty).to(tl.float32)
+    freq = d % (D // 2)
+    axis = tl.full((D,), 0, tl.int32)
+    if MULTI:
+        if INTERLEAVED:
+            axis = tl.where((freq % 3 == 1) & (freq < 3 * MH), 1, axis)
+            axis = tl.where((freq % 3 == 2) & (freq < 3 * MW), 2, axis)
+        else:
+            axis = tl.where(freq < MT, 0, tl.where(freq < MT + MH, 1, 2))
+    position = tl.load(POS + axis * PS + pos_token)
+    cos = tl.load(CACHE + position * CS + freq).to(tl.float32)
+    sin = tl.load(CACHE + position * CS + D // 2 + freq).to(tl.float32)
+    rotated = tl.gather(normalized, (d + D // 2) % D, 0)
+    rotated = tl.where(d < D // 2, -rotated, rotated)
+    if INDEXED:
+        # Compact adapter prefill uses FlashAttention's FP32 rotary arithmetic.
+        result = tl.where(d < D // 2, tl.fma(normalized, cos, rotated * sin),
+                          tl.fma(rotated, sin, normalized * cos))
+    else:
+        # Native MRoPE contracts one product into the add, retaining the other
+        # product's BF16 boundary (different operands in the two rotary halves).
+        first = (normalized * cos).to(Q.dtype.element_ty).to(tl.float32)
+        second = (rotated * sin).to(Q.dtype.element_ty).to(tl.float32)
+        result = tl.where(d < D // 2, tl.fma(normalized, cos, second),
+                          tl.fma(rotated, sin, first))
+    if row < NQ * HQ:
+        tl.store(OQ + row * D + d, result)
+    else:
+        tl.store(OK + (row - NQ * HQ) * D + d, result)
+
+
+def vllm_qk_norm_rope(attn, query, key, positions, query_indices=None):
+    """One kernel for both Q/K head norms and MRoPE; native KV ownership stays intact."""
+    q = query.view(-1, attn.num_heads, attn.head_dim)
+    k = key.view(-1, attn.num_kv_heads, attn.head_dim)
+    rope = attn.rotary_emb
+    assert q.dtype == k.dtype == torch.bfloat16 and attn.head_dim == rope.rotary_dim == 128
+    assert q.stride(-1) == k.stride(-1) == 1 and q.stride(1) == k.stride(1) == 128
+    assert positions.stride(-1) == 1
+    oq, ok = torch.empty(q.shape, device=q.device, dtype=q.dtype), torch.empty(k.shape, device=k.device, dtype=k.dtype)
+    cache = rope._match_cos_sin_cache_dtype(q)
+    sections = rope.mrope_section or (64, 0, 0)
+    _vllm_qk_norm_rope[(q.shape[0] * attn.num_heads + k.shape[0] * attn.num_kv_heads,)](
+        q, k, attn.q_norm.weight, attn.k_norm.weight, positions, cache,
+        positions if query_indices is None else query_indices, oq, ok,
+        q.shape[0], k.shape[0], attn.num_heads, attn.num_kv_heads, 128, q.stride(0), k.stride(0),
+        positions.stride(0) if positions.ndim == 2 else 0, cache.stride(0),
+        attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon,
+        query_indices is not None, positions.ndim == 2, rope.mrope_interleaved, *sections,
+        num_warps=4, enable_fp_fusion=False)
+    return oq, ok
+
+
+@triton.jit
+def _layerwise_rmsnorm(X, W, Y, N: tl.constexpr, H: tl.constexpr,
+                       EPS: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    d = tl.arange(0, BLOCK)
+    x = tl.load(X + row * H + d, d < H, other=0).to(tl.float32)
+    w = tl.load(W + (row // N) * H + d, d < H, other=0).to(tl.float32)
+    scale = tl.rsqrt(tl.sum(x * x, 0) / H + EPS)
+    normalized = (x * scale).to(Y.dtype.element_ty).to(tl.float32)
+    tl.store(Y + row * H + d, normalized * w, d < H)
+
+
+def layerwise_rmsnorm(memories, weights, eps):
+    layers, tokens, hidden = memories.shape
+    assert memories.is_contiguous() and weights.is_contiguous()
+    output = torch.empty_like(memories)
+    _layerwise_rmsnorm[(layers * tokens,)](memories, weights, output, tokens, hidden,
+                                          eps, triton.next_power_of_2(hidden), enable_fp_fusion=False)
+    return output
+
+
+@triton.jit
 def _rope(X, C, S, Y, H: tl.constexpr, N: tl.constexpr, D: tl.constexpr, COUNT: tl.constexpr,
           X0: tl.constexpr, X1: tl.constexpr, X2: tl.constexpr, X3: tl.constexpr,
           Y0: tl.constexpr, Y1: tl.constexpr, Y2: tl.constexpr, Y3: tl.constexpr,

@@ -18,6 +18,12 @@ dependencies = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+[project.optional-dependencies]
+vllm = ["vllm==0.23.0", "fla-core==0.5.2", "flash-attn==2.8.3.post1"]
+
+[project.entry-points."vllm.general_plugins"]
+delta_vision = "src.vllm_adapter:register"
+
 [tool.setuptools.packages.find]
 include = ["src*"]
 

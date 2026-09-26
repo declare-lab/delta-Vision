@@ -7,13 +7,53 @@ import torch
 
 
 def prefix_plan(text_positions, image_positions, text_mask, image_mask):
-    if text_positions.shape[0] != 1:
-        raise ValueError("Adapter FA2 benchmark currently requires batch size 1")
-    if not bool(text_mask.all()) or not bool(image_mask.all()):
-        raise ValueError("Adapter FA2 benchmark requires unpadded inputs")
+    if text_positions.shape[0] != 1 or not bool(text_mask.all()) or not bool(image_mask.all()):
+        return batched_prefix_plan(text_positions, image_positions, text_mask, image_mask)
     text = text_positions[0].tolist()
     images = image_positions[0].tolist()
     return prefix_plan_from_positions(text, images, text_positions.device)
+
+
+def batched_prefix_plan(text_positions, image_positions, text_mask, image_mask):
+    """Pack valid text runs and their causal KV prefixes for padded FA2 batches.
+
+    Each sample has its own sequences. Visual tokens keep their original
+    positions, so text preceding an image cannot read that image's K/V.
+    Padding queries are omitted and restored as zero outputs afterwards.
+    """
+    text_rows, image_rows = text_positions.tolist(), image_positions.tolist()
+    text_valid, image_valid = text_mask.tolist(), image_mask.tolist()
+    text_width, image_width = text_positions.shape[1], image_positions.shape[1]
+    query_indices, key_indices, cu_q, cu_k = [], [], [0], [0]
+    for batch_idx, (texts, images, tm, im) in enumerate(zip(text_rows, image_rows, text_valid, image_valid)):
+        text_slots = [i for i, active in enumerate(tm) if active]
+        slots = [(images[i], i) for i, active in enumerate(im) if active]
+        slots += [(texts[i], image_width + i) for i in text_slots]
+        slots.sort()
+        positions = [position for position, _ in slots]
+        if len(set(positions)) != len(positions) or [texts[i] for i in text_slots] != sorted(texts[i] for i in text_slots):
+            raise ValueError('Adapter FA2 requires unique, increasing sequence positions')
+        ranks = {slot: rank for rank, (_, slot) in enumerate(slots)}
+        query_indices.extend(batch_idx * text_width + i for i in text_slots)
+        starts = [0]
+        for i in range(1, len(text_slots)):
+            if ranks[image_width + text_slots[i]] != ranks[image_width + text_slots[i - 1]] + 1:
+                starts.append(i)
+        if not text_slots:
+            continue
+        starts.append(len(text_slots))
+        offset = batch_idx * (image_width + text_width)
+        for start, end in zip(starts, starts[1:]):
+            length = ranks[image_width + text_slots[end - 1]] + 1
+            key_indices.extend(offset + slot for _, slot in slots[:length])
+            cu_q.append(cu_q[-1] + end - start)
+            cu_k.append(cu_k[-1] + length)
+    if not query_indices:
+        raise ValueError('Adapter FA2 requires at least one valid text query')
+    plan = _plan(key_indices, cu_q, cu_k, text_positions.device, causal=True)
+    plan['query_indices'] = device_tensor(query_indices, torch.long, text_positions.device)
+    plan['dense_decode_ready'] = False
+    return plan
 
 
 def prefix_plan_from_positions(text, images, device, *, shared_prefix=False, async_copy=False):
@@ -94,9 +134,14 @@ def attention_heads(query, key, value, *, scaling, plan):
 
     batch, heads, length, dim = query.shape
     q = query.transpose(1, 2).reshape(-1, heads, dim)
+    query_indices = plan.get('query_indices')
+    if query_indices is not None:
+        q = q.index_select(0, query_indices)
     k = key.transpose(1, 2).reshape(-1, key.shape[1], dim).index_select(0, plan["key_indices"])
     v = value.transpose(1, 2).reshape(-1, value.shape[1], dim).index_select(0, plan["key_indices"])
     output = varlen_attention(q, k, v, scaling=scaling, plan=plan)
+    if query_indices is not None:
+        output = output.new_zeros((batch * length, heads, dim)).index_copy(0, query_indices, output)
     return output.reshape(batch, length, heads, dim).contiguous()
 
 

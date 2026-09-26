@@ -105,9 +105,9 @@ def load_qwen35(config, device):
     return processor, model, adapter, controller
 
 
-# Project-wide DeepStack-off policy for Qwen training and inference.
+# Default DeepStack-off policy; training may explicitly retain a native teacher.
 def _reject_deepstack(*args, **kwargs):
-    raise AssertionError("DeepStack execution is disabled project-wide")
+    raise AssertionError("DeepStack execution is disabled for this model")
 
 
 def disable_qwen_deepstack(model):

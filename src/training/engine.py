@@ -124,7 +124,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--kl-topk", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=2.0)
 
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wandb-project", default="vision-kv-inject")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default="")
@@ -156,6 +156,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--pixel-area-cache", default="")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
+    parser.add_argument("--teacher-deepstack", action=argparse.BooleanOptionalAction, default=False,
+                        help="Keep native Qwen DeepStack for the frozen training teacher; adapter student never injects DeepStack.")
     parser.add_argument("--qwen-device-map", default="", help="Optional Qwen HF device_map, e.g. auto, for single-process multi-GPU loading.")
     parser.add_argument("--qwen-max-memory", default="", help="Optional HF max_memory, JSON or comma list like 0=120GiB,1=120GiB,cpu=200GiB.")
     parser.add_argument("--device", default="cuda:0")
@@ -1004,7 +1006,7 @@ def run_llava(args: argparse.Namespace) -> None:
 
 
 def run_qwen(args: argparse.Namespace) -> None:
-    args.teacher_deepstack = False
+    args.student_attention_implementation = 'flash_attention_2' if args.attn_implementation in ('auto', 'flash_attention_2') else 'sdpa'
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
     if distributed:
@@ -1059,8 +1061,11 @@ def run_qwen(args: argparse.Namespace) -> None:
         move_to_device=not qwen_zero3_load,
         zero3_sharded_load=qwen_zero3_load,
         deepspeed_config=ds_config,
+        deepstack=args.teacher_deepstack,
     )
     _ = hf_ds_config
+    # Loading the teacher with FA2 does not select the custom student kernel.
+    model._adapter_attention_implementation = args.student_attention_implementation
     if qwen_device_map is not None:
         device = qwen_input_device(model)
     language_model = model.model.language_model
@@ -1133,7 +1138,8 @@ def run_qwen(args: argparse.Namespace) -> None:
             f"micro_batch={args.micro_batch_size_per_gpu} grad_accum={args.gradient_accumulation_steps} "
             f"max_steps={args.max_steps} trainable={trainable_count/1e6:.2f}M "
             f"lr={args.lr} scheduler={args.lr_scheduler} warmup={args.warmup_ratio} "
-            f"batch_sampling={args.batch_sampling} order_s={order_s:.2f}",
+            f"batch_sampling={args.batch_sampling} order_s={order_s:.2f} "
+            f"student_attention={args.student_attention_implementation} teacher_deepstack={args.teacher_deepstack}",
             flush=True,
         )
         if qwen_device_map is not None:

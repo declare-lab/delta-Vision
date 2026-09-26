@@ -76,7 +76,17 @@ def resolve(argv=None):
         parser.error('Qwen3.5 uses the existing --run-dir/config.json for shared model/training settings')
     if workflow == 'baseline' and (args.task != 'eval' or common):
         parser.error('baseline is eval-only; model settings come from the prepared run, not model overrides')
-    tokens = option_tokens(common) + option_tokens(cfg.get(args.task, {})) + forwarded
+    task_options = cfg.get(args.task, {})
+    if args.task == 'train' and family == 'qwen' and workflow == 'adapter':
+        # Standing reference: qwen_static_embedding_2000_wandb_delayed_20260820_145737_kl_only.
+        # Explicit experiment settings and CLI arguments always take precedence.
+        defaults = json.loads((ROOT / 'configs/qwen_training.default.json').read_text())
+        common = {**defaults['model'], **common}
+        if isinstance(task_options, dict):
+            task_options = {**defaults['train'], **task_options}
+        else:
+            task_options = option_tokens(defaults['train']) + option_tokens(task_options)
+    tokens = option_tokens(common) + option_tokens(task_options) + forwarded
     if family != 'qwen35' and workflow == 'adapter':
         # The family is authoritative; reject conflicting legacy model-kind flags.
         for i, token in enumerate(tokens):
