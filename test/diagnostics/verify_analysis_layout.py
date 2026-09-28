@@ -28,7 +28,7 @@ results={};meta={'family':a.family,'side':a.side,'input':'realworldqa[0]','devic
 if a.family=='qwen':
  from src.model_setup import load_frozen_qwen3vl
  from src.model import prepare_qwen3vl_batch_inputs
- processor,model=load_frozen_qwen3vl('/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',dtype,device,'flash_attention_2')
+ processor,model=load_frozen_qwen3vl(str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),dtype,device,'flash_attention_2')
  inputs,_,_,_=prepare_qwen3vl_batch_inputs(processor,[row],ROOT/'data/benchmarks/realworldqa',device,include_answers=False)
  nh=mod('visual_channel_native_cache');hook=nh.NativeVisualHook(model.model.language_model.layers);hook.positions=inputs['mm_token_type_ids'][0].eq(1).nonzero().flatten()
  with torch.inference_mode():

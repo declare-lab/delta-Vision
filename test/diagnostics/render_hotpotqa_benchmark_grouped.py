@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = ROOT / "data/benchmarks/hotpotqa/validation.jsonl"
 DEFAULT_OUT = ROOT / "data/benchmarks/hotpotqa/rendered_validation_grouped"
-DEFAULT_MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+DEFAULT_MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 _FONT_PATH = DEFAULT_FONT

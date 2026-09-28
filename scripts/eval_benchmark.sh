@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 PY="$ROOT_DIR/.venv/bin/python"
 export PYTHONPATH="$ROOT_DIR"
 DATA_ROOT="$ROOT_DIR"
-MODEL_ROOT="/lustre-data/leijingdi/code/delta-vision"
+MODEL_ROOT="$ROOT_DIR"
 MODEL_KIND="qwen"
 MODEL_PATH=""
 DATA=""
@@ -245,9 +245,9 @@ PY
 
 if [[ -z "${MODEL_PATH}" ]]; then
   if [[ "$MODEL_KIND" == "qwen" ]]; then
-    MODEL_PATH="models/Qwen3-VL-4B-Instruct"
+    MODEL_PATH="model/Qwen3-VL-4B-Instruct"
   else
-    MODEL_PATH="models/llava-1.5-7b-hf"
+    MODEL_PATH="model/llava-1.5-7b-hf"
   fi
 fi
 if [[ -z "${DATA}" ]]; then

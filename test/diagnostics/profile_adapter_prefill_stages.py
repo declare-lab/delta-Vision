@@ -20,7 +20,7 @@ from src.data import QwenBenchmarkDataset
 
 def main():
     torch.set_num_threads(4)
-    model, processor = load_baseline_model('base', '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct', torch.bfloat16, 'cuda:0', 1., 'flash_attention_2')
+    model, processor = load_baseline_model('base', str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"), torch.bfloat16, 'cuda:0', 1., 'flash_attention_2')
     disable_qwen_deepstack(model)
     checkpoint = ROOT/'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt'
     adapter, _ = model_module.load_qwen_embedding_adapter_checkpoint(str(checkpoint), model.model.language_model, torch.device('cuda:0'), torch.bfloat16)

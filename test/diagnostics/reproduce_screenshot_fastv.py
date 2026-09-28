@@ -46,7 +46,7 @@ def main():
     output = ROOT / args.output
     output.mkdir(exist_ok=True)
     data_path = ROOT / 'data/benchmarks/mmstar/mmstar_speedtest_200.jsonl'
-    model_path = '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
+    model_path = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
     reference = None
     for method in ['base', 'fastv']:
         if method == 'base' and args.resume_base:

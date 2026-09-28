@@ -17,7 +17,7 @@ import time
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[3]
-MODEL = '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
+MODEL = str(Path(__file__).resolve().parents[3] / "model/Qwen3-VL-4B-Instruct")
 CHECKPOINT = ROOT / 'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt'
 MANIFEST = ROOT / 'artifacts/diagnostics/video_balanced_base_adapter_20260914/videomme_selected.jsonl'
 MANIFEST_SHA = '44f433831305e6278b25b0ea905e683674e50cef5a359de390fee9218068c145'

@@ -33,7 +33,7 @@ def main():
     torch.set_num_threads(4)
     out = ROOT / args.output_dir
     out.mkdir(parents=True, exist_ok=True)
-    model_path = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+    model_path = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
     device = torch.device("cuda:0")
     base, processor = load_baseline_model("base", model_path, torch.bfloat16, device, 1., "flash_attention_2")
     base_metadata = optimize_qwen_attention_metadata(base)

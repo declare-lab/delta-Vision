@@ -22,7 +22,7 @@ def main():
     with torch.inference_mode():
         for method in ['base','fastv']:
             torch.set_num_threads(4)
-            model,processor=load_baseline_model(method,'/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',torch.bfloat16,device,.05,'flash_attention_2')
+            model,processor=load_baseline_model(method,str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),torch.bfloat16,device,.05,'flash_attention_2')
             disable_qwen_deepstack(model)
             data=QwenBenchmarkDataset(str(path),processor,'mmstar',data_root=str(path.parent),max_samples=200)
             for index in [0,25,50,75,100,125,150,175]:

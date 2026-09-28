@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "test/results/all_fa2_20260915/full"
-MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 
 
 def run_gpu(gpu, methods):

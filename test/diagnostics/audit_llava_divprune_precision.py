@@ -14,7 +14,7 @@ from baselines.llava_hf_baselines import _divprune_select_tokens
 def main():
     root=Path(__file__).resolve().parents[2]
     extract=runpy.run_path(str(root/'test/diagnostics/audit_llava_six_routes.py'))['extract']
-    p=Path('/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf')
+    p=Path(str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"))
     torch.set_num_threads(4)
     c=AutoConfig.from_pretrained(p);c.vision_config._attn_implementation='flash_attention_2'
     v=CLIPVisionModel(c.vision_config).eval();projector=LlavaMultiModalProjector(c).eval()

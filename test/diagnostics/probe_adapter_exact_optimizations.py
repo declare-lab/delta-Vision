@@ -16,7 +16,7 @@ from src.model import (load_qwen_embedding_adapter_checkpoint, build_qwen_initia
 from src.model_setup import disable_qwen_deepstack
 from src.kernels import FusedQwenNorms
 
-MODEL = '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
+MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 CHECKPOINT = ROOT / 'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt'
 
 

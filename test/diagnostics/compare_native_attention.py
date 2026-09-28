@@ -25,7 +25,7 @@ def main():
     torch.set_num_threads(4)
     loaded={}
     for backend in args.backends:
-        model,processor=load_baseline_model('base','/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',
+        model,processor=load_baseline_model('base',str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
             torch.bfloat16,torch.device('cuda:0'),1.,backend)
         loaded[backend]=(model,NativeDecoderGraphs(model),GenerationStageTimer(model))
     data=ROOT/'data/benchmarks/mmstar/mmstar_speedtest_200.jsonl'

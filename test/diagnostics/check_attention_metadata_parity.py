@@ -32,7 +32,7 @@ def main():
     rows = []
     for name in args.methods:
         model, processor = load_baseline_model(name,
-            "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+            str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
             torch.bfloat16, torch.device("cuda:0"), .05, "flash_attention_2")
         path = ROOT / "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"
         ds = QwenBenchmarkDataset(str(path), processor, "mmstar", data_root=str(path.parent), max_samples=200)

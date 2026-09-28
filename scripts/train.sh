@@ -25,7 +25,7 @@ WANDB_RUN_ID=""
 
 MODEL_KIND="qwen"
 MODEL_KIND="$(printf '%s' "$MODEL_KIND" | tr '[:upper:]' '[:lower:]')"
-DATA_ROOT="/lustre-data/leijingdi/code/delta-vision"
+DATA_ROOT="$ROOT_DIR"
 IMAGE_ROOT="$ROOT_DIR/data/train/pixmo"
 
 if (( $# > 0 )) && [[ "$1" == "--help" || "$1" == "-h" ]]; then
@@ -68,7 +68,7 @@ if [[ "$MODEL_KIND" == "qwen" ]]; then
   METRICS_JSONL="$OUTPUT_DIR/train_metrics.jsonl"
   INIT_CHECKPOINT=""
 
-  MODEL_PATH="models/Qwen3-VL-4B-Instruct"
+  MODEL_PATH="model/Qwen3-VL-4B-Instruct"
   DATA="data/train/pixmo/pixmo_ama_full_valid.clean.jsonl"
   DS_CONFIG="$ROOT_DIR/configs/ds_zero2.json"
   PIXEL_AREA_CACHE="$ROOT_DIR/data/train/pixmo/pixmo_ama_full_valid.clean.jsonl.pixel_areas.json"
@@ -211,8 +211,9 @@ elif [[ "$MODEL_KIND" == "llava" ]]; then
   LOG_FILE="$ROOT_DIR/artifacts/logs/${RUN_NAME}.train.log"
   METRICS_JSONL="$OUTPUT_DIR/train_metrics.jsonl"
   INIT_CHECKPOINT=""
-  MODEL_PATH="models/llava-1.5-7b-hf"
-  DATA="data/pixmo_ama_train.jsonl"
+  MODEL_PATH="model/llava-1.5-7b-hf"
+  DATA="$ROOT_DIR/data/train/pixmo/pixmo_ama_full_valid.clean.jsonl"
+  DATA_ROOT="$IMAGE_ROOT"
   DS_CONFIG="$ROOT_DIR/configs/ds_zero2.json"
   NPROC_PER_NODE=8
   MASTER_PORT="29500"

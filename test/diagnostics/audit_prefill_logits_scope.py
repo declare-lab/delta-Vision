@@ -17,7 +17,7 @@ from baselines.eval_baselines import load_baseline_model, _qwen_inputs_from_item
 def main():
     configure_torch_runtime()
     device = torch.device("cuda:0")
-    model, processor = load_baseline_model("base", "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+    model, processor = load_baseline_model("base", str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
                                             torch.bfloat16, device, 1., "flash_attention_2")
     data = ROOT / "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"
     dataset = QwenBenchmarkDataset(str(data), processor, "mmstar", data_root=str(data.parent), max_samples=200)

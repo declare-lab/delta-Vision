@@ -9,7 +9,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "test/results/deepstack_off_20260915/full"
-MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 DATA = ROOT / "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"
 CHECKPOINT = ROOT / "artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt"
 

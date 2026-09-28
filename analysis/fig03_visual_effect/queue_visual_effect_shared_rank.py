@@ -27,8 +27,8 @@ def prepare(run, prior):
     assert not run.exists()
     run.mkdir(parents=True)
     config = dict(repository=str(ROOT), prior=str(prior), seed=44,
-        models=dict(qwen='/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',
-                    llava='/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf'),
+        models=dict(qwen=str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
+                    llava=str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf")),
         ranks=[0, 16, 32, 64, 128, 256, 512, 1024],
         conditions=['native', 'full_effect', 'rank0', 'rank16', 'rank32', 'rank64', 'rank128', 'rank256', 'rank512', 'rank1024'],
         datasets={}, dtype='bfloat16', attention='flash_attention_2', deepstack='off', max_new_tokens=8,

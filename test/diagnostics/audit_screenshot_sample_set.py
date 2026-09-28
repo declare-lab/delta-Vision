@@ -6,7 +6,7 @@ sys.path.insert(0,str(ROOT))
 from transformers import AutoProcessor,AutoConfig
 from src.data import QwenBenchmarkDataset
 from src.benchmarks import estimate_qwen_kv_cache_mb,estimate_qwen_prefill_flops
-model='/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
+model=str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 processor=AutoProcessor.from_pretrained(model)
 config=AutoConfig.from_pretrained(model).text_config
 out=[]

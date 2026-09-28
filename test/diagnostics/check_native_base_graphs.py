@@ -45,7 +45,7 @@ def main():
     out = ROOT / args.output
     out.parent.mkdir(parents=True, exist_ok=True)
     model, processor = load_baseline_model(args.method,
-        "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct", torch.bfloat16,
+        str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"), torch.bfloat16,
         torch.device("cuda:0"), args.retention, args.attention)
     if args.deepstack == 'off':
         from src.model_setup import disable_qwen_deepstack

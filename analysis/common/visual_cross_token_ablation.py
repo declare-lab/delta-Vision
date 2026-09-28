@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL = '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct'
+MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 
 
 def decompose(q, k, v, positions, scale, chunk=128):

@@ -12,8 +12,8 @@ from src.evaluate import extract_option_from_text
 from src.model import load_frozen_qwen3vl, load_frozen_llava
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_QWEN = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
-DEFAULT_LLAVA = str(ROOT / "models/llava-1.5-7b-hf")
+DEFAULT_QWEN = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
+DEFAULT_LLAVA = str(ROOT / "model/llava-1.5-7b-hf")
 
 
 def _to_device_item(item: dict[str, Any], device: torch.device) -> dict[str, Any]:

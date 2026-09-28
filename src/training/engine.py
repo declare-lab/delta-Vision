@@ -101,9 +101,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser("Unified trainer for LLaVA kv_adapter and Qwen3-VL embedding_adapter.")
     parser.add_argument("--model-kind", choices=("llava", "qwen"), default="llava")
 
-    parser.add_argument("--model-path", default="../delta-vision/models/llava-1.5-7b-hf")
-    parser.add_argument("--data", default="../delta-vision/data/pixmo_ama_train.jsonl")
-    parser.add_argument("--data-root", default="../delta-vision", help="Root for resolving LLaVA image paths in JSONL")
+    parser.add_argument("--model-path", default=str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"))
+    parser.add_argument("--data", default=str(Path(__file__).resolve().parents[2] / "data/train/pixmo/pixmo_ama_full_valid.clean.jsonl"))
+    parser.add_argument("--data-root", default=str(Path(__file__).resolve().parents[2] / "data/train/pixmo"), help="Root for resolving LLaVA image paths in JSONL")
     parser.add_argument("--image-root", default="", help="Root for resolving Qwen image paths in JSONL")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--metrics-jsonl", default="")

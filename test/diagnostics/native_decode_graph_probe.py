@@ -23,7 +23,7 @@ def main():
     rows = []
     for method in ["base", "divprune"]:
         model, processor = load_baseline_model(method,
-            "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+            str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
             torch.bfloat16, torch.device("cuda:0"), .05, "flash_attention_2")
         optimization = optimize_qwen_attention_metadata(model)
         data = ROOT / "data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"

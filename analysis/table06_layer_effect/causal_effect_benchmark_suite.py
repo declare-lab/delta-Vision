@@ -23,7 +23,7 @@ from analysis.table06_layer_effect import realworldqa_causal_effect_rank as core
 ROOT = core.ROOT
 MODELS = {
     'qwen': (core.MODEL, 36, 2560),
-    'llava': ('/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf', 32, 4096),
+    'llava': (str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"), 32, 4096),
 }
 DATASETS = {'realworldqa': ('data/benchmarks/realworldqa/test.jsonl', 765),
             'mmstar': ('data/benchmarks/mmstar/mmstar_val.jsonl', 1000)}

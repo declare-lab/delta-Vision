@@ -1,4 +1,4 @@
-"""Pure renderer tests without importing/loading Torch or model weights."""
+"""Optional legacy renderer tests without importing Torch or model weights."""
 import ast
 from pathlib import Path
 import re
@@ -7,6 +7,8 @@ import unittest
 
 def render():
     source = Path(__file__).resolve().parents[3] / 'vision-kv-inject-attention-sink/src/data.py'
+    if not source.is_file():
+        raise unittest.SkipTest('Optional legacy renderer checkout is not available')
     tree = ast.parse(source.read_text())
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'media_first_qwen_content')
     namespace = {'re': re}

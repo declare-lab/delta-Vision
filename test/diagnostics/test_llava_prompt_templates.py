@@ -19,7 +19,7 @@ class LlavaPromptTemplates(unittest.TestCase):
     def setUpClass(cls):
         cls.mistral = AutoProcessor.from_pretrained(ROOT/'model/llava-v1.6-mistral-7b-hf', local_files_only=True)
         cls.vicuna = AutoProcessor.from_pretrained(
-            '/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf', local_files_only=True)
+            str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"), local_files_only=True)
 
     def test_native_training_and_generation_text(self):
         question = 'What is shown?'

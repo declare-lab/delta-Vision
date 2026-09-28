@@ -2701,7 +2701,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Cap padded tokens per Qwen benchmark batch as max_seq_len * batch_size. 0 disables.",
     )
-    parser.add_argument("--data-root", default="../delta-vision")
+    parser.add_argument("--data-root", default=str(Path(__file__).resolve().parents[3]))
     parser.add_argument("--n-runs", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")

@@ -18,7 +18,7 @@ def prepare(run):
     for name in ('logs','rows','audits','data','source/src'):(run/name).mkdir(parents=True)
     parent=ROOT/'artifacts/eval/divprune_fixed_multimodal_random44_five_models_20260920_112257/config.json'
     prior=json.loads(parent.read_text())
-    config=dict(model_path='/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',
+    config=dict(model_path=str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
         methods=['native','initial_embedding'],shards=8,seed=44,evaluation={},attention='flash_attention_2',
         deepstack=False,adapter_checkpoint=None,fast_path=False,visual_tokens='all retained',
         intervention='Before every LM layer, replace visual hidden by the layer0 input E; text continues unchanged. Native full attention/FFN and generate/KV-cache.',

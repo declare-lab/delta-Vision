@@ -61,8 +61,8 @@ from analysis.fig03_visual_effect.native_effect_core import (
 )
 
 
-DEFAULT_QWEN4B = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
-DEFAULT_LLAVA7B = "/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf"
+DEFAULT_QWEN4B = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
+DEFAULT_LLAVA7B = str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf")
 DEFAULT_RANKS = "16,32,64,128,256,512,1024"
 
 

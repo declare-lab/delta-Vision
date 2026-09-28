@@ -15,7 +15,7 @@ from src.benchmarking.common.comparison import RequestRunner
 
 OUT=ROOT/'test/results/prefill_timing_audit_20260915'
 OUT.mkdir(parents=True,exist_ok=True)
-sys.argv=['audit','--model-path','/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',
+sys.argv=['audit','--model-path',str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
           '--checkpoint',str(ROOT/'artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt')]
 args=bp.parse_args()
 bp.configure_torch_runtime()

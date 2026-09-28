@@ -63,7 +63,7 @@ def main():
     for method in args.methods:
         set_global_seed(42)
         model, processor = load_baseline_model(method,
-            "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+            str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
             torch.bfloat16, torch.device("cuda:0"), .05, "flash_attention_2")
         if args.deepstack == 'off':
             from src.model_setup import disable_qwen_deepstack

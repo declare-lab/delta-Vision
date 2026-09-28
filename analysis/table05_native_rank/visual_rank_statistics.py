@@ -24,10 +24,10 @@ from src.model import load_frozen_llava, load_frozen_qwen3vl, qwen_apply_rotary_
 from src.data import LlavaBenchmarkDataset, QwenBenchmarkDataset
 from src.benchmarks import get_benchmark_spec
 
-SHARED = Path('/lustre-data/leijingdi/code/vision-kv-inject')
+SHARED = Path(__file__).resolve().parents[2]
 MODELS = {
-    'qwen': '/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',
-    'llava': '/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf',
+    'qwen': str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
+    'llava': str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"),
 }
 COUNTS = {'mmstar': 1000, 'realworldqa': 765, 'sqa': 1000}
 

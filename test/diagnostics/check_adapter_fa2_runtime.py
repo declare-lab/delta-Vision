@@ -18,7 +18,7 @@ from baselines.eval_baselines import _qwen_inputs_from_item
 def main():
     torch.set_num_threads(4)
     device = torch.device("cuda:0")
-    processor, model = load_frozen_qwen3vl("/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+    processor, model = load_frozen_qwen3vl(str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
         torch.bfloat16, device, "flash_attention_2")
     adapter, _ = load_qwen_embedding_adapter_checkpoint(str(ROOT / "artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt"),
         model.model.language_model, device, torch.bfloat16)

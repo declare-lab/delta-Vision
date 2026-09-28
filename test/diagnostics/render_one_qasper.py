@@ -13,7 +13,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATA = ROOT / "data/train/qasper-data/agent_memory_qasper_ctx8192_episode_safe_seed42.sectioned.jsonl"
-DEFAULT_MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+DEFAULT_MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 DEFAULT_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 

@@ -28,8 +28,8 @@ from analysis.fig01a_hidden_channels.visual_channel_rank_grid import _layers, _t
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS = {
-    "qwen": "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
-    "llava": "/lustre-data/leijingdi/code/delta-vision/models/llava-1.5-7b-hf",
+    "qwen": str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
+    "llava": str(Path(__file__).resolve().parents[2] / "model/llava-1.5-7b-hf"),
 }
 BENCHMARKS = ("mmstar", "sqa", "realworldqa")
 RANKS = (0, 32, 64, 128, 256, 512, 1024)

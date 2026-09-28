@@ -44,7 +44,7 @@ from analysis.common.text_reconstruction_metrics import COPY_TRANSCRIPTION_INSTR
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser("Qwen3-VL visual-effect low-rank oracle diagnostic.")
-    parser.add_argument("--model-path", default="/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct")
+    parser.add_argument("--model-path", default=str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"))
     parser.add_argument("--data", default="data/train/rendered_text_copy_300/paired_eval.jsonl")
     parser.add_argument("--image-root", default="data/train/rendered_text_copy_300")
     parser.add_argument("--output-dir", required=True)

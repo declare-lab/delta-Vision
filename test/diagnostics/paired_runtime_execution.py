@@ -20,7 +20,7 @@ from src.benchmarking.common.generation_timing import GenerationStageTimer
 from src.model import load_qwen_embedding_adapter_checkpoint, qwen_embedding_adapter_decode_step
 from src.graphs import NativeDecoderGraphs, clone_tree
 
-MODEL = "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct"
+MODEL = str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct")
 CHECKPOINT = ROOT / "artifacts/experiments/pixmo_adapter_comparison/static_recurrent_sft_opd_20260911/static_kl/checkpoints/qwen_embedding_adapter_step2000.pt"
 
 

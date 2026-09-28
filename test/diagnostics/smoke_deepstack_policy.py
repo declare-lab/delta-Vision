@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 from src.model import load_frozen_qwen3vl
-processor,model=load_frozen_qwen3vl('/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct',torch.bfloat16,torch.device('cuda:0'))
+processor,model=load_frozen_qwen3vl(str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),torch.bfloat16,torch.device('cuda:0'))
 counts={'main_merger':0,'deepstack_merger':0,'language_injection':0}
 def bump(name):
  def hook(*a):counts[name]+=1

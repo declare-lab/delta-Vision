@@ -26,7 +26,7 @@ def main():
     for retention in [.05, .2]:
         output = OUT / f"ret{int(retention*100):02d}"
         command = [str(ROOT/".venv/bin/python"), "-m", "baselines.eval_baselines",
-                   "--model-path", "/lustre-data/leijingdi/code/delta-vision/models/Qwen3-VL-4B-Instruct",
+                   "--model-path", str(Path(__file__).resolve().parents[2] / "model/Qwen3-VL-4B-Instruct"),
                    "--method", "base,fastv,dart,divprune,zoo,sparsevlm,visionzip", "--retention", str(retention),
                    "--benchmark", "mmstar", "--data", str(ROOT/"data/benchmarks/mmstar/mmstar_speedtest_200.jsonl"),
                    "--max-samples", "200", "--max-new-tokens", "8", "--measure-prefill", "--measure-decode",
