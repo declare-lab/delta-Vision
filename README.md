@@ -235,7 +235,7 @@ The unified entry point supports `--family qwen`, `llava`, and `qwen35`. Qwen3.5
 
 ## Citation
 
-If you use δ-Vision in your work, please cite:
+If you find our work helpful, please kindly cite:
 
 ```bibtex
 @misc{lei2026justmlpsefficientvisual,
