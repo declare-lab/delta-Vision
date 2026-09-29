@@ -4,7 +4,7 @@
 
 ### Just MLPs: Efficient Visual State Reconstruction for Multimodal Language Models
 
-Jingdi Lei, Junxian Li, Di Zhang, Zhanqiu Zhang, Yiwen Guo, and Soujanya Poria · 2026 · [arXiv:2609.34972](https://arxiv.org/abs/2609.34972)
+Jingdi Lei, Junxian Li, Di Zhang, Zhanqiu Zhang, Yiwen Guo, and Soujanya Poria
 
 Preserve every visual token with lightweight, layer-wise visual memory prediction.
 
