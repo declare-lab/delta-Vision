@@ -4,12 +4,15 @@
 
 ### Just MLPs: Efficient Visual State Reconstruction for Multimodal Language Models
 
+Jingdi Lei, Junxian Li, Di Zhang, Zhanqiu Zhang, Yiwen Guo, and Soujanya Poria · 2026 · [arXiv:2609.34972](https://arxiv.org/abs/2609.34972)
+
 Preserve every visual token with lightweight, layer-wise visual memory prediction.
 
 </div>
 
 <p align="center">
   <a href="https://creativecommons.org/licenses/by/4.0/"><img alt="License: CC-BY-4.0" src="https://img.shields.io/badge/License-CC_BY_4.0-brightgreen.svg"></a>
+  <a href="https://arxiv.org/abs/2609.34972"><img alt="arXiv Paper" src="https://img.shields.io/badge/arXiv-Paper-B31B1B?style=flat-square&logo=arxiv&logoColor=white"></a>
   <a href="https://huggingface.co/huaXiaKyrie/delta-Vision-Embedding-Adapter"><img alt="Hugging Face Model" src="https://img.shields.io/badge/🤗_Huggingface-Model-ff9800.svg"></a>
   <a href="https://huggingface.co/datasets/huaXiaKyrie/pixmo-ama-train"><img alt="Hugging Face Training Dataset" src="https://img.shields.io/badge/🤗_Huggingface-Dataset-ff9800.svg"></a>
 </p>
@@ -229,3 +232,19 @@ python -m analysis fig05_hybrid_attention --describe
 | `analysis/` | Paper analyses and ablations |
 
 The unified entry point supports `--family qwen`, `llava`, and `qwen35`. Qwen3.5 uses its own prepared `RUN/config.json` and worker protocol; its additional dependency versions are recorded in [configs/qwen35_adapter_requirements.txt](configs/qwen35_adapter_requirements.txt).
+
+## Citation
+
+If you use δ-Vision in your work, please cite:
+
+```bibtex
+@misc{lei2026justmlpsefficientvisual,
+      title={Just MLPs: Efficient Visual State Reconstruction for Multimodal Language Models},
+      author={Jingdi Lei and Junxian Li and Di Zhang and Zhanqiu Zhang and Yiwen Guo and Soujanya Poria},
+      year={2026},
+      eprint={2609.34972},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2609.34972},
+}
+```
